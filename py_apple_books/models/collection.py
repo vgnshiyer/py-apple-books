@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from src.py_apple_books.models.book import Book
+from py_apple_books.models.book import Book
 
 @dataclass
 class Collection:

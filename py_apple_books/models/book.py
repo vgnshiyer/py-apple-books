@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from src.py_apple_books.models.collection import Collection
+import pathlib
 
 @dataclass
 class Book:
@@ -10,4 +10,3 @@ class Book:
     description: str # ZBOOKDESCRIPTION
     genre: str # ZGENRE
     path: pathlib.Path # ZPATH
-    collections: list[Collection]
