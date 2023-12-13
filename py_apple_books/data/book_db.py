@@ -23,7 +23,7 @@ def get_db_cursor():
     conn = sqlite3.connect(sqlite_file)
     return conn.cursor()
 
-def get_all_books():
+def find_all():
     cursor = get_db_cursor()
     fields_str = ", ".join(BOOK_FIELDS)
     query = f"""
@@ -33,7 +33,7 @@ def get_all_books():
     cursor.execute(query)
     return cursor.fetchall()
 
-def get_book_by_id(book_id: str):
+def find_book_by_id(book_id: str):
     cursor = get_db_cursor()
     fields_str = ", ".join(BOOK_FIELDS)
     query = f"""
@@ -44,7 +44,7 @@ def get_book_by_id(book_id: str):
     cursor.execute(query, (book_id,))
     return cursor.fetchone()
 
-def get_books_in_collection(collection_id: str):
+def find_books_in_collection(collection_id: str):
     cursor = get_db_cursor()
     fields_str = ", ".join([f"ZBKLIBRARYASSET.{field}" for field in BOOK_FIELDS])
     query = f"""

@@ -5,3 +5,8 @@ if __name__ == '__main__':
 
     for c in collections:
         print(c)
+
+    books = BooksApi.list_books()
+
+    for b in books:
+        print(b)

@@ -18,7 +18,7 @@ def get_db_cursor():
     conn = sqlite3.connect(sqlite_file)
     return conn.cursor()
 
-def get_all_collections():
+def find_all():
     cursor = get_db_cursor()
     fields_str = ", ".join(COLLECTION_FIELDS)
     query = f"""
@@ -28,7 +28,7 @@ def get_all_collections():
     cursor.execute(query)
     return cursor.fetchall()
 
-def get_collection_by_id(collection_id: str):
+def find_by_id(collection_id: str):
     cursor = get_db_cursor()
     fields_str = ", ".join(COLLECTION_FIELDS)
     query = f"""
@@ -39,7 +39,18 @@ def get_collection_by_id(collection_id: str):
     cursor.execute(query, (collection_id,))
     return cursor.fetchone()
 
-def get_collections_by_book_id(book_id: str):
+def find_by_name(collection_name: str):
+    cursor = get_db_cursor()
+    fields_str = ", ".join(COLLECTION_FIELDS)
+    query = f"""
+        SELECT {fields_str}
+        FROM ZBKCOLLECTION
+        WHERE ZTITLE = ?
+    """
+    cursor.execute(query, (collection_name,))
+    return cursor.fetchone()
+
+def find_collections_by_book_id(book_id: str):
     cursor = get_db_cursor()
     fields_str = ", ".join(COLLECTION_FIELDS)
     query = f"""
