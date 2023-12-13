@@ -10,17 +10,17 @@ class BooksApi:
 
         collections = [dict(zip(Collection.__annotations__.keys(), c)) for c in collection_db.get_all_collections()]
 
-        for c in collections:
-            books_in_collection = [dict(zip(Book.__annotations__.keys(), b)) for b in book_db.get_books_in_collection(c['id_'])]
+        for collection in collections:
+            books_in_collection = [dict(zip(Book.__annotations__.keys(), b)) for b in book_db.get_books_in_collection(collection['id_'])]
 
-            c['books'] = []
-            for b in books_in_collection:
-                book = Book(**b)
+            collection['books'] = []
+            for book in books_in_collection:
+                book_obj = Book(**book)
 
-                c.get('books').append(book)
+                collection.get('books').append(book_obj)
 
-            collection = Collection(**c)
+            collection_obj = Collection(**collection)
 
-            list_of_collections.append(collection)
+            list_of_collections.append(collection_obj)
 
         return list_of_collections
