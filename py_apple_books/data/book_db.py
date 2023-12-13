@@ -2,10 +2,7 @@ import sqlite3
 from pathlib import Path
 from py_apple_books.data import db_utils
 
-BOOK_DB_PATH = (
-    Path.home()
-    / "Library/Containers/com.apple.iBooksX/Data/Documents/BKLibrary"
-)
+BOOK_DB_PATH = (Path.home() / "Library/Containers/com.apple.iBooksX/Data/Documents/BKLibrary")
 
 BOOK_FIELDS = [
     'Z_PK',
@@ -44,7 +41,7 @@ def find_by_collection_id(collection_id: str):
         SELECT {fields_str}
         FROM {TABLE_NAME}
         INNER JOIN ZBKCOLLECTIONMEMBER
-        ON ZBKCOLLECTIONMEMBER.ZASSETID = {TABLE_NAME}.ZASSETID
+        ON ZBKCOLLECTIONMEMBER.ZASSET = {TABLE_NAME}.Z_PK
         WHERE ZBKCOLLECTIONMEMBER.ZCOLLECTION = ?
     """
     cursor.execute(query, (collection_id,))

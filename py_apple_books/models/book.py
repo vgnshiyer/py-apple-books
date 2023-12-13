@@ -3,10 +3,10 @@ import pathlib
 
 @dataclass
 class Book:
-    id_: str # Z_PK
-    asset_id: str # ZASSETID
-    title: str # ZTITLE
-    author: str # ZAUTHOR
-    description: str # ZBOOKDESCRIPTION
-    genre: str # ZGENRE
-    path: pathlib.Path # ZPATH
+    id_: str
+    asset_id: str
+    title: str
+    author: str
+    description: str
+    genre: str
+    path: pathlib.Path

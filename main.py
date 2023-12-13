@@ -4,14 +4,11 @@ if __name__ == '__main__':
     booksApi = BooksApi()
 
 
-    # collections = booksApi.list_collections()
-    # for c in collections:
-    #     print(c)
+    collections = booksApi.list_collections(include_books=True)
+    for c in collections:
+        print(c)
 
     # books = booksApi.list_books()
 
     # for b in books:
     #     print(b)
-
-    collection = booksApi.get_collection_by_id('8')
-    print(collection)

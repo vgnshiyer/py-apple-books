@@ -2,10 +2,7 @@ import sqlite3
 from pathlib import Path
 from py_apple_books.data import db_utils
 
-COLLECTION_DB_PATH = (
-    Path.home()
-    / "Library/Containers/com.apple.iBooksX/Data/Documents/BKLibrary"
-)
+COLLECTION_DB_PATH = (Path.home() / "Library/Containers/com.apple.iBooksX/Data/Documents/BKLibrary")
 
 COLLECTION_FIELDS = [
     'Z_PK',
