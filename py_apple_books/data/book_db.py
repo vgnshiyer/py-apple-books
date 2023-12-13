@@ -1,6 +1,6 @@
 import sqlite3
 from pathlib import Path
-from functools import lru_cache
+from py_apple_books.data import db_utils
 
 BOOK_DB_PATH = (
     Path.home()
@@ -17,45 +17,35 @@ BOOK_FIELDS = [
     'ZPATH'
 ]
 
-@lru_cache(maxsize=1)
-def get_db_cursor():
-    sqlite_file = list(BOOK_DB_PATH.glob("*.sqlite"))[0]
-    conn = sqlite3.connect(sqlite_file)
-    return conn.cursor()
+TABLE_NAME = "ZBKLIBRARYASSET"
 
 def find_all():
-    cursor = get_db_cursor()
-    fields_str = ", ".join(BOOK_FIELDS)
-    query = f"""
-        SELECT {fields_str}
-        FROM ZBKLIBRARYASSET
-    """
-    cursor.execute(query)
-    return cursor.fetchall()
+    return db_utils.find_all(BOOK_DB_PATH, BOOK_FIELDS, TABLE_NAME)
 
-def find_book_by_id(book_id: str):
-    cursor = get_db_cursor()
-    fields_str = ", ".join(BOOK_FIELDS)
-    query = f"""
-        SELECT {fields_str}
-        FROM ZBKLIBRARYASSET
-        WHERE Z_PK = ?
-    """
-    cursor.execute(query, (book_id,))
-    return cursor.fetchone()
+def find_by_id(book_id: str):
+    return db_utils.find_by_field(BOOK_DB_PATH, BOOK_FIELDS, TABLE_NAME, "Z_PK", book_id)
 
-def find_books_in_collection(collection_id: str):
-    cursor = get_db_cursor()
-    fields_str = ", ".join([f"ZBKLIBRARYASSET.{field}" for field in BOOK_FIELDS])
+def find_by_asset_id(asset_id: str):
+    return db_utils.find_by_field(BOOK_DB_PATH, BOOK_FIELDS, TABLE_NAME, "ZASSETID", asset_id)
+
+def find_by_title(title: str):
+    return db_utils.find_by_field(BOOK_DB_PATH, BOOK_FIELDS, TABLE_NAME, "ZTITLE", title)
+
+def find_by_author(author: str):
+    return db_utils.find_by_field(BOOK_DB_PATH, BOOK_FIELDS, TABLE_NAME, "ZAUTHOR", author)
+
+def find_by_genre(genre: str):
+    return db_utils.find_by_field(BOOK_DB_PATH, BOOK_FIELDS, TABLE_NAME, "ZGENRE", genre)
+
+def find_by_collection_id(collection_id: str):
+    cursor = db_utils.get_db_cursor(BOOK_DB_PATH)
+    fields_str = ", ".join([f"{TABLE_NAME}.{field}" for field in BOOK_FIELDS])
     query = f"""
         SELECT {fields_str}
-        FROM ZBKLIBRARYASSET
+        FROM {TABLE_NAME}
         INNER JOIN ZBKCOLLECTIONMEMBER
-        ON ZBKCOLLECTIONMEMBER.ZASSETID = ZBKLIBRARYASSET.ZASSETID
+        ON ZBKCOLLECTIONMEMBER.ZASSETID = {TABLE_NAME}.ZASSETID
         WHERE ZBKCOLLECTIONMEMBER.ZCOLLECTION = ?
     """
     cursor.execute(query, (collection_id,))
-    res = cursor.fetchall()
-    print(res)
-    return res
-    
+    return cursor.fetchall()

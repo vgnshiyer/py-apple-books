@@ -1,6 +1,6 @@
 import sqlite3
 from pathlib import Path
-from functools import lru_cache
+from py_apple_books.data import db_utils
 
 COLLECTION_DB_PATH = (
     Path.home()
@@ -12,50 +12,23 @@ COLLECTION_FIELDS = [
     'ZTITLE',
 ]
 
-@lru_cache(maxsize=1)
-def get_db_cursor():
-    sqlite_file = list(COLLECTION_DB_PATH.glob("*.sqlite"))[0]
-    conn = sqlite3.connect(sqlite_file)
-    return conn.cursor()
+TABLE_NAME = "ZBKCOLLECTION"
 
 def find_all():
-    cursor = get_db_cursor()
-    fields_str = ", ".join(COLLECTION_FIELDS)
-    query = f"""
-        SELECT {fields_str}
-        FROM ZBKCOLLECTION
-    """
-    cursor.execute(query)
-    return cursor.fetchall()
+    return db_utils.find_all(COLLECTION_DB_PATH, COLLECTION_FIELDS, TABLE_NAME)
 
 def find_by_id(collection_id: str):
-    cursor = get_db_cursor()
-    fields_str = ", ".join(COLLECTION_FIELDS)
-    query = f"""
-        SELECT {fields_str}
-        FROM ZBKCOLLECTION
-        WHERE Z_PK = ?
-    """
-    cursor.execute(query, (collection_id,))
-    return cursor.fetchone()
+    return db_utils.find_by_field(COLLECTION_DB_PATH, COLLECTION_FIELDS, TABLE_NAME, "Z_PK", collection_id)
 
 def find_by_name(collection_name: str):
-    cursor = get_db_cursor()
-    fields_str = ", ".join(COLLECTION_FIELDS)
-    query = f"""
-        SELECT {fields_str}
-        FROM ZBKCOLLECTION
-        WHERE ZTITLE = ?
-    """
-    cursor.execute(query, (collection_name,))
-    return cursor.fetchone()
+    return db_utils.find_by_field(COLLECTION_DB_PATH, COLLECTION_FIELDS, TABLE_NAME, "ZTITLE", collection_name)
 
-def find_collections_by_book_id(book_id: str):
-    cursor = get_db_cursor()
-    fields_str = ", ".join(COLLECTION_FIELDS)
+def find_by_book_id(book_id: str):
+    cursor = db_utils.get_db_cursor(COLLECTION_DB_PATH)
+    fields_str = ", ".join([f"{TABLE_NAME}.{field}" for field in COLLECTION_FIELDS])
     query = f"""
         SELECT {fields_str}
-        FROM ZBKCOLLECTION
+        FROM {TABLE_NAME}
         INNER JOIN ZBKCOLLECTIONMEMBER
         ON ZBKCOLLECTIONMEMBER.ZCOLLECTION = ZBKCOLLECTION.Z_PK
         WHERE ZBKCOLLECTIONMEMBER.ZASSET = ?
