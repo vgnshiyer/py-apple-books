@@ -8,9 +8,8 @@ def get_db_cursor(db_path: Path):
     conn = sqlite3.connect(sqlite_file)
     return conn.cursor()
 
-def find_all(db_path: Path, fields: list, table: str):
+def find_all(db_path: Path, fields_str: str, table: str):
     cursor = get_db_cursor(db_path)
-    fields_str = ", ".join(fields)
     query = f"""
         SELECT {fields_str}
         FROM {table}
@@ -18,9 +17,8 @@ def find_all(db_path: Path, fields: list, table: str):
     cursor.execute(query)
     return cursor.fetchall()
 
-def find_by_field(db_path: Path, fields: list, table: str, field: str, value: str):
+def find_by_field(db_path: Path, fields_str: str, table: str, field: str, value: str):
     cursor = get_db_cursor(db_path)
-    fields_str = ", ".join(fields)
     query = f"""
         SELECT {fields_str}
         FROM {table}
