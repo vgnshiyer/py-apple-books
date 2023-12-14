@@ -32,7 +32,7 @@ class TestBooksApi(unittest.TestCase):
 
     @patch('py_apple_books.data.collection_db.find_by_id')
     def test_get_collection_by_id(self, mock_find_by_id):
-        mock_find_by_id.return_value = (1, 'collection1', 'details1', 0, 0)
+        mock_find_by_id.return_value = [(1, 'collection1', 'details1', 0, 0)]
         collection = self.booksApi.get_collection_by_id('1')
         self.assertIsInstance(collection, Collection)
         self.assertEqual(collection.id, 1)
@@ -46,7 +46,7 @@ class TestBooksApi(unittest.TestCase):
 
     @patch('py_apple_books.data.collection_db.find_by_name')
     def test_get_collection_by_name(self, mock_find_by_name):
-        mock_find_by_name.return_value = (1, 'collection1', 'details1', 0, 0)
+        mock_find_by_name.return_value = [(1, 'collection1', 'details1', 0, 0)]
         collection = self.booksApi.get_collection_by_name('collection1')
         self.assertIsInstance(collection, Collection)
         self.assertEqual(collection.id, 1)

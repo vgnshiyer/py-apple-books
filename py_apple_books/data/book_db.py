@@ -35,6 +35,30 @@ def find_by_genre(genre: str):
 def find_finished_books():
     return db_utils.find_by_field(BOOK_DB_PATH, get_fields_str(), TABLE_NAME, "ZISFINISHED", 1)
 
+def find_unfinished_books():
+    return db_utils.find_by_field(BOOK_DB_PATH, get_fields_str(), TABLE_NAME, "ZISFINISHED", 0)
+
+def find_explicit_books():
+    return db_utils.find_by_field(BOOK_DB_PATH, get_fields_str(), TABLE_NAME, "ZISEXPLICIT", 1)
+
+def find_locked_books():
+    return db_utils.find_by_field(BOOK_DB_PATH, get_fields_str(), TABLE_NAME, "ZISLOCKED", 1)
+
+def find_ephemeral_books():
+    return db_utils.find_by_field(BOOK_DB_PATH, get_fields_str(), TABLE_NAME, "ZISEPHEMERAL", 1)
+
+def find_hidden_books():
+    return db_utils.find_by_field(BOOK_DB_PATH, get_fields_str(), TABLE_NAME, "ZISHIDDEN", 1)
+
+def find_sample_books():
+    return db_utils.find_by_field(BOOK_DB_PATH, get_fields_str(), TABLE_NAME, "ZISSAMPLE", 1)
+
+def find_store_audiobooks():
+    return db_utils.find_by_field(BOOK_DB_PATH, get_fields_str(), TABLE_NAME, "ZISSTOREAUDIOBOOK", 1)
+
+def find_by_rating(rating: int):
+    return db_utils.find_by_field(BOOK_DB_PATH, get_fields_str(), TABLE_NAME, "ZRATING", rating)
+
 def find_by_collection_id(collection_id: str):
     cursor = db_utils.get_db_cursor(BOOK_DB_PATH)
     fields_str = get_fields_str()

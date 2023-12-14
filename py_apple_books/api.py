@@ -32,22 +32,23 @@ class BooksApi:
             for book in books_in_collection:
                 book_obj = Book(**book)
                 collection.get('books').append(book_obj)
-        return collection
 
     def get_collection_by_id(self, collection_id: str, include_books: bool = False) -> Optional[Collection]:
         raw_collection_data = collection_db.find_by_id(collection_id)
         if not raw_collection_data:
             raise CollectionNotFoundError(collection_id=collection_id)
+        raw_collection_data = raw_collection_data[0]
         collection = dict(zip(self.collection_mappings.keys(), raw_collection_data))
-        collection = self._populate_books(collection, include_books)
+        self._populate_books(collection, include_books)
         return Collection(**collection)
 
     def get_collection_by_name(self, collection_name: str, include_books: bool = False) -> Optional[Collection]:
         raw_collection_data = collection_db.find_by_name(collection_name)
         if not raw_collection_data:
             raise CollectionNotFoundError(collection_name=collection_name)
+        raw_collection_data = raw_collection_data[0]
         collection = dict(zip(self.collection_mappings.keys(), raw_collection_data))
-        collection = self._populate_books(collection, include_books)
+        self._populate_books(collection, include_books)
         return Collection(**collection)
 
     def list_books(self) -> list[Book]:
@@ -111,7 +112,83 @@ class BooksApi:
         raw_book_data = book_db.find_finished_books()
         if not raw_book_data:
             return []
-        print(raw_book_data)
+        list_of_books = []
+        books = [dict(zip(self.book_mappings.keys(), b)) for b in raw_book_data]
+        for book in books:
+            book_obj = Book(**book)
+            list_of_books.append(book_obj)
+        return list_of_books
+
+    def get_unfinished_books(self) -> list[Book]:
+        raw_book_data = book_db.find_unfinished_books()
+        if not raw_book_data:
+            return []
+        list_of_books = []
+        books = [dict(zip(self.book_mappings.keys(), b)) for b in raw_book_data]
+        for book in books:
+            book_obj = Book(**book)
+            list_of_books.append(book_obj)
+        return list_of_books
+
+    def get_explicit_books(self) -> list[Book]:
+        raw_book_data = book_db.find_explicit_books()
+        if not raw_book_data:
+            return []
+        list_of_books = []
+        books = [dict(zip(self.book_mappings.keys(), b)) for b in raw_book_data]
+        for book in books:
+            book_obj = Book(**book)
+            list_of_books.append(book_obj)
+        return list_of_books
+
+    def get_locked_books(self) -> list[Book]:
+        raw_book_data = book_db.find_locked_books()
+        if not raw_book_data:
+            return []
+        list_of_books = []
+        books = [dict(zip(self.book_mappings.keys(), b)) for b in raw_book_data]
+        for book in books:
+            book_obj = Book(**book)
+            list_of_books.append(book_obj)
+        return list_of_books
+
+    def get_ephemeral_books(self) -> list[Book]:
+        raw_book_data = book_db.find_ephemeral_books()
+        if not raw_book_data:
+            return []
+        list_of_books = []
+        books = [dict(zip(self.book_mappings.keys(), b)) for b in raw_book_data]
+        for book in books:
+            book_obj = Book(**book)
+            list_of_books.append(book_obj)
+        return list_of_books
+
+    def get_hidden_books(self) -> list[Book]:
+        raw_book_data = book_db.find_hidden_books()
+        if not raw_book_data:
+            return []
+        list_of_books = []
+        books = [dict(zip(self.book_mappings.keys(), b)) for b in raw_book_data]
+        for book in books:
+            book_obj = Book(**book)
+            list_of_books.append(book_obj)
+        return list_of_books
+
+    def get_sample_books(self) -> list[Book]:
+        raw_book_data = book_db.find_sample_books()
+        if not raw_book_data:
+            return []
+        list_of_books = []
+        books = [dict(zip(self.book_mappings.keys(), b)) for b in raw_book_data]
+        for book in books:
+            book_obj = Book(**book)
+            list_of_books.append(book_obj)
+        return list_of_books
+
+    def get_books_by_rating(self, rating: int) -> list[Book]:
+        raw_book_data = book_db.find_by_rating(rating)
+        if not raw_book_data:
+            return []
         list_of_books = []
         books = [dict(zip(self.book_mappings.keys(), b)) for b in raw_book_data]
         for book in books:
