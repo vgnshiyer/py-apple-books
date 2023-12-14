@@ -30,8 +30,6 @@ class BooksApi:
             raw_books_in_collection = book_db.find_by_collection_id(collection['id'])
             books_in_collection = [dict(zip(self.book_mappings.keys(), b)) for b in raw_books_in_collection]
             for book in books_in_collection:
-                book['highlights'] = []
-                book['underlines'] = []
                 book_obj = Book(**book)
                 collection.get('books').append(book_obj)
         return collection
@@ -59,8 +57,6 @@ class BooksApi:
         list_of_books = []
         books = [dict(zip(self.book_mappings.keys(), b)) for b in raw_book_data]
         for book in books:
-            book['highlights'] = []
-            book['underlines'] = []
             book_obj = Book(**book)
             list_of_books.append(book_obj)
         return list_of_books
@@ -69,6 +65,7 @@ class BooksApi:
         raw_book_data = book_db.find_by_id(book_id)
         if not raw_book_data:
             raise BookNotFoundError(book_id=book_id)
+        raw_book_data = raw_book_data[0]
         book = dict(zip(self.book_mappings.keys(), raw_book_data))
         return Book(**book)
 
@@ -76,6 +73,7 @@ class BooksApi:
         raw_book_data = book_db.find_by_asset_id(asset_id)
         if not raw_book_data:
             raise BookNotFoundError(asset_id=asset_id)
+        raw_book_data = raw_book_data[0]
         book = dict(zip(self.book_mappings.keys(), raw_book_data))
         return Book(**book)
 
@@ -83,22 +81,43 @@ class BooksApi:
         raw_book_data = book_db.find_by_title(title)
         if not raw_book_data:
             raise BookNotFoundError(title=title)
+        raw_book_data = raw_book_data[0]
         book = dict(zip(self.book_mappings.keys(), raw_book_data))
         return Book(**book)
 
-    def get_book_by_author(self, author: str) -> Optional[Book]:
+    def get_books_by_author(self, author: str) -> Optional[Book]:
         raw_book_data = book_db.find_by_author(author)
         if not raw_book_data:
             raise BookNotFoundError(author=author)
-        book = dict(zip(self.book_mappings.keys(), raw_book_data))
-        return Book(**book)
+        books = [dict(zip(self.book_mappings.keys(), b)) for b in raw_book_data]
+        list_of_books = []
+        for book in books:
+            book_obj = Book(**book)
+            list_of_books.append(book_obj)
+        return list_of_books
 
-    def get_book_by_genre(self, genre: str) -> Optional[Book]:
+    def get_books_by_genre(self, genre: str) -> Optional[Book]:
         raw_book_data = book_db.find_by_genre(genre)
         if not raw_book_data:
             raise BookNotFoundError(genre=genre)
-        book = dict(zip(self.book_mappings.keys(), raw_book_data))
-        return Book(**book)
+        books = [dict(zip(self.book_mappings.keys(), b)) for b in raw_book_data]
+        list_of_books = []
+        for book in books:
+            book_obj = Book(**book)
+            list_of_books.append(book_obj)
+        return list_of_books
+
+    def get_finished_books(self) -> list[Book]:
+        raw_book_data = book_db.find_finished_books()
+        if not raw_book_data:
+            return []
+        print(raw_book_data)
+        list_of_books = []
+        books = [dict(zip(self.book_mappings.keys(), b)) for b in raw_book_data]
+        for book in books:
+            book_obj = Book(**book)
+            list_of_books.append(book_obj)
+        return list_of_books
 
     def get_books_by_collection_id(self, collection_id: str) -> list[Book]:
         raw_book_data = book_db.find_by_collection_id(collection_id)

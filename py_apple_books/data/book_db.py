@@ -32,6 +32,9 @@ def find_by_author(author: str):
 def find_by_genre(genre: str):
     return db_utils.find_by_field(BOOK_DB_PATH, get_fields_str(), TABLE_NAME, "ZGENRE", genre)
 
+def find_finished_books():
+    return db_utils.find_by_field(BOOK_DB_PATH, get_fields_str(), TABLE_NAME, "ZISFINISHED", 1)
+
 def find_by_collection_id(collection_id: str):
     cursor = db_utils.get_db_cursor(BOOK_DB_PATH)
     fields_str = get_fields_str()

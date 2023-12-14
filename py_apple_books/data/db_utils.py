@@ -25,4 +25,4 @@ def find_by_field(db_path: Path, fields_str: str, table: str, field: str, value:
         WHERE {field} = ?
     """
     cursor.execute(query, (value,))
-    return cursor.fetchone()
+    return cursor.fetchall()
