@@ -8,7 +8,7 @@ if __name__ == '__main__':
     for c in collections:
         print(c)
 
-    # books = booksApi.list_books()
+    books = booksApi.list_books()
 
-    # for b in books:
-    #     print(b)
+    for b in books:
+        print(b)

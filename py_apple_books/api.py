@@ -18,7 +18,6 @@ class BooksApi:
             return []
         list_of_collections = []
         collections = [dict(zip(self.collection_mappings.keys(), c)) for c in raw_collection_data]
-        print(collections)
         for collection in collections:
             self._populate_books(collection, include_books)
             collection_obj = Collection(**collection)
@@ -31,6 +30,8 @@ class BooksApi:
             raw_books_in_collection = book_db.find_by_collection_id(collection['id'])
             books_in_collection = [dict(zip(self.book_mappings.keys(), b)) for b in raw_books_in_collection]
             for book in books_in_collection:
+                book['highlights'] = []
+                book['underlines'] = []
                 book_obj = Book(**book)
                 collection.get('books').append(book_obj)
         return collection
@@ -58,6 +59,8 @@ class BooksApi:
         list_of_books = []
         books = [dict(zip(self.book_mappings.keys(), b)) for b in raw_book_data]
         for book in books:
+            book['highlights'] = []
+            book['underlines'] = []
             book_obj = Book(**book)
             list_of_books.append(book_obj)
         return list_of_books

@@ -43,13 +43,13 @@ class Book:
 
     # User interactions
     rating: int
-    highlights: list[Highlight]
-    underlines: list[Underline]
+    highlights: list[Highlight] = None
+    underlines: list[Underline] = None
 
     def __post_init__(self):
-        self.creation_date = datetime.fromtimestamp(float(self.creation_date) / 1000)
-        self.finished_date = datetime.fromtimestamp(float(self.finished_date) / 1000)
-        self.last_opened_date = datetime.fromtimestamp(float(self.last_opened_date) / 1000)
-        self.purchased_date = datetime.fromtimestamp(float(self.purchased_date) / 1000)
-        self.duration = float(self.duration) / 1000
-        self.reading_progress = float(self.reading_progress) * 100
+        self.creation_date = datetime.fromtimestamp(float(self.creation_date) / 1000) if self.creation_date else None
+        self.finished_date = datetime.fromtimestamp(float(self.finished_date) / 1000) if self.finished_date else None
+        self.last_opened_date = datetime.fromtimestamp(float(self.last_opened_date) / 1000) if self.last_opened_date else None
+        self.purchased_date = datetime.fromtimestamp(float(self.purchased_date) / 1000) if self.purchased_date else None
+        self.duration = float(self.duration) / 1000 if self.duration else None
+        self.reading_progress = float(self.reading_progress) * 100 if self.reading_progress else None
