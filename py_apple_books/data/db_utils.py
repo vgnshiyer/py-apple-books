@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 import sqlite3
+from py_apple_books.utils import get_mappings
 
 @lru_cache(maxsize=1)
 def get_db_cursor(db_path: Path):
@@ -31,4 +32,9 @@ def find_by_field(db_path: Path, fields_str: str, table: str, field: str, value:
         WHERE {field} = ?
     """
     cursor.execute(query, (value,))
+    return cursor.fetchall()
+
+def run_query(db_path: Path, query: str):
+    cursor = get_db_cursor(db_path)
+    cursor.execute(query)
     return cursor.fetchall()
