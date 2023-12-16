@@ -1,7 +1,9 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from py_apple_books.models.annotation import Annotation
 from py_apple_books.models.highlight import Highlight
 from py_apple_books.models.underline import Underline
 from datetime import datetime
+from typing import List
 import pathlib
 
 @dataclass
@@ -43,8 +45,9 @@ class Book:
 
     # User interactions
     rating: int
-    highlights: list[Highlight] = None
-    underlines: list[Underline] = None
+    highlights: List[Highlight] = field(default_factory=list)
+    underlines: List[Underline] = field(default_factory=list)
+    other_annotations: List[Annotation] = field(default_factory=list)
 
     def __post_init__(self):
         self.creation_date = datetime.fromtimestamp(float(self.creation_date) / 1000) if self.creation_date else None
@@ -53,3 +56,11 @@ class Book:
         self.purchased_date = datetime.fromtimestamp(float(self.purchased_date) / 1000) if self.purchased_date else None
         self.duration = float(self.duration) / 1000 if self.duration else None
         self.reading_progress = float(self.reading_progress) * 100 if self.reading_progress else None
+
+    def add_annotation(self, annotation: Annotation):
+        if isinstance(annotation, Highlight):
+            self.highlights.append(annotation)
+        elif isinstance(annotation, Underline):
+            self.underlines.append(annotation)
+        else:
+            self.other_annotations.append(annotation)
