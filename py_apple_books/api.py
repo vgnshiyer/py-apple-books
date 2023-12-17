@@ -108,14 +108,14 @@ class BooksApi:
         raw_book_data = raw_book_data[0]
         return self._create_book_object(raw_book_data)
 
-    def get_book_by_title(self, title: str) -> Optional[Book]:
+    def get_book_by_title(self, title: str, include_annotations: bool = False) -> Optional[Book]:
         raw_book_data = book_db.find_by_title(title, include_annotations)
         if not raw_book_data:
             raise BookNotFoundError(title=title)
         raw_book_data = raw_book_data[0]
         return self._create_book_object(raw_book_data)
 
-    def get_books_by_author(self, author: str) -> Optional[Book]:
+    def get_books_by_author(self, author: str, include_annotations: bool = False) -> Optional[Book]:
         list_of_books = []
         raw_book_data = book_db.find_by_author(author, include_annotations)
         if not raw_book_data:
@@ -124,7 +124,7 @@ class BooksApi:
             list_of_books.append(self._create_book_object(book_data))
         return list_of_books
 
-    def get_books_by_genre(self, genre: str) -> Optional[Book]:
+    def get_books_by_genre(self, genre: str, include_annotations: bool = False) -> Optional[Book]:
         list_of_books = []
         raw_book_data = book_db.find_by_genre(genre)
         if not raw_book_data:
@@ -133,7 +133,7 @@ class BooksApi:
             list_of_books.append(self._create_book_object(book_data))
         return list_of_books
 
-    def get_finished_books(self) -> list[Book]:
+    def get_finished_books(self, include_annotations: bool = False) -> list[Book]:
         list_of_books = []
         raw_book_data = book_db.find_finished_books()
         if not raw_book_data:
@@ -142,7 +142,7 @@ class BooksApi:
             list_of_books.append(self._create_book_object(book_data))
         return list_of_books
 
-    def get_unfinished_books(self) -> list[Book]:
+    def get_unfinished_books(self, include_annotations: bool = False) -> list[Book]:
         list_of_books = []
         raw_book_data = book_db.find_unfinished_books()
         if not raw_book_data:
@@ -151,7 +151,7 @@ class BooksApi:
             list_of_books.append(self._create_book_object(book_data))
         return list_of_books
 
-    def get_explicit_books(self) -> list[Book]:
+    def get_explicit_books(self, include_annotations: bool = False) -> list[Book]:
         list_of_books = []
         raw_book_data = book_db.find_explicit_books()
         if not raw_book_data:
@@ -160,7 +160,7 @@ class BooksApi:
             list_of_books.append(self._create_book_object(book_data))
         return list_of_books
 
-    def get_locked_books(self) -> list[Book]:
+    def get_locked_books(self, include_annotations: bool = False) -> list[Book]:
         list_of_books = []
         raw_book_data = book_db.find_locked_books()
         if not raw_book_data:
@@ -169,7 +169,7 @@ class BooksApi:
             list_of_books.append(self._create_book_object(book_data))
         return list_of_books
 
-    def get_ephemeral_books(self) -> list[Book]:
+    def get_ephemeral_books(self, include_annotations: bool = False) -> list[Book]:
         list_of_books = []
         raw_book_data = book_db.find_ephemeral_books()
         if not raw_book_data:
@@ -178,7 +178,7 @@ class BooksApi:
             list_of_books.append(self._create_book_object(book_data))
         return list_of_books
 
-    def get_hidden_books(self) -> list[Book]:
+    def get_hidden_books(self, include_annotations: bool = False) -> list[Book]:
         list_of_books = []
         raw_book_data = book_db.find_hidden_books()
         if not raw_book_data:
@@ -187,7 +187,7 @@ class BooksApi:
             list_of_books.append(self._create_book_object(book_data))
         return list_of_books
 
-    def get_sample_books(self) -> list[Book]:
+    def get_sample_books(self, include_annotations: bool = False) -> list[Book]:
         list_of_books = []
         raw_book_data = book_db.find_sample_books()
         if not raw_book_data:
@@ -196,7 +196,7 @@ class BooksApi:
             list_of_books.append(self._create_book_object(book_data))
         return list_of_books
 
-    def get_books_by_rating(self, rating: int) -> list[Book]:
+    def get_books_by_rating(self, rating: int, include_annotations: bool = False) -> list[Book]:
         list_of_books = []
         raw_book_data = book_db.find_by_rating(rating)
         if not raw_book_data:
@@ -205,7 +205,7 @@ class BooksApi:
             list_of_books.append(self._create_book_object(book_data))
         return list_of_books
 
-    def get_books_by_collection_id(self, collection_id: str) -> list[Book]:
+    def get_books_by_collection_id(self, collection_id: str, include_annotations: bool = False) -> list[Book]:
         list_of_books = []
         raw_book_data = book_db.find_by_collection_id(collection_id)
         if not raw_book_data:
