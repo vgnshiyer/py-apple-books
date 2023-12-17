@@ -23,3 +23,22 @@ class BookNotFoundError(Exception):
             super().__init__(f"Book with collection id {collection_id} not found")
         else:
             super().__init__("Book not found")
+
+class AnnotationNotFoundError(Exception):
+    def __init__(self, annotation_id=None, asset_id=None, representative_text=None, selected_text=None, note=None, chapter=None, location=None):
+        if annotation_id:
+            super().__init__(f"Annotation with id {annotation_id} not found")
+        elif asset_id:
+            super().__init__(f"Annotation with asset id {asset_id} not found")
+        elif representative_text:
+            super().__init__(f"Annotation with representative text {representative_text} not found")
+        elif selected_text:
+            super().__init__(f"Annotation with selected text {selected_text} not found")
+        elif note:
+            super().__init__(f"Annotation with note {note} not found")
+        elif chapter:
+            super().__init__(f"Annotation with chapter {chapter} not found")
+        elif location:
+            super().__init__(f"Annotation with location {location} not found")
+        else:
+            super().__init__("Annotation not found")

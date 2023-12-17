@@ -4,7 +4,7 @@ from py_apple_books.models.collection import Collection
 from py_apple_books.models.highlight import Highlight
 from py_apple_books.models.underline import Underline
 from py_apple_books.models.annotation import Annotation
-from py_apple_books.exceptions import CollectionNotFoundError, BookNotFoundError
+from py_apple_books.exceptions import CollectionNotFoundError, BookNotFoundError, AnnotationNotFoundError
 from py_apple_books.utils import get_mappings
 from typing import Optional
 
@@ -248,28 +248,26 @@ class BooksApi:
             list_of_annotations.append(self._create_annotation_object(annotation))
         return list_of_annotations
 
-    def get_annotations_by_id(self, annotation_id: str) -> Optional[Annotation]:
+    def get_annotation_by_id(self, annotation_id: str) -> Optional[Annotation]:
         raw_annotation_data = annotation_db.find_by_id(annotation_id)
         if not raw_annotation_data:
-            return None
+            raise AnnotationNotFoundError(annotation_id=annotation_id)
         raw_annotation_data = raw_annotation_data[0]
         annotation = dict(zip(self._annotation_mappings.keys(), raw_annotation_data))
         return self._create_annotation_object(annotation)
 
-    def get_annotations_by_book_id(self, asset_id: str) -> Optional[Annotation]:
+    def get_annotation_by_book_id(self, asset_id: str) -> Optional[Annotation]:
         raw_annotation_data = annotation_db.find_by_book_id(asset_id)
         if not raw_annotation_data:
-            return None
-        annotations = [dict(zip(self._annotation_mappings.keys(), a)) for a in raw_annotation_data]
-        list_of_annotations = []
-        for annotation in annotations:
-            annotation_obj = self._create_annotation_object(annotation)
-            list_of_annotations.append(annotation_obj)
-        return list_of_annotations
+            raise AnnotationNotFoundError(asset_id=asset_id)
+        raw_annotation_data = raw_annotation_data[0]
+        annotation = dict(zip(self._annotation_mappings.keys(), raw_annotation_data))
+        return self._create_annotation_object(annotation)
 
     def get_annotations_by_representative_text(self, representative_text: str) -> Optional[Annotation]:
         raw_annotation_data = annotation_db.find_by_representative_text(representative_text)
-        if not raw_annotation_data: return None
+        if not raw_annotation_data: 
+            raise AnnotationNotFoundError(representative_text=representative_text)
         list_of_annotations = []
         annotations = [dict(zip(self._annotation_mappings.keys(), a)) for a in raw_annotation_data]
         for annotation in annotations:
@@ -307,15 +305,12 @@ class BooksApi:
             list_of_annotations.append(annotation_obj)
         return list_of_annotations
 
-    def get_annotations_by_location(self, location: str) -> list[Annotation]:
+    def get_annotation_by_location(self, location: str) -> list[Annotation]:
         raw_annotation_data = annotation_db.find_by_location(location)
-        if not raw_annotation_data: return []
-        list_of_annotations = []
-        annotations = [dict(zip(self._annotation_mappings.keys(), a)) for a in raw_annotation_data]
-        for annotation in annotations:
-            annotation_obj = self._create_annotation_object(annotation)
-            list_of_annotations.append(annotation_obj)
-        return list_of_annotations
+        if not raw_annotation_data: raise AnnotationNotFoundError(location=location)
+        raw_annotation_data = raw_annotation_data[0]
+        annotation = dict(zip(self._annotation_mappings.keys(), raw_annotation_data))
+        return self._create_annotation_object(annotation)
 
     def get_annotations_by_note(self, note: str) -> list[Annotation]:
         raw_annotation_data = annotation_db.find_by_note_text(note)
@@ -333,5 +328,6 @@ class BooksApi:
         if not raw_annotation_data: return []
         annotations = [dict(zip(self._annotation_mappings.keys(), a)) for a in raw_annotation_data]
         for annotation in annotations:
-            list_of_annotations.append(self._create_annotation_object(annotation))
+            annotation_obj = self._create_annotation_object(annotation)
+            list_of_annotations.append(annotation_obj)
         return list_of_annotations
