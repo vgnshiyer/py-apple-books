@@ -17,7 +17,19 @@ class Collection:
     books: List[Book] = field(default_factory=list)
 
     def add_book(self, book: Book) -> None:
+        """
+        Adds a book to the collection.
+
+        Args:
+            book (Book): book to add to the collection
+        """
         self.books.append(book)
 
-    def __hash__(self):
+    def __hash__(self) -> int:
+        """
+        Returns a hash value for the Collection object.
+
+        Returns:
+            int: hash value for the Collection object
+        """
         return hash(self.id)

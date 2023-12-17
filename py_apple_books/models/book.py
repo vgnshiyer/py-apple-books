@@ -1,8 +1,3 @@
-from dataclasses import dataclass, field
-from py_apple_books.models.annotation import Annotation
-from py_apple_books.models.highlight import Highlight
-from py_apple_books.models.underline import Underline
-from datetime import datetime
 from typing import List
 import pathlib
 
@@ -50,6 +45,9 @@ class Book:
     other_annotations: List[Annotation] = field(default_factory=list)
 
     def __post_init__(self):
+        """
+        Converts the creation_date, finished_date, last_opened_date, and purchased_date from timestamp to datetime.
+        """
         self.creation_date = datetime.fromtimestamp(float(self.creation_date) / 1000) if self.creation_date else None
         self.finished_date = datetime.fromtimestamp(float(self.finished_date) / 1000) if self.finished_date else None
         self.last_opened_date = datetime.fromtimestamp(float(self.last_opened_date) / 1000) if self.last_opened_date else None
@@ -57,10 +55,22 @@ class Book:
         self.duration = float(self.duration) / 1000 if self.duration else None
         self.reading_progress = float(self.reading_progress) * 100 if self.reading_progress else None
 
-    def __hash__(self):
+    def __hash__(self) -> int:
+        """
+        Returns a hash value for the Book object.
+
+        Returns:
+            int: hash value for the Book object
+        """
         return hash(self.id)
 
-    def add_annotation(self, annotation: Annotation):
+    def add_annotation(self, annotation: Annotation) -> None:
+        """
+        Adds an annotation to the book.
+
+        Args:
+            annotation (Annotation): annotation to add
+        """
         if isinstance(annotation, Highlight):
             self.highlights.append(annotation)
         elif isinstance(annotation, Underline):
