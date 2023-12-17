@@ -9,7 +9,7 @@ from py_apple_books.utils import get_mappings
 from typing import Optional
 
 
-class BooksApi:
+class PyAppleBooks:
 
     def __init__(self):
         self._book_mappings = get_mappings('Book')
@@ -96,7 +96,7 @@ class BooksApi:
                 book.add_annotation(self._create_annotation_object(annotation_dict))
         return book
 
-    def _create_collection_object(self, raw_collection_data) -> Collection:
+    def _create_collection_object(self, raw_collection_data: list) -> Collection:
         """
         Returns a Collection object.
 
@@ -424,8 +424,8 @@ class BooksApi:
         if not raw_book_data:
             raise BookNotFoundError(collection_id=collection_id)
         for book_data in raw_book_data:
-            list_of_books.append(self._create_book_object(book_data))
-        return list_of_books
+            list_of_books.add(self._create_book_object(book_data))
+        return list(list_of_books)
 
     def list_annotations(self) -> list[Annotation]:
         """
@@ -472,7 +472,7 @@ class BooksApi:
             list_of_annotations.append(self._create_annotation_object(annotation))
         return list_of_annotations
 
-    def get_annotations_with_notes(self) -> list[Annotation]:
+    def get_all_notes(self) -> list[Annotation]:
         """
         Fetches a list of Annotation objects with notes.
 
@@ -504,22 +504,25 @@ class BooksApi:
         annotation = dict(zip(self._annotation_mappings.keys(), raw_annotation_data))
         return self._create_annotation_object(annotation)
 
-    def get_annotation_by_book_id(self, asset_id: str) -> Optional[Annotation]:
+    def get_annotations_by_book_id(self, asset_id: str) -> Optional[Annotation]:
         """
-        Fetches an Annotation object by book id.
+        Fetches Annotations by book id.
 
         Args:
             asset_id (str): book id
 
         Returns:
-            Annotation: Annotation object
+            list[Annotation]: list of Annotation objects
         """
         raw_annotation_data = annotation_db.find_by_book_id(asset_id)
         if not raw_annotation_data:
             raise AnnotationNotFoundError(asset_id=asset_id)
-        raw_annotation_data = raw_annotation_data[0]
-        annotation = dict(zip(self._annotation_mappings.keys(), raw_annotation_data))
-        return self._create_annotation_object(annotation)
+        annotations = [dict(zip(self._annotation_mappings.keys(), a)) for a in raw_annotation_data]
+        list_of_annotations = []
+        for annotation in annotations:
+            annotation_obj = self._create_annotation_object(annotation)
+            list_of_annotations.append(annotation_obj)
+        return list_of_annotations
 
     def get_annotations_by_representative_text(self, representative_text: str) -> Optional[Annotation]:
         """
@@ -532,8 +535,7 @@ class BooksApi:
             list[Annotation]: list of Annotation objects
         """
         raw_annotation_data = annotation_db.find_by_representative_text(representative_text)
-        if not raw_annotation_data: 
-            raise AnnotationNotFoundError(representative_text=representative_text)
+        if not raw_annotation_data: return []
         list_of_annotations = []
         annotations = [dict(zip(self._annotation_mappings.keys(), a)) for a in raw_annotation_data]
         for annotation in annotations:
