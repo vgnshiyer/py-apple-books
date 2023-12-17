@@ -57,6 +57,9 @@ class Book:
         self.duration = float(self.duration) / 1000 if self.duration else None
         self.reading_progress = float(self.reading_progress) * 100 if self.reading_progress else None
 
+    def __hash__(self):
+        return hash(self.id)
+
     def add_annotation(self, annotation: Annotation):
         if isinstance(annotation, Highlight):
             self.highlights.append(annotation)

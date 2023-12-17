@@ -5,6 +5,7 @@ from functools import lru_cache
 
 BOOK_TABLE_NAME = "ZBKLIBRARYASSET"
 ANNOTATION_TABLE_NAME = "anno_db.ZAEANNOTATION"
+COLLECTIONMEMBER_TABLE_NAME = "ZBKCOLLECTIONMEMBER"
 
 fields_str = db_utils.get_fields_str('Book', BOOK_TABLE_NAME)
 
@@ -130,9 +131,9 @@ def find_by_collection_id(collection_id: str):
     query = f"""
         SELECT {fields_str}
         FROM {BOOK_TABLE_NAME}
-        INNER JOIN ZBKCOLLECTIONMEMBER
-        ON ZBKCOLLECTIONMEMBER.ZASSET = {BOOK_TABLE_NAME}.Z_PK
-        WHERE ZBKCOLLECTIONMEMBER.ZCOLLECTION = ?
+        INNER JOIN {COLLECTIONMEMBER_TABLE_NAME}
+        ON {COLLECTIONMEMBER_TABLE_NAME}.ZASSET = {BOOK_TABLE_NAME}.Z_PK
+        WHERE {COLLECTIONMEMBER_TABLE_NAME}.ZCOLLECTION = ?
     """
     cursor.execute(query, (collection_id,))
     return cursor.fetchall()
