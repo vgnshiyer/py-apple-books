@@ -7,12 +7,12 @@ ANNOTATION_TABLE_NAME = "anno_db.ZAEANNOTATION"
 COLLECTIONMEMBER_TABLE_NAME = "ZBKCOLLECTIONMEMBER"
 
 @lru_cache(maxsize=5)
-def get_fields_str(class_name: str, table_name: str):
+def get_fields_str(class_name: str, table_name: str) -> str:
     mappings = get_mappings(class_name)
     return ", ".join(f"{table_name}.{mappings[field]} AS {field}" for field in mappings)
 
 @lru_cache(maxsize=1)
-def get_book_annotation_query():
+def get_book_annotation_query() -> str:
     book_fields_str = get_fields_str('Book', BOOK_TABLE_NAME)
     annotation_fields_str = get_fields_str('Annotation', ANNOTATION_TABLE_NAME)
     query = f"""
@@ -24,7 +24,7 @@ def get_book_annotation_query():
     return query
 
 @lru_cache(maxsize=1)
-def book_collection_member_query():
+def book_collection_member_query() -> str:
     fields_str = get_fields_str('Book', BOOK_TABLE_NAME)
     query = f"""
         SELECT {fields_str}
@@ -35,7 +35,7 @@ def book_collection_member_query():
     return query
 
 @lru_cache(maxsize=1)
-def get_book_collection_query():
+def get_book_collection_query() -> str:
     collection_fields_str = get_fields_str('Collection', COLLECTION_TABLE_NAME)
     book_fields_str = get_fields_str('Book', BOOK_TABLE_NAME)
     query = f"""
@@ -49,7 +49,7 @@ def get_book_collection_query():
     return query
 
 @lru_cache(maxsize=1)
-def get_collection_collection_member_query():
+def get_collection_collection_member_query() -> str:
     collection_fields_str = get_fields_str('Collection', COLLECTION_TABLE_NAME)
     query = f"""
         SELECT {collection_fields_str}
