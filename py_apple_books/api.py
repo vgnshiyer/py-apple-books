@@ -24,6 +24,8 @@ class BooksApi:
             5: 'Purple',
         }
 
+        self._book_map = {}
+
     def _create_annotation_object(self, annotation: dict) -> Annotation:
         is_underline = annotation.pop('is_underline')
         style = annotation.pop('style')
@@ -35,35 +37,31 @@ class BooksApi:
         else:
             return Annotation(**annotation)
 
+    def _get_or_create_book(self, book_params: dict) -> Book:
+        id_ = book_params['id']
+        if id_ not in self._book_map:
+            self._book_map[id_] = Book(**book_params)
+        return self._book_map[id_]
+
     def _create_book_object(self, raw_book_data: list) -> Book:
         book_fields_len = len(self._book_mappings)
         book_dict = dict(zip(self._book_mappings.keys(), raw_book_data[:book_fields_len]))
-        book = Book(**book_dict)
+        book = self._get_or_create_book(book_dict)
         if raw_book_data[book_fields_len:]:
             annotation_dict = dict(zip(self._annotation_mappings.keys(), raw_book_data[book_fields_len:]))
             if annotation_dict['id']:
                 book.add_annotation(self._create_annotation_object(annotation_dict))
         return book
 
-    def _populate_books(self, collection: dict, include_books: bool) -> dict:
-        collection['books'] = []
-        if include_books:
-            raw_books_in_collection = book_db.find_by_collection_id(collection['id'])
-            books_in_collection = [dict(zip(self._book_mappings.keys(), b)) for b in raw_books_in_collection]
-            for book in books_in_collection:
-                book_obj = Book(**book)
-                collection.get('books').append(book_obj)
-
     def list_collections(self, include_books: bool = False) -> list[Collection]:
-        if include_books == False:
-            raw_collection_data = collection_db.find_all()
-            if not raw_collection_data:
-                return []
-            list_of_collections = []
-            collections = [dict(zip(self._collection_mappings.keys(), c)) for c in raw_collection_data]
-            for collection in collections:
-                collection_obj = Collection(**collection)
-                list_of_collections.append(collection_obj)
+        raw_collection_data = collection_db.find_all(include_books)
+        if not raw_collection_data:
+            return []
+        list_of_collections = []
+        collections = [dict(zip(self._collection_mappings.keys(), c)) for c in raw_collection_data]
+        for collection in collections:
+            collection_obj = Collection(**collection)
+            list_of_collections.append(collection_obj)
             
         return list_of_collections
 
