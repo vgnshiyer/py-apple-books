@@ -18,10 +18,6 @@ def get_db_cursor():
     cursor.execute(f"ATTACH DATABASE '{other_sqlite_file}' AS anno_db")
     return cursor
 
-def get_fields_str(class_name: str, table_name: str):
-    mappings = get_mappings(class_name)
-    return ", ".join(f"{table_name}.{mappings[field]} AS {field}" for field in mappings)
-
 
 def find_all(fields_str: str, table: str):
     cursor = get_db_cursor()
