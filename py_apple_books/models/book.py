@@ -1,5 +1,12 @@
+from py_apple_books.models.annotation import Annotation
+from py_apple_books.models.highlight import Highlight
+from py_apple_books.models.underline import Underline
+
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import List
 import pathlib
+
 
 @dataclass
 class Book:
