@@ -11,8 +11,8 @@ def find_all(annotations: bool = False) -> list:
         list: list of all books in the database
     """
     if not annotations:
-        fields_str = db_utils.get_fields_str('Book', query_utils.BOOK_TABLE_NAME)
-        return db_utils.find_all(fields_str, BOOK_TABLE_NAME)
+        fields_str = query_utils.get_fields_str('Book', query_utils.BOOK_TABLE_NAME)
+        return db_utils.find_all(fields_str, query_utils.BOOK_TABLE_NAME)
     return db_utils.run_query(query_utils.get_book_annotation_query())
 
 def find_by_id(book_id: str, annotations: bool = False) -> list:
