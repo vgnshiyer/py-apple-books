@@ -16,14 +16,17 @@ def get_db_cursor() -> sqlite3.Cursor:
     Returns:
         sqlite3.Cursor: cursor for the database
     """
-    sqlite_file = list(DB_PATHS[0].glob("*.sqlite"))[0]
-    conn = sqlite3.connect(sqlite_file)
-    cursor = conn.cursor()
+    try:
+        sqlite_file = list(DB_PATHS[0].glob("*.sqlite"))[0]
+        conn = sqlite3.connect(sqlite_file)
+        cursor = conn.cursor()
 
-    other_sqlite_file = list(DB_PATHS[1].glob("*.sqlite"))[0]
-    cursor.execute(f"ATTACH DATABASE '{other_sqlite_file}' AS anno_db")
-    return cursor
-
+        other_sqlite_file = list(DB_PATHS[1].glob("*.sqlite"))[0]
+        cursor.execute(f"ATTACH DATABASE '{other_sqlite_file}' AS anno_db")
+        return cursor
+    except sqlite3.Error as e:
+        print("Error connecting to database: ", e)
+        return None
 
 def find_all(fields_str: str, table: str) -> list:
     """
@@ -36,13 +39,17 @@ def find_all(fields_str: str, table: str) -> list:
     Returns:
         list: list of all rows in the table
     """
-    cursor = get_db_cursor()
-    query = f"""
-        SELECT {fields_str}
-        FROM {table}
-    """
-    cursor.execute(query)
-    return cursor.fetchall()
+    try:
+        cursor = get_db_cursor()
+        query = f"""
+            SELECT {fields_str}
+            FROM {table}
+        """
+        cursor.execute(query)
+        return cursor.fetchall()
+    except sqlite3.Error as e:
+        print(f"An error occurred while fetching all rows: {e}")
+        return []
 
 def find_by_field(fields_str: str, table: str, field: str, value: str) -> list:
     """
@@ -57,14 +64,18 @@ def find_by_field(fields_str: str, table: str, field: str, value: str) -> list:
     Returns:
         list: list of rows in the table matching the field and value
     """
-    cursor = get_db_cursor()
-    query = f"""
-        SELECT {fields_str}
-        FROM {table}
-        WHERE {field} = ?
-    """
-    cursor.execute(query, (value,))
-    return cursor.fetchall()
+    try:
+        cursor = get_db_cursor()
+        query = f"""
+            SELECT {fields_str}
+            FROM {table}
+            WHERE {field} = ?
+        """
+        cursor.execute(query, (value,))
+        return cursor.fetchall()
+    except sqlite3.Error as e:
+        print(f"An error occurred while fetching rows by field: {e}")
+        return []
 
 def run_query(query: str) -> list:
     cursor = get_db_cursor()
