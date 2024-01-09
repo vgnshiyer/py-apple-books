@@ -2,6 +2,9 @@
 
 PyAppleBooks is a Python library designed to streamline interactions with Apple Books data. It offers a straightforward and intuitive interface, empowering developers to effortlessly access, manipulate, and manage Apple Books content through Python-based applications.
 
+[![PyPI](https://img.shields.io/pypi/v/py_apple_books.svg)](https://pypi.org/project/py-apple-books/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 ## Installation
 
 `pip install py_apple_books`
