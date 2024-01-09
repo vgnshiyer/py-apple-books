@@ -179,3 +179,21 @@ def find_notes() -> list:
         WHERE ZANNOTATIONNOTE != ''
     """
     return db_utils.run_query(query)
+
+def find_by_style(style: str) -> list:
+    """
+    Fetches annotations by style
+
+    Args:
+        style (str): style of the annotation
+
+    Returns:
+        list: list of annotations with the specified style
+    """
+    fields_str = query_utils.get_fields_str('Annotation', query_utils.ANNOTATION_TABLE_NAME)
+    query = f"""
+        SELECT {fields_str}
+        FROM {query_utils.ANNOTATION_TABLE_NAME}
+        WHERE ZANNOTATIONSTYLE = {style}
+    """
+    return db_utils.run_query(query)

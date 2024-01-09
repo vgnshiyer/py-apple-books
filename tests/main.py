@@ -339,6 +339,17 @@ class TestBooksApi(unittest.TestCase):
         notes = self.booksApi.get_all_notes()
         self.assertEqual(len(notes), 0)
 
+    @patch('py_apple_books.data.annotation_db.find_by_style')
+    def test_get_annotations_by_color(self, mock_find_by_style):
+        mock_find_by_style.return_value = [
+            (1, 'asset1', 1, 0, 0, datetime.datetime.now().timestamp(), datetime.datetime.now().timestamp(), 'sel_text1', 'rep_text1', 'note1', 'locat1', 'chapter1'),
+            (2, 'asset2', 1, 0, 0, datetime.datetime.now().timestamp(), datetime.datetime.now().timestamp(), 'sel_text2', 'rep_text2', 'note2', 'locat2', 'chapter2')
+        ]
+        annotations = self.booksApi.get_annotation_by_color('yellow')
+        self.assertEqual(len(annotations), 2)
+        self.assertIsInstance(annotations[0], Annotation)
+        self.assertIsInstance(annotations[1], Annotation)
+
 
 if __name__ == '__main__':
     unittest.main()

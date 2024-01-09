@@ -60,6 +60,7 @@ def find_by_title(title: str, annotations: bool = False) -> list:
         list: list of books with the specified title
     """
     if not annotations:
+        fields_str = query_utils.get_fields_str('Book', query_utils.BOOK_TABLE_NAME)
         return db_utils.find_by_field(fields_str, query_utils.BOOK_TABLE_NAME, "ZTITLE", title)
     query = query_utils.get_book_annotation_query()
     query += f"WHERE {query_utils.BOOK_TABLE_NAME}.ZTITLE = '{title}'"
@@ -77,6 +78,7 @@ def find_by_author(author: str, annotations: bool = False) -> list:
         list: list of books with the specified author
     """
     if not annotations:
+        fields_str = query_utils.get_fields_str('Book', query_utils.BOOK_TABLE_NAME)
         return db_utils.find_by_field(fields_str, query_utils.BOOK_TABLE_NAME, "ZAUTHOR", author)
     query = query_utils.get_book_annotation_query()
     query += f"WHERE {query_utils.BOOK_TABLE_NAME}.ZAUTHOR = '{author}'"
@@ -93,6 +95,7 @@ def find_by_genre(genre: str, annotations: bool = False) -> list:
         list: list of books with the specified genre
     """
     if not annotations:
+        fields_str = query_utils.get_fields_str('Book', query_utils.BOOK_TABLE_NAME)
         return db_utils.find_by_field(fields_str, query_utils.BOOK_TABLE_NAME, "ZGENRE", genre)
     query = query_utils.get_book_annotation_query()
     query += f"WHERE {query_utils.BOOK_TABLE_NAME}.ZGENRE = '{genre}'"
@@ -106,6 +109,7 @@ def find_finished_books(annotations: bool = False) -> list:
         list: list of all finished books
     """
     if not annotations:
+        fields_str = query_utils.get_fields_str('Book', query_utils.BOOK_TABLE_NAME)
         return db_utils.find_by_field(fields_str, query_utils.BOOK_TABLE_NAME, "ZISFINISHED", 1)
     query = query_utils.get_book_annotation_query()
     query += f"WHERE {query_utils.BOOK_TABLE_NAME}.ZISFINISHED = 1"
@@ -119,6 +123,7 @@ def find_unfinished_books(annotations: bool = False) -> list:
         list: list of all unfinished books
     """
     if not annotations:
+        fields_str = query_utils.get_fields_str('Book', query_utils.BOOK_TABLE_NAME)
         return db_utils.find_by_field(fields_str, query_utils.BOOK_TABLE_NAME, "ZISFINISHED", 0)
     query = query_utils.get_book_annotation_query()
     query += f"WHERE {query_utils.BOOK_TABLE_NAME}.ZISFINISHED = 0"
@@ -132,6 +137,7 @@ def find_explicit_books(annotations: bool = False) -> list:
         list: list of all explicit books
     """
     if not annotations:
+        fields_str = query_utils.get_fields_str('Book', query_utils.BOOK_TABLE_NAME)
         return db_utils.find_by_field(fields_str, query_utils.BOOK_TABLE_NAME, "ZISEXPLICIT", 1)
     query = query_utils.get_book_annotation_query()
     query += f"WHERE {query_utils.BOOK_TABLE_NAME}.ZISEXPLICIT = 1"
@@ -145,6 +151,7 @@ def find_locked_books(annotations: bool = False) -> list:
         list: list of all locked books
     """
     if not annotations:
+        fields_str = query_utils.get_fields_str('Book', query_utils.BOOK_TABLE_NAME)
         return db_utils.find_by_field(fields_str, query_utils.BOOK_TABLE_NAME, "ZISLOCKED", 1)
     query = query_utils.get_book_annotation_query()
     query += f"WHERE {query_utils.BOOK_TABLE_NAME}.ZISLOCKED = 1"
@@ -158,6 +165,7 @@ def find_ephemeral_books(annotations: bool = False) -> list:
         list: list of all ephemeral books
     """
     if not annotations:
+        fields_str = query_utils.get_fields_str('Book', query_utils.BOOK_TABLE_NAME)
         return db_utils.find_by_field(fields_str, query_utils.BOOK_TABLE_NAME, "ZISEPHEMERAL", 1)
     query = query_utils.get_book_annotation_query()
     query += f"WHERE {query_utils.BOOK_TABLE_NAME}.ZISEPHEMERAL = 1"
@@ -171,6 +179,7 @@ def find_hidden_books(annotations: bool = False) -> list:
         list: list of all hidden books
     """
     if not annotations:
+        fields_str = query_utils.get_fields_str('Book', query_utils.BOOK_TABLE_NAME)
         return db_utils.find_by_field(fields_str, query_utils.BOOK_TABLE_NAME, "ZISHIDDEN", 1)
     query = query_utils.get_book_annotation_query()
     query += f"WHERE {query_utils.BOOK_TABLE_NAME}.ZISHIDDEN = 1"
@@ -184,6 +193,7 @@ def find_sample_books(annotations: bool = False) -> list:
         list: list of all sample books
     """
     if not annotations:
+        fields_str = query_utils.get_fields_str('Book', query_utils.BOOK_TABLE_NAME)
         return db_utils.find_by_field(fields_str, query_utils.BOOK_TABLE_NAME, "ZISSAMPLE", 1)
     query = query_utils.get_book_annotation_query()
     query += f"WHERE {query_utils.BOOK_TABLE_NAME}.ZISSAMPLE = 1"
@@ -197,6 +207,7 @@ def find_store_audiobooks(annotations: bool = False) -> list:
         list: list of all store audiobooks
     """
     if not annotations:
+        fields_str = query_utils.get_fields_str('Book', query_utils.BOOK_TABLE_NAME)
         return db_utils.find_by_field(fields_str, query_utils.BOOK_TABLE_NAME, "ZISSTOREAUDIOBOOK", 1)
     query = query_utils.get_book_annotation_query()
     query += f"WHERE {query_utils.BOOK_TABLE_NAME}.ZISSTOREAUDIOBOOK = 1"
@@ -213,6 +224,7 @@ def find_by_rating(rating: int, annotations: bool = False) -> list:
         list: list of all books with the specified rating
     """
     if not annotations:
+        fields_str = query_utils.get_fields_str('Book', query_utils.BOOK_TABLE_NAME)
         return db_utils.find_by_field(fields_str, query_utils.BOOK_TABLE_NAME, "ZRATING", rating)
     query = query_utils.get_book_annotation_query()
     query += f"WHERE {query_utils.BOOK_TABLE_NAME}.ZRATING = {rating}"

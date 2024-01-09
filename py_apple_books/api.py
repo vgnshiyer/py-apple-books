@@ -17,12 +17,14 @@ class PyAppleBooks:
         self._annotation_mappings = get_mappings('Annotation')
 
         self._style_mappings = {
-            1: 'Green',
-            2: 'Blue',
-            3: 'Yellow',
-            4: 'Pink',
-            5: 'Purple',
+            1: 'green',
+            2: 'blue',
+            3: 'yellow',
+            4: 'pink',
+            5: 'purple',
         }
+
+        self._reverse_style_mappings = {v: k for k, v in self._style_mappings.items()}
 
         self._book_map = {}
         self._collection_map = {}
@@ -641,6 +643,28 @@ class PyAppleBooks:
         """
         list_of_annotations = []
         raw_annotation_data = annotation_db.find_by_selected_text(selected_text)
+        if not raw_annotation_data: return []
+        annotations = [dict(zip(self._annotation_mappings.keys(), a)) for a in raw_annotation_data]
+        for annotation in annotations:
+            annotation_obj = self._create_annotation_object(annotation)
+            list_of_annotations.append(annotation_obj)
+        return list_of_annotations
+
+    def get_annotation_by_color(self, color: str) -> list[Annotation]:
+        """
+        Fetches a list of Annotation objects by color.
+
+        Args:
+            color (str): color
+
+        Returns:
+            list[Annotation]: list of Annotation objects
+        """
+        if color not in self._reverse_style_mappings:
+            raise Exception(f"Invalid color {color}")
+
+        list_of_annotations = []
+        raw_annotation_data = annotation_db.find_by_style(self._reverse_style_mappings[color])
         if not raw_annotation_data: return []
         annotations = [dict(zip(self._annotation_mappings.keys(), a)) for a in raw_annotation_data]
         for annotation in annotations:
