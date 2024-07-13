@@ -27,6 +27,12 @@ def get_db_cursor() -> sqlite3.Cursor:
     except sqlite3.Error as e:
         print("Error connecting to database: ", e)
         return None
+    except IndexError:
+        print("No sqlite files found. Please open iBooks at least once.")
+        return None
+    except Exception as e:
+        print("An error occurred: ", e)
+        return None
 
 def find_all(fields_str: str, table: str) -> list:
     """
