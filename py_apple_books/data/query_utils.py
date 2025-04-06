@@ -6,10 +6,12 @@ BOOK_TABLE_NAME = "ZBKLIBRARYASSET"
 ANNOTATION_TABLE_NAME = "anno_db.ZAEANNOTATION"
 COLLECTIONMEMBER_TABLE_NAME = "ZBKCOLLECTIONMEMBER"
 
+
 @lru_cache(maxsize=5)
 def get_fields_str(class_name: str, table_name: str) -> str:
     mappings = get_mappings(class_name)
     return ", ".join(f"{table_name}.{mappings[field]} AS {field}" for field in mappings)
+
 
 @lru_cache(maxsize=1)
 def get_book_annotation_query() -> str:
@@ -23,6 +25,7 @@ def get_book_annotation_query() -> str:
     """
     return query
 
+
 @lru_cache(maxsize=1)
 def book_collection_member_query() -> str:
     fields_str = get_fields_str('Book', BOOK_TABLE_NAME)
@@ -33,6 +36,7 @@ def book_collection_member_query() -> str:
         ON {COLLECTIONMEMBER_TABLE_NAME}.ZASSET = {BOOK_TABLE_NAME}.Z_PK
     """
     return query
+
 
 @lru_cache(maxsize=1)
 def get_book_collection_query() -> str:
@@ -47,6 +51,7 @@ def get_book_collection_query() -> str:
         ON {COLLECTIONMEMBER_TABLE_NAME}.ZASSETID = {BOOK_TABLE_NAME}.ZASSETID
     """
     return query
+
 
 @lru_cache(maxsize=1)
 def get_collection_collection_member_query() -> str:

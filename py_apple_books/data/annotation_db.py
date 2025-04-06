@@ -1,8 +1,5 @@
-import sqlite3
-from pathlib import Path
 from py_apple_books.data import db_utils, query_utils
-from py_apple_books.utils import get_mappings
-from functools import lru_cache
+
 
 def find_all() -> list:
     """
@@ -13,6 +10,7 @@ def find_all() -> list:
     """
     fields_str = query_utils.get_fields_str('Annotation', query_utils.ANNOTATION_TABLE_NAME)
     return db_utils.find_all(fields_str, query_utils.ANNOTATION_TABLE_NAME)
+
 
 def find_by_id(annotation_id: str) -> list:
     """
@@ -27,6 +25,7 @@ def find_by_id(annotation_id: str) -> list:
     fields_str = query_utils.get_fields_str('Annotation', query_utils.ANNOTATION_TABLE_NAME)
     return db_utils.find_by_field(fields_str, query_utils.ANNOTATION_TABLE_NAME, "Z_PK", annotation_id)
 
+
 def find_by_book_id(book_id: str) -> list:
     """
     Fetches all annotations for a book
@@ -40,6 +39,7 @@ def find_by_book_id(book_id: str) -> list:
     fields_str = query_utils.get_fields_str('Annotation', query_utils.ANNOTATION_TABLE_NAME)
     return db_utils.find_by_field(fields_str, query_utils.ANNOTATION_TABLE_NAME, "ZANNOTATIONASSETID", book_id)
 
+
 def find_deleted() -> list:
     """
     Fetches all deleted annotations
@@ -49,6 +49,7 @@ def find_deleted() -> list:
     """
     fields_str = query_utils.get_fields_str('Annotation', query_utils.ANNOTATION_TABLE_NAME)
     return db_utils.find_by_field(fields_str, query_utils.ANNOTATION_TABLE_NAME, "ZANNOTATIONDELETED", 1)
+
 
 def find_not_deleted() -> list:
     """
@@ -60,6 +61,7 @@ def find_not_deleted() -> list:
     fields_str = query_utils.get_fields_str('Annotation', query_utils.ANNOTATION_TABLE_NAME)
     return db_utils.find_by_field(fields_str, query_utils.ANNOTATION_TABLE_NAME, "ZANNOTATIONDELETED", 0)
 
+
 def find_underlines() -> list:
     """
     Fetches all underlines
@@ -69,6 +71,7 @@ def find_underlines() -> list:
     """
     fields_str = query_utils.get_fields_str('Annotation', query_utils.ANNOTATION_TABLE_NAME)
     return db_utils.find_by_field(fields_str, query_utils.ANNOTATION_TABLE_NAME, "ZANNOTATIONISUNDERLINE", 1)
+
 
 def find_by_chapter(chapter: str) -> list:
     """
@@ -83,6 +86,7 @@ def find_by_chapter(chapter: str) -> list:
     fields_str = query_utils.get_fields_str('Annotation', query_utils.ANNOTATION_TABLE_NAME)
     return db_utils.find_by_field(fields_str, query_utils.ANNOTATION_TABLE_NAME, "ZFUTUREPROOFING5", chapter)
 
+
 def find_by_location(location: str) -> list:
     """
     Fetches annotation for a location
@@ -95,6 +99,7 @@ def find_by_location(location: str) -> list:
     """
     fields_str = query_utils.get_fields_str('Annotation', query_utils.ANNOTATION_TABLE_NAME)
     return db_utils.find_by_field(fields_str, query_utils.ANNOTATION_TABLE_NAME, "ZANNOTATIONLOCATION", location)
+
 
 def find_by_representative_text(representative_text: str) -> list:
     """
@@ -110,9 +115,10 @@ def find_by_representative_text(representative_text: str) -> list:
     query = f"""
         SELECT {fields_str}
         FROM {query_utils.ANNOTATION_TABLE_NAME}
-        WHERE ZANNOTATIONREPRESENTATIVETEXT LIKE \'{representative_text}\'
+        WHERE ZANNOTATIONREPRESENTATIVETEXT LIKE \'%{representative_text}%\'
     """
     return db_utils.run_query(query)
+
 
 def find_by_note_text(note_text: str) -> list:
     """
@@ -128,9 +134,10 @@ def find_by_note_text(note_text: str) -> list:
     query = f"""
         SELECT {fields_str}
         FROM {query_utils.ANNOTATION_TABLE_NAME}
-        WHERE ZANNOTATIONNOTE LIKE \'{note_text}\'
+        WHERE ZANNOTATIONNOTE LIKE \'%{note_text}%\'
     """
     return db_utils.run_query(query)
+
 
 def find_by_selected_text(selected_text: str):
     """
@@ -146,9 +153,10 @@ def find_by_selected_text(selected_text: str):
     query = f"""
         SELECT {fields_str}
         FROM {query_utils.ANNOTATION_TABLE_NAME}
-        WHERE ZANNOTATIONSELECTEDTEXT LIKE \'{selected_text}\'
+        WHERE ZANNOTATIONSELECTEDTEXT LIKE \'%{selected_text}%\'
     """
     return db_utils.run_query(query)
+
 
 def find_highlights() -> list:
     """
@@ -165,6 +173,7 @@ def find_highlights() -> list:
     """
     return db_utils.run_query(query)
 
+
 def find_notes() -> list:
     """
     Fetches all notes
@@ -179,6 +188,7 @@ def find_notes() -> list:
         WHERE ZANNOTATIONNOTE != ''
     """
     return db_utils.run_query(query)
+
 
 def find_by_style(style: str) -> list:
     """

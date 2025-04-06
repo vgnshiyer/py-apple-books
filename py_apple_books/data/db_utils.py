@@ -1,12 +1,12 @@
 from functools import lru_cache
 from pathlib import Path
 import sqlite3
-from py_apple_books.utils import get_mappings
 
 DB_PATHS = [
     (Path.home() / "Library/Containers/com.apple.iBooksX/Data/Documents/BKLibrary"),
     (Path.home() / "Library/Containers/com.apple.iBooksX/Data/Documents/AEAnnotation")
 ]
+
 
 @lru_cache(maxsize=1)
 def get_db_cursor() -> sqlite3.Cursor:
@@ -34,6 +34,7 @@ def get_db_cursor() -> sqlite3.Cursor:
         print("An error occurred: ", e)
         return None
 
+
 def find_all(fields_str: str, table: str) -> list:
     """
     Fetches all rows in a table
@@ -56,6 +57,7 @@ def find_all(fields_str: str, table: str) -> list:
     except sqlite3.Error as e:
         print(f"An error occurred while fetching all rows: {e}")
         return []
+
 
 def find_by_field(fields_str: str, table: str, field: str, value: str) -> list:
     """
@@ -82,6 +84,7 @@ def find_by_field(fields_str: str, table: str, field: str, value: str) -> list:
     except sqlite3.Error as e:
         print(f"An error occurred while fetching rows by field: {e}")
         return []
+
 
 def run_query(query: str) -> list:
     cursor = get_db_cursor()
