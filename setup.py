@@ -6,7 +6,7 @@ with open('README.md') as f:
 setup(
     # name of the package -> must be the same as the name of the folder
     name='py_apple_books',
-    version='0.3',
+    version='0.3.0',
     description='Python library for Apple Books',
     long_description=long_description,
     long_description_content_type='text/markdown',
@@ -22,7 +22,7 @@ setup(
         'Intended Audience :: Developers',
         'Topic :: Software Development :: Build Tools',
         'License :: OSI Approved :: MIT License',
-        'Programming Language :: Python :: 3.0+',
+        'Programming Language :: Python :: 3',
     ],
     package_data={
         'py_apple_books': ['*.ini'],
