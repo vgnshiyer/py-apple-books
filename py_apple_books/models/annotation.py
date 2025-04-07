@@ -40,7 +40,7 @@ class Annotation(Model):
     location: str
 
     # Color
-    color: AnnotationColor = None
+    color: str = None
 
     def __post_init__(self):
         """
@@ -51,4 +51,4 @@ class Annotation(Model):
             if self.modification_date else None
 
         if self.style in AnnotationColor._value2member_map_:
-            self.color = AnnotationColor(self.style)
+            self.color = AnnotationColor(self.style).name

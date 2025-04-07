@@ -22,5 +22,7 @@ class Collection(Model):
     books = ManyToMany(
         related_model=Book,
         related_name='collections',
-        foreign_key='book_id'
+        from_key='id',
+        to_key='asset_id',
+        join_table='book_collection'
     )
