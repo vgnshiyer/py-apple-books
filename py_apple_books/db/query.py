@@ -23,7 +23,8 @@ class Query:
                fields: Union[List[str], str] = '*',
                where: Optional[List[Where]] = None,
                order_by: Optional[str] = None,
-               limit: Optional[int] = None) -> str:
+               limit: Optional[int] = None,
+               use_or: bool = False) -> str:
         """
         Build and execute a SELECT query
 
@@ -43,7 +44,10 @@ class Query:
 
         if where:
             where_clauses = [str(clause) for clause in where]
-            query += f" WHERE {' AND '.join(where_clauses)}"
+            if use_or:
+                query += f" WHERE {' OR '.join(where_clauses)}"
+            else:
+                query += f" WHERE {' AND '.join(where_clauses)}"
 
         if order_by:
             query += f" ORDER BY {order_by}"

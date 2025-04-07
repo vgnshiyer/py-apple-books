@@ -6,7 +6,7 @@ with open('README.md') as f:
 setup(
     # name of the package -> must be the same as the name of the folder
     name='py_apple_books',
-    version='1.0.0',
+    version='1.2.0',
     description='Python library for Apple Books',
     long_description=long_description,
     long_description_content_type='text/markdown',

@@ -22,6 +22,10 @@ PyAppleBooks is a Python API library to access your Apple Books Data.
 | get_book_by_id(book_id) | Get a book by its ID | book_id: str | Book |
 | list_annotations() | List all annotations across all books | None | ModelIterable |
 | get_annotation_by_id(annotation_id) | Get an annotation by its ID | annotation_id: str | Annotation |
+| get_annotations_by_color(color) | Get annotations by color | color: str | ModelIterable |
+| search_annotation_by_highlighted_text(text) | Search for annotations by highlighted text | text: str | ModelIterable |
+| search_annotation_by_note(note) | Search for annotations by note | note: str | ModelIterable |
+| search_annotation_by_text(text) | Search for annotations by any text that contains the given text | text: str | ModelIterable |
 
 ## Examples
 
@@ -73,28 +77,79 @@ Selected text: Genomes contain the instructions for building an organism.
 Selected text: Uniqueness is a commodity in oversupply.
 ```
 
-#### Get all collections
+#### Get annotations by color
+
+```python
+annotations = api.get_annotations_by_color('green')
+for annotation in annotations:
+    print('-' * 50)
+    print(f'Selected text: {annotation.selected_text}')
+    print(f'Color: {annotation.color}')
+```
+
+```
+# sample output
+--------------------------------------------------
+Selected text: Many things are obvious in retrospect, but still take a flash of genius to become plain.
+Color: GREEN
+--------------------------------------------------
+Selected text: An electron does not have a definite position or path until we observe it.
+Color: GREEN
+```
+
+#### Search for annotations by highlighted text
+
+```python
+annotations = api.search_annotation_by_highlighted_text('genomes')
+for annotation in annotations:
+    print('-' * 50)
+    print(f'Selected text: {annotation.selected_text}')
+    print(f'Color: {annotation.color}')
+```
+
+```
+# sample output
+--------------------------------------------------
+Selected text: The human genome - the complete set of human genes - comes packaged in twenty-three separate pairs of chromosomes
+Color: YELLOW
+--------------------------------------------------
+Selected text: Natural selection is the process by which genes change their sequences
+Color: GREEN
+```
+
+#### Get all collections and books
 
 ```python
 collections = api.list_collections()
 for collection in collections:
     print('-'*50)
     print(f"Collection: {collection.title}")
+    print(f"Number of books: {len(collection.books)}")
+    for book in collection.books:
+        print(f"  - {book.title}")
 ```
 
 ```
 # Sample output
 --------------------------------------------------
 Collection: Management
+Number of books: 1
+  - Crucial Conversations
 --------------------------------------------------
 Collection: Finance
+Number of books: 2
+  - The Business of the 21st Century Book
+  - The Richest Man in Babylon
 --------------------------------------------------
 Collection: biography
+Number of books: 3
+  - Elon Musk
+  - Steve Jobs
+  - Einstein: His Life and Universe
 ```
 
 ## Upcoming Features
 
-- [ ] Relations support (e.g. get books in a collection, annotations for a book)
 - [ ] Adding a book to collection
 - [ ] Removing a book from collection
 - [ ] Updating annotations
