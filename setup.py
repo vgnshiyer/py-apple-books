@@ -6,7 +6,7 @@ with open('README.md') as f:
 setup(
     # name of the package -> must be the same as the name of the folder
     name='py_apple_books',
-    version='0.3.0',
+    version='1.0.0',
     description='Python library for Apple Books',
     long_description=long_description,
     long_description_content_type='text/markdown',
@@ -18,7 +18,7 @@ setup(
     # projects official homepage
     url='https://github.com/vgnshiyer/py-apple-books',
     classifiers=[
-        'Development Status :: 4 - Beta',
+        'Development Status :: 5 - Production/Stable',
         'Intended Audience :: Developers',
         'Topic :: Software Development :: Build Tools',
         'License :: OSI Approved :: MIT License',

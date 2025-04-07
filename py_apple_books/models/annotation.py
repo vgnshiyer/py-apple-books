@@ -1,8 +1,22 @@
 from dataclasses import dataclass
+from py_apple_books.models.base import AppleBooksModel
 from datetime import datetime
+from enum import Enum
+
+
+class AnnotationColor(Enum):
+    GREEN = 1
+    BLUE = 2
+    YELLOW = 3
+    PINK = 4
+    PURPLE = 5
+
 
 @dataclass
-class Annotation:
+class Annotation(AppleBooksModel):
+    """
+    Represents an annotation in the Apple Books library.
+    """
     # Identifiers
     id: str
     asset_id: str
@@ -18,23 +32,23 @@ class Annotation:
     representative_text: str
     selected_text: str
     note: str
+    is_underline: bool
+    style: int
 
     # Location
     chapter: str
     location: str
 
+    # Color
+    color: AnnotationColor = None
+
     def __post_init__(self):
         """
         Converts the creation_date and modification_date from timestamp to datetime.
         """
-        self.creation_date = datetime.fromtimestamp(float(self.creation_date) / 1000) if self.creation_date else None
-        self.modification_date = datetime.fromtimestamp(float(self.modification_date) / 1000) if self.modification_date else None
+        self.creation_date = datetime.fromtimestamp(self.creation_date) if self.creation_date else None
+        self.modification_date = datetime.fromtimestamp(self.modification_date) \
+            if self.modification_date else None
 
-    def __hash__(self):
-        """
-        Returns a hash value for the Annotation object.
-
-        Returns:
-            int: hash value for the Annotation object
-        """
-        return hash(self.id)
+        if self.style in AnnotationColor._value2member_map_:
+            self.color = AnnotationColor(self.style)
