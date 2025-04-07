@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from py_apple_books.models.base import AppleBooksModel
+from py_apple_books.models.base import Model
 from datetime import datetime
 from enum import Enum
 
@@ -13,7 +13,7 @@ class AnnotationColor(Enum):
 
 
 @dataclass
-class Annotation(AppleBooksModel):
+class Annotation(Model):
     """
     Represents an annotation in the Apple Books library.
     """

@@ -1,18 +1,18 @@
-from dataclasses import dataclass, field
-from py_apple_books.models.base import AppleBooksModel
+from dataclasses import dataclass
+from py_apple_books.models.base import Model
 from py_apple_books.models.annotation import Annotation
+from py_apple_books.models.relations import OneToMany
 import pathlib
 from datetime import datetime
-from typing import List
 
 
 @dataclass
-class Book(AppleBooksModel):
+class Book(Model):
     """
     Represents a book in the Apple Books library.
     """
     id: int
-    asset_id: str  # what is this?
+    asset_id: str
 
     # Basic book information
     title: str
@@ -47,8 +47,13 @@ class Book(AppleBooksModel):
 
     # User interactions
     rating: int
-    # TODO: add relations support
-    annotations: List[Annotation] = field(default_factory=list)
+
+    # Relations
+    annotations = OneToMany(
+        related_model=Annotation,
+        related_name='book',
+        foreign_key='asset_id'
+    )
 
     def __post_init__(self):
         self.creation_date = datetime.fromtimestamp(float(self.creation_date) / 1000) if self.creation_date else None

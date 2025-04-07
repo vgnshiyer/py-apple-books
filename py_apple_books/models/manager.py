@@ -28,7 +28,7 @@ class ModelManager:
 
         self.model_name = self.model_class.__name__
         self.table_name = None
-        if self.model_name != 'AppleBooksModel':
+        if self.model_name != 'Model':
             self.table_name = self.model_class._get_mappings('Tables')[self.model_name.lower()]
 
     def _create_callable(self, query: str) -> Callable[[], list[Any]]:

@@ -1,11 +1,11 @@
-from dataclasses import dataclass, field
-from py_apple_books.models.base import AppleBooksModel
+from dataclasses import dataclass
+from py_apple_books.models.base import Model
 from py_apple_books.models.book import Book
-from typing import List
+from py_apple_books.models.relations import ManyToMany
 
 
 @dataclass
-class Collection(AppleBooksModel):
+class Collection(Model):
     """
     Represents a collection in the Apple Books library.
     """
@@ -19,5 +19,8 @@ class Collection(AppleBooksModel):
 
     # Collection details
     details: str
-    # TODO: add relations support
-    books: List[Book] = field(default_factory=list)
+    books = ManyToMany(
+        related_model=Book,
+        related_name='collections',
+        foreign_key='book_id'
+    )
