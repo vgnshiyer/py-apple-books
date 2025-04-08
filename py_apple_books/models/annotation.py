@@ -54,4 +54,4 @@ class Annotation(Model):
             self.color = AnnotationColor(self.style).name
 
     def __str__(self):
-        return f"Representative text: {self.representative_text}\nSelected text: {self.selected_text}\nNote: {self.note}"
+        return f"ID: {self.id}\nRepresentative text: {self.representative_text}\nSelected text: {self.selected_text}\nNote: {self.note}"

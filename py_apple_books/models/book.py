@@ -65,4 +65,4 @@ class Book(Model):
         self.reading_progress = float(self.reading_progress) * 100 if self.reading_progress else None
 
     def __str__(self):
-        return f"{self.title} by {self.author}: {self.description}"
+        return f"ID: {self.id}\nTitle: {self.title}\nAuthor: {self.author}\nDescription: {self.description}"

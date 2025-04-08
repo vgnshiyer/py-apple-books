@@ -28,4 +28,4 @@ class Collection(Model):
     )
 
     def __str__(self):
-        return f"{self.title}: {self.details}"
+        return f"ID: {self.id}\nTitle: {self.title}\nDetails: {self.details}"
