@@ -26,3 +26,6 @@ class Collection(Model):
         to_key='asset_id',
         join_table='book_collection'
     )
+
+    def __str__(self):
+        return f"{self.title}: {self.details}"
