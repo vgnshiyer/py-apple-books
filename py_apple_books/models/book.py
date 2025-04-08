@@ -63,3 +63,6 @@ class Book(Model):
         self.purchased_date = datetime.fromtimestamp(float(self.purchased_date) / 1000) if self.purchased_date else None
         self.duration = float(self.duration) / 1000 if self.duration else None
         self.reading_progress = float(self.reading_progress) * 100 if self.reading_progress else None
+
+    def __str__(self):
+        return f"ID: {self.id}\nTitle: {self.title}\nAuthor: {self.author}\nDescription: {self.description}"
