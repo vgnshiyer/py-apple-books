@@ -47,12 +47,21 @@ class ModelManager:
             fields = [field for field in fields if field in only]
         return fields
 
-    def all(self, only: List[str] = None) -> ModelIterable:
+    def _format_order_by(self, order_by: str) -> str:
+        if order_by:
+            field = order_by[1:] if order_by.startswith('-') else order_by
+            direction = ' DESC' if order_by.startswith('-') else ''
+            order_by = self.model_class._get_mappings(self.model_name)[field] + direction
+        return order_by
+
+    def all(self, only: List[str] = None, limit: int = None, order_by: str = None) -> ModelIterable:
         fields = self._get_fields(only)
-        query = Query.select(self.table_name, fields=fields)
+        order_by = self._format_order_by(order_by)
+        query = Query.select(self.table_name, fields=fields, limit=limit, order_by=order_by)
         return ModelIterable(callable=self._create_callable(query), model_class=self.model_class)
 
-    def filter(self, only: List[str] = None, use_or: bool = False, **filters) -> ModelIterable:
+    def filter(self, only: List[str] = None, use_or: bool = False, limit: int = None,
+               order_by: str = None, **filters) -> ModelIterable:
         fields = self._get_fields(only)
 
         where_clauses = []
@@ -70,7 +79,9 @@ class ModelManager:
             else:
                 where_clauses.append(Where(self._get_db_field(field), value, operator='='))
 
-        query = Query.select(self.table_name, fields=fields, where=where_clauses, use_or=use_or)
+        order_by = self._format_order_by(order_by)
+        query = Query.select(self.table_name, fields=fields, where=where_clauses, use_or=use_or,
+                             limit=limit, order_by=order_by)
         return ModelIterable(callable=self._create_callable(query), model_class=self.model_class)
 
     # TODO

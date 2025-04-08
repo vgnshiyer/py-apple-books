@@ -5,7 +5,7 @@ with open('README.md') as f:
 
 setup(
     name='py_apple_books',
-    version='1.2.1',
+    version='1.3.0',
     description='Python library for Apple Books',
     long_description=long_description,
     long_description_content_type='text/markdown',
