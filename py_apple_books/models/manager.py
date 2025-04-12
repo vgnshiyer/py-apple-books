@@ -84,6 +84,62 @@ class ModelManager:
                              limit=limit, order_by=order_by)
         return ModelIterable(callable=self._create_callable(query), model_class=self.model_class)
 
+    def handle_relations(self, model_object):
+        """
+        Handle the relations for a model object.
+        """
+        for relation in self.model_class.relations:
+            # handle one-to-many relations
+            if relation['type'] == 'OneToMany':
+                related_model = relation['related_model']
+                foreign_key = relation['foreign_key']
+                val = getattr(model_object, foreign_key)
+                setattr(model_object, relation['name'],
+                        related_model.manager.filter(**{foreign_key: val}))
+
+            # handle many-to-one relations
+            elif relation['type'] == 'ManyToOne':
+                related_model = relation['related_model']
+                foreign_key = relation['foreign_key']
+                val = getattr(model_object, foreign_key)
+                try:
+                    setattr(model_object, relation['name'],
+                            related_model.manager.filter(**{foreign_key: val})[0])
+                except IndexError:
+                    setattr(model_object, relation['name'], None)
+
+            # handle one-to-one relations
+            elif relation['type'] == 'OneToOne':
+                related_model = relation['related_model']
+                foreign_key = relation['foreign_key']
+                val = getattr(model_object, foreign_key)
+                try:
+                    setattr(model_object, relation['name'],
+                            related_model.manager.filter(**{foreign_key: val})[0])
+                except IndexError:
+                    setattr(model_object, relation['name'], None)
+
+            # handle many-to-many relations
+            elif relation['type'] == 'ManyToMany':
+                related_ids = self.get_related_ids(model_object, relation)
+                related_model = relation['related_model']
+                setattr(model_object, relation['name'],
+                        related_model.manager.filter(**{f"{relation['to_key']}__in": related_ids}))
+
+    def get_related_ids(self, model_object, relation: dict) -> list[str]:
+        """
+        Get related IDs for many-to-many relationships.
+        """
+        # This method is a minor contrivance to avoid multi-level join
+        join_table = self.model_class._get_mappings('Tables')[relation['join_table']]
+        from_key = self.model_class._get_mappings(relation['join_table'])[relation['from_key']]
+        to_key = self.model_class._get_mappings(relation['join_table'])[relation['to_key']]
+        val = getattr(model_object, relation['from_key'])
+
+        query = Query.select(join_table, fields=[to_key], where=[Where(from_key, val, operator='=')])
+        related_ids = self.compiler.execute(query)
+        return [row[0] for row in related_ids]
+
     # TODO
     def add(self, data: dict) -> str:
         pass
