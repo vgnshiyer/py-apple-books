@@ -3,8 +3,6 @@ import pathlib
 import configparser
 from py_apple_books.models.manager import ModelManager
 from py_apple_books.models.relations import OneToMany, OneToOne, ManyToMany
-from py_apple_books.db.query import Query
-from py_apple_books.db.clause import Where
 
 
 class ModelBase(type):
@@ -81,61 +79,8 @@ class Model(metaclass=ModelBase):
     def from_db(cls, db_data: list[Any]) -> 'Model':
         fields_len = len(cls._get_mappings(cls.__name__))
         obj = cls(**dict(zip(cls._get_mappings(cls.__name__).keys(), db_data[:fields_len])))
-        cls._handle_relations(obj)
+        cls.manager.handle_relations(obj)
         return obj
-
-    @classmethod
-    def _handle_relations(cls, model_object: 'Model'):
-        for relation in cls.relations:
-            # handle one-to-many relations
-            if relation['type'] == 'OneToMany':
-                related_model = relation['related_model']
-                foreign_key = relation['foreign_key']
-                val = getattr(model_object, foreign_key)
-                setattr(model_object, relation['name'],
-                        related_model.manager.filter(**{foreign_key: val}))
-
-            # handle many-to-one relations
-            elif relation['type'] == 'ManyToOne':
-                related_model = relation['related_model']
-                foreign_key = relation['foreign_key']
-                val = getattr(model_object, foreign_key)
-                try:
-                    setattr(model_object, relation['name'],
-                            related_model.manager.filter(**{foreign_key: val})[0])
-                except IndexError:
-                    setattr(model_object, relation['name'], None)
-
-            # handle one-to-one relations
-            elif relation['type'] == 'OneToOne':
-                related_model = relation['related_model']
-                foreign_key = relation['foreign_key']
-                val = getattr(model_object, foreign_key)
-                try:
-                    setattr(model_object, relation['name'],
-                            related_model.manager.filter(**{foreign_key: val})[0])
-                except IndexError:
-                    setattr(model_object, relation['name'], None)
-
-            # handle many-to-many relations
-            elif relation['type'] == 'ManyToMany':
-                related_ids = cls._get_related_ids(model_object, relation)
-                related_model = relation['related_model']
-                setattr(model_object, relation['name'],
-                        related_model.manager.filter(**{f"{relation['to_key']}__in": related_ids}))
-
-    @classmethod
-    def _get_related_ids(cls, model_object: 'Model', relation: dict) -> list[str]:
-        # This method is a minor contrivance to avoid multi-level join
-        compiler = cls.manager.compiler
-        join_table = cls._get_mappings('Tables')[relation['join_table']]
-        from_key = cls._get_mappings(relation['join_table'])[relation['from_key']]
-        to_key = cls._get_mappings(relation['join_table'])[relation['to_key']]
-        val = getattr(model_object, relation['from_key'])
-
-        query = Query.select(join_table, fields=[to_key], where=[Where(from_key, val, operator='=')])
-        related_ids = compiler.execute(query)
-        return [row[0] for row in related_ids]
 
     @classmethod
     def to_db(cls) -> dict:
