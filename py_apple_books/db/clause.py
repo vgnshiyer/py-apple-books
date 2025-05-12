@@ -3,7 +3,8 @@ class Clause:
         pass
 
     def _escape_like(self, value: str) -> str:
-        return f"'{value.replace('%', '\\%').replace('_', '\\_')}'"
+        escaped_value = value.replace('%', r'\%').replace('_', r'\_')
+        return f"'{escaped_value}'"
 
     def _escape_value(self, value) -> str:
         if isinstance(value, str):
