@@ -2,4 +2,4 @@ from .api import PyAppleBooks
 
 __all__ = ['PyAppleBooks']
 
-__version__ = '1.3.1'
+__version__ = '1.3.2'
