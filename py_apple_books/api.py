@@ -62,3 +62,23 @@ class PyAppleBooks:
                                          use_or=True,
                                          limit=limit,
                                          order_by=order_by)
+
+    # -- reading progress actions --
+    def get_books_in_progress(self, limit: int = None, order_by: str = None) -> ModelIterable:
+        """Get books that are currently being read (progress > 0% and < 100%)."""
+        return Book.manager.filter(reading_progress__gt=0, 
+                                  reading_progress__lt=100, 
+                                  limit=limit, 
+                                  order_by=order_by)
+
+    def get_finished_books(self, limit: int = None, order_by: str = None) -> ModelIterable:
+        """Get books that are marked as finished."""
+        return Book.manager.filter(is_finished=True, limit=limit, order_by=order_by)
+
+    def get_unstarted_books(self, limit: int = None, order_by: str = None) -> ModelIterable:
+        """Get books that haven't been started (progress = 0% or None)."""
+        return Book.manager.filter(reading_progress__lte=0, limit=limit, order_by=order_by)
+
+    def get_recently_read_books(self, limit: int = 10, order_by: str = "-last_opened_date") -> ModelIterable:
+        """Get recently opened books, ordered by last opened date."""
+        return Book.manager.filter(last_opened_date__isnull=False, limit=limit, order_by=order_by)

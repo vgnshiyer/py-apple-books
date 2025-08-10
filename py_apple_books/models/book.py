@@ -66,3 +66,29 @@ class Book(Model):
 
     def __str__(self):
         return f"ID: {self.id}\nTitle: {self.title}\nAuthor: {self.author}\nDescription: {self.description}"
+
+    @property
+    def progress_status(self) -> str:
+        """Get a human-readable reading progress status."""
+        if self.is_finished:
+            return "Finished"
+        elif self.reading_progress is None or self.reading_progress == 0:
+            return "Not Started"
+        elif self.reading_progress >= 100:
+            return "Completed"
+        else:
+            return f"In Progress ({self.reading_progress:.1f}%)"
+
+    def format_progress_summary(self) -> str:
+        """Get a formatted summary of reading progress."""
+        status = self.progress_status
+        last_read = "Never" if self.last_opened_date is None else self.last_opened_date.strftime("%Y-%m-%d")
+        
+        summary = f"Progress: {status}"
+        if self.reading_progress and self.reading_progress > 0:
+            summary += f" | Last Read: {last_read}"
+        if self.duration:
+            hours = self.duration / 3600  # Convert seconds to hours
+            summary += f" | Time Spent: {hours:.1f}h"
+        
+        return summary

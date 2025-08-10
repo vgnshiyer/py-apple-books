@@ -76,6 +76,14 @@ class ModelManager:
                 where_clauses.append(Where(self._get_db_field(field.split('__')[0]), value, operator='>='))
             elif field.endswith('__lt'):
                 where_clauses.append(Where(self._get_db_field(field.split('__')[0]), value, operator='<'))
+            elif field.endswith('__lte'):
+                where_clauses.append(Where(self._get_db_field(field.split('__')[0]), value, operator='<='))
+            elif field.endswith('__isnull'):
+                db_field = self._get_db_field(field.split('__')[0])
+                if value:
+                    where_clauses.append(Where(db_field, 'NULL', operator='IS'))
+                else:
+                    where_clauses.append(Where(db_field, 'NULL', operator='IS NOT'))
             else:
                 where_clauses.append(Where(self._get_db_field(field), value, operator='='))
 
