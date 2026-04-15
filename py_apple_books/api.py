@@ -1,5 +1,9 @@
+from datetime import datetime
 from py_apple_books.models import Book, Collection, Annotation, AnnotationColor
 from py_apple_books.models.manager import ModelIterable
+
+# Seconds between Unix epoch (1970-01-01) and Apple epoch (2001-01-01)
+APPLE_EPOCH_OFFSET = 978307200
 
 
 class PyAppleBooks:
@@ -62,6 +66,27 @@ class PyAppleBooks:
                                          use_or=True,
                                          limit=limit,
                                          order_by=order_by)
+
+    def get_annotations_by_date_range(self, after: datetime = None, before: datetime = None,
+                                       limit: int = None, order_by: str = None) -> ModelIterable:
+        """Get annotations within a date range.
+
+        Args:
+            after: Only include annotations created after this datetime.
+            before: Only include annotations created before this datetime.
+            limit: Maximum number of results.
+            order_by: Field to sort by (prefix with - for descending).
+        """
+        kwargs = {}
+        if after:
+            kwargs["creation_date__gte"] = after.timestamp() - APPLE_EPOCH_OFFSET
+        if before:
+            kwargs["creation_date__lte"] = before.timestamp() - APPLE_EPOCH_OFFSET
+        if limit:
+            kwargs["limit"] = limit
+        if order_by:
+            kwargs["order_by"] = order_by
+        return Annotation.manager.filter(**kwargs) if kwargs else Annotation.manager.all()
 
     # -- reading progress actions --
     def get_books_in_progress(self, limit: int = None, order_by: str = None) -> ModelIterable:
