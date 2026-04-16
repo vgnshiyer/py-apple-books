@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from py_apple_books.models.base import Model
 from py_apple_books.models.annotation import Annotation
 from py_apple_books.models.relations import OneToMany
+from py_apple_books.utils import apple_timestamp_to_datetime
 import pathlib
 from datetime import datetime
 
@@ -56,11 +57,10 @@ class Book(Model):
     )
 
     def __post_init__(self):
-        self.creation_date = datetime.fromtimestamp(float(self.creation_date) / 1000) if self.creation_date else None
-        self.finished_date = datetime.fromtimestamp(float(self.finished_date) / 1000) if self.finished_date else None
-        self.last_opened_date = datetime.fromtimestamp(float(self.last_opened_date) / 1000) \
-            if self.last_opened_date else None
-        self.purchased_date = datetime.fromtimestamp(float(self.purchased_date) / 1000) if self.purchased_date else None
+        self.creation_date = apple_timestamp_to_datetime(self.creation_date)
+        self.finished_date = apple_timestamp_to_datetime(self.finished_date)
+        self.last_opened_date = apple_timestamp_to_datetime(self.last_opened_date)
+        self.purchased_date = apple_timestamp_to_datetime(self.purchased_date)
         self.duration = float(self.duration) / 1000 if self.duration else None
         self.reading_progress = float(self.reading_progress) * 100 if self.reading_progress else None
 

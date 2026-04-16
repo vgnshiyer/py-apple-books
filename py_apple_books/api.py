@@ -1,9 +1,7 @@
 from datetime import datetime
 from py_apple_books.models import Book, Collection, Annotation, AnnotationColor
 from py_apple_books.models.manager import ModelIterable
-
-# Seconds between Unix epoch (1970-01-01) and Apple epoch (2001-01-01)
-APPLE_EPOCH_OFFSET = 978307200
+from py_apple_books.utils import APPLE_EPOCH_OFFSET
 
 
 class PyAppleBooks:

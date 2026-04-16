@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from py_apple_books.models.base import Model
+from py_apple_books.utils import apple_timestamp_to_datetime
 from datetime import datetime
 from enum import Enum
 
@@ -46,9 +47,8 @@ class Annotation(Model):
         """
         Converts the creation_date and modification_date from timestamp to datetime.
         """
-        self.creation_date = datetime.fromtimestamp(self.creation_date) if self.creation_date else None
-        self.modification_date = datetime.fromtimestamp(self.modification_date) \
-            if self.modification_date else None
+        self.creation_date = apple_timestamp_to_datetime(self.creation_date)
+        self.modification_date = apple_timestamp_to_datetime(self.modification_date)
 
         if self.style in AnnotationColor._value2member_map_:
             self.color = AnnotationColor(self.style).name
