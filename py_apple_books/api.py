@@ -33,6 +33,10 @@ class PyAppleBooks:
         """Get a book by title."""
         return Book.manager.filter(title__contains=title)
 
+    def get_books_by_genre(self, genre: str, limit: int = None, order_by: str = None) -> ModelIterable:
+        """Get books whose genre contains the given string (case-sensitive)."""
+        return Book.manager.filter(genre__contains=genre, limit=limit, order_by=order_by)
+
     # -- annotation actions --
     def list_annotations(self, limit: int = None, order_by: str = None) -> ModelIterable:
         """List all annotations."""
