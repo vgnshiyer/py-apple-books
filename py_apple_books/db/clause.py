@@ -40,6 +40,14 @@ class Where(Clause):
                 formatted_items = [self._escape_value(item) for item in self.value]
                 formatted_value = f"({', '.join(formatted_items)})"
             return f"{self.field} {self.operator} {formatted_value}"
-        else:
-            # Handle regular operators
-            return f"{self.field} {self.operator} {self._escape_value(self.value)}"
+        if self.operator in ('IS', 'IS NOT') and (
+            self.value is None or self.value == 'NULL'
+        ):
+            # SQL keyword NULL — must not be quoted. Without this
+            # special case, ``__isnull`` filters render as
+            # ``col IS 'NULL'`` (literal string), which matches nothing
+            # on numeric columns and every row with the literal string
+            # ``'NULL'`` on text columns — silently broken.
+            return f"{self.field} {self.operator} NULL"
+        # Handle regular operators
+        return f"{self.field} {self.operator} {self._escape_value(self.value)}"

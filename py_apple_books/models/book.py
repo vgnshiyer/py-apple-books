@@ -50,10 +50,18 @@ class Book(Model):
     rating: int
 
     # Relations
+    #
+    # ``book.annotations`` returns only user-created annotations (highlights
+    # and notes). Apple Books stores its auto-tracked reading-position
+    # bookmark as an annotation with ``type = 3``; we filter that out here
+    # so callers asking "what did the user annotate?" get the expected set.
+    # For direct access to the bookmark, use
+    # :meth:`PyAppleBooks.get_current_reading_location`.
     annotations = OneToMany(
         related_model=Annotation,
         related_name='book',
-        foreign_key='asset_id'
+        foreign_key='asset_id',
+        extra_filters={'type__ne': 3},
     )
 
     def __post_init__(self):

@@ -19,6 +19,7 @@ class ModelBase(type):
                     'type': relation_type,
                     'related_model': value.related_model,
                     'foreign_key': value.foreign_key,
+                    'extra_filters': dict(value.extra_filters),
                 }
                 cls.relations.append(forward_relation)
 
@@ -30,6 +31,9 @@ class ModelBase(type):
                     'type': 'ManyToOne' if relation_type == 'OneToMany' else relation_type,
                     'related_model': cls,
                     'foreign_key': value.foreign_key,
+                    # Reverse relations don't inherit extra_filters —
+                    # filtering is one-directional by definition.
+                    'extra_filters': {},
                 }
                 related_model.relations.append(backward_relation)
 
@@ -42,6 +46,7 @@ class ModelBase(type):
                     'from_key': value.from_key,
                     'to_key': value.to_key,
                     'join_table': value.join_table,
+                    'extra_filters': dict(value.extra_filters),
                 }
                 cls.relations.append(forward_relation)
 
@@ -55,6 +60,7 @@ class ModelBase(type):
                     'from_key': value.to_key,
                     'to_key': value.from_key,
                     'join_table': value.join_table,
+                    'extra_filters': {},
                 }
                 related_model.relations.append(backward_relation)
 

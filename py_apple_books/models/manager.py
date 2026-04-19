@@ -78,6 +78,8 @@ class ModelManager:
                 where_clauses.append(Where(self._get_db_field(field.split('__')[0]), value, operator='<'))
             elif field.endswith('__lte'):
                 where_clauses.append(Where(self._get_db_field(field.split('__')[0]), value, operator='<='))
+            elif field.endswith('__ne'):
+                where_clauses.append(Where(self._get_db_field(field.split('__')[0]), value, operator='!='))
             elif field.endswith('__isnull'):
                 db_field = self._get_db_field(field.split('__')[0])
                 if value:
@@ -97,13 +99,15 @@ class ModelManager:
         Handle the relations for a model object.
         """
         for relation in self.model_class.relations:
+            extra = relation.get('extra_filters', {}) or {}
+
             # handle one-to-many relations
             if relation['type'] == 'OneToMany':
                 related_model = relation['related_model']
                 foreign_key = relation['foreign_key']
                 val = getattr(model_object, foreign_key)
                 setattr(model_object, relation['name'],
-                        related_model.manager.filter(**{foreign_key: val}))
+                        related_model.manager.filter(**{foreign_key: val, **extra}))
 
             # handle many-to-one relations
             elif relation['type'] == 'ManyToOne':
@@ -112,7 +116,7 @@ class ModelManager:
                 val = getattr(model_object, foreign_key)
                 try:
                     setattr(model_object, relation['name'],
-                            related_model.manager.filter(**{foreign_key: val})[0])
+                            related_model.manager.filter(**{foreign_key: val, **extra})[0])
                 except IndexError:
                     setattr(model_object, relation['name'], None)
 
@@ -123,7 +127,7 @@ class ModelManager:
                 val = getattr(model_object, foreign_key)
                 try:
                     setattr(model_object, relation['name'],
-                            related_model.manager.filter(**{foreign_key: val})[0])
+                            related_model.manager.filter(**{foreign_key: val, **extra})[0])
                 except IndexError:
                     setattr(model_object, relation['name'], None)
 
@@ -131,8 +135,13 @@ class ModelManager:
             elif relation['type'] == 'ManyToMany':
                 related_ids = self.get_related_ids(model_object, relation)
                 related_model = relation['related_model']
-                setattr(model_object, relation['name'],
-                        related_model.manager.filter(**{f"{relation['to_key']}__in": related_ids}))
+                setattr(
+                    model_object,
+                    relation['name'],
+                    related_model.manager.filter(
+                        **{f"{relation['to_key']}__in": related_ids, **extra}
+                    ),
+                )
 
     def get_related_ids(self, model_object, relation: dict) -> list[str]:
         """

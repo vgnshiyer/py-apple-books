@@ -12,6 +12,11 @@ from py_apple_books.utils import APPLE_EPOCH_OFFSET
 # position" bookmark. Distinct from highlights (1) and notes (2); one per
 # book, updated as the user reads, with empty selected_text/note and a
 # zero-width CFI range.
+#
+# User-facing annotation queries (``list_annotations``, search, date-range,
+# color) silently exclude these rows — they aren't user-created annotations
+# and showing them as empty-text entries is confusing. For direct access to
+# the bookmark itself, use :meth:`PyAppleBooks.get_current_reading_location`.
 _ANNOTATION_TYPE_READING_BOOKMARK = 3
 
 
@@ -49,40 +54,73 @@ class PyAppleBooks:
         return Book.manager.filter(genre__contains=genre, limit=limit, order_by=order_by)
 
     # -- annotation actions --
+    #
+    # All user-facing annotation queries filter out Apple Books' auto-tracked
+    # reading-position bookmarks (``type = 3``). These are system entries with
+    # empty text, not user-created highlights or notes — callers that want
+    # them specifically should use :meth:`get_current_reading_location`.
+
     def list_annotations(self, limit: int = None, order_by: str = None) -> ModelIterable:
-        """List all annotations."""
-        return Annotation.manager.all(limit=limit, order_by=order_by)
+        """List all user-created annotations (highlights and notes).
+
+        Excludes Apple Books' auto-tracked reading-position bookmarks.
+        """
+        return Annotation.manager.filter(
+            type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
+            limit=limit,
+            order_by=order_by,
+        )
 
     def get_annotation_by_id(self, annotation_id: str) -> Annotation:
-        """Get an annotation by id."""
+        """Get an annotation by id (returns bookmarks too — use when the
+        caller has already obtained the id from a specific API)."""
         return Annotation.manager.filter(id=annotation_id)[0]
 
     def get_annotations_by_color(self, color: str, limit: int = None, order_by: str = None) -> ModelIterable:
-        """Get annotations by color."""
+        """Get user highlights by color."""
         style = AnnotationColor[color.upper()].value
-        return Annotation.manager.filter(style=style, limit=limit, order_by=order_by)
+        # The color filter (style in 1..5) already excludes bookmarks
+        # (style = 0); the explicit type filter is a belt-and-suspenders
+        # guard against future style reuse.
+        return Annotation.manager.filter(
+            style=style,
+            type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
+            limit=limit,
+            order_by=order_by,
+        )
 
     def search_annotation_by_highlighted_text(self, text: str,
                                               limit: int = None, order_by: str = None) -> ModelIterable:
-        """Search for annotations by highlighted text."""
-        return Annotation.manager.filter(selected_text__contains=text, limit=limit, order_by=order_by)
+        """Search user annotations by highlighted text."""
+        return Annotation.manager.filter(
+            selected_text__contains=text,
+            type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
+            limit=limit,
+            order_by=order_by,
+        )
 
     def search_annotation_by_note(self, note: str, limit: int = None, order_by: str = None) -> ModelIterable:
-        """Search for annotations by note."""
-        return Annotation.manager.filter(note__contains=note, limit=limit, order_by=order_by)
+        """Search user annotations by note."""
+        return Annotation.manager.filter(
+            note__contains=note,
+            type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
+            limit=limit,
+            order_by=order_by,
+        )
 
     def search_annotation_by_text(self, text: str, limit: int = None, order_by: str = None) -> ModelIterable:
-        """Search for annotations by any text that contains the given text."""
+        """Search user annotations by any text that contains the given text."""
         return Annotation.manager.filter(selected_text__contains=text,
                                          representative_text__contains=text,
                                          note__contains=text,
+                                         type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
                                          use_or=True,
                                          limit=limit,
                                          order_by=order_by)
 
     def get_annotations_by_date_range(self, after: datetime = None, before: datetime = None,
                                        limit: int = None, order_by: str = None) -> ModelIterable:
-        """Get annotations within a date range.
+        """Get user annotations within a date range.
 
         Args:
             after: Only include annotations created after this datetime.
@@ -90,7 +128,7 @@ class PyAppleBooks:
             limit: Maximum number of results.
             order_by: Field to sort by (prefix with - for descending).
         """
-        kwargs = {}
+        kwargs = {"type__ne": _ANNOTATION_TYPE_READING_BOOKMARK}
         if after:
             kwargs["creation_date__gte"] = after.timestamp() - APPLE_EPOCH_OFFSET
         if before:
@@ -99,7 +137,7 @@ class PyAppleBooks:
             kwargs["limit"] = limit
         if order_by:
             kwargs["order_by"] = order_by
-        return Annotation.manager.filter(**kwargs) if kwargs else Annotation.manager.all()
+        return Annotation.manager.filter(**kwargs)
 
     # -- reading progress actions --
     def get_books_in_progress(self, limit: int = None, order_by: str = None) -> ModelIterable:
