@@ -5,19 +5,22 @@ with open('README.md') as f:
 
 setup(
     name='py_apple_books',
-    version='1.6.0',
+    version='1.7.0',
     description='Python library for Apple Books',
     long_description=long_description,
     long_description_content_type='text/markdown',
     author='Vignesh Iyer',
     author_email='vgnshiyer@gmail.com',
-    packages=find_packages(),
+    packages=find_packages(exclude=['tests', 'tests.*']),
     install_requires=[
         # EPUB parsing: handles EPUB2 (NCX) and EPUB3 (nav doc) ToCs.
         'ebooklib>=0.20',
         # XHTML → plain text for chapter content extraction.
         'beautifulsoup4>=4.12',
     ],
+    extras_require={
+        'dev': ['pytest>=7.0'],
+    },
     license='MIT',
     url='https://github.com/vgnshiyer/py-apple-books',
     classifiers=[

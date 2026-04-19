@@ -169,6 +169,7 @@ class BookContent:
     def __init__(self, path: PathLike) -> None:
         self.path = pathlib.Path(path)
         self._book: Optional[epub.EpubBook] = None
+        self._opf_dir_cache: Optional[pathlib.PurePosixPath] = None
 
     def __repr__(self) -> str:
         return f"BookContent(path={str(self.path)!r})"
@@ -328,7 +329,8 @@ class BookContent:
                 item = book.get_item_with_id(spine_id)
                 if item is None:
                     continue
-                same_file = [ch for ch in chapters if ch.href == item.file_name]
+                item_href = self._to_bundle_relative(item.file_name)
+                same_file = [ch for ch in chapters if ch.href == item_href]
                 if not same_file:
                     continue
                 # On the exact spine hit, honor any fragment hint in the
@@ -419,6 +421,44 @@ class BookContent:
                 ) from e
         return self._book
 
+    def _opf_dir(self) -> pathlib.PurePosixPath:
+        """Cached OPF directory relative to the EPUB bundle root.
+
+        ebooklib's :attr:`EpubItem.file_name` is OPF-relative, while we
+        want :attr:`Chapter.href` to be bundle-relative so callers can
+        resolve it with ``content.path / chapter.href``. This helper
+        gives us the prefix to prepend.
+        """
+        if self._opf_dir_cache is None:
+            self._opf_dir_cache = _opf_dir_from_container(self.path)
+        return self._opf_dir_cache
+
+    def _to_bundle_relative(self, opf_relative: str) -> str:
+        """Convert an OPF-relative href (ebooklib convention) to a
+        bundle-relative path rooted at :attr:`path`."""
+        if not opf_relative:
+            return opf_relative
+        opf_dir = self._opf_dir()
+        opf_dir_str = str(opf_dir)
+        if opf_dir_str in ("", "."):
+            return opf_relative
+        return f"{opf_dir_str}/{opf_relative}"
+
+    def _to_opf_relative(self, bundle_relative: str) -> str:
+        """Inverse of :meth:`_to_bundle_relative` — strip the OPF-dir
+        prefix from a bundle-relative href so ebooklib's internal
+        lookups find it."""
+        if not bundle_relative:
+            return bundle_relative
+        opf_dir = self._opf_dir()
+        opf_dir_str = str(opf_dir)
+        if opf_dir_str in ("", "."):
+            return bundle_relative
+        prefix = f"{opf_dir_str}/"
+        if bundle_relative.startswith(prefix):
+            return bundle_relative[len(prefix):]
+        return bundle_relative
+
     def _chapters_from_ebooklib_toc(self, book: epub.EpubBook) -> List[Chapter]:
         """Flatten ebooklib's nested ToC into a list of :class:`Chapter`.
 
@@ -431,13 +471,15 @@ class BookContent:
         if not toc:
             return []
 
-        # Build a lookup from href (with and without fragment) to
-        # manifest item id for stable chapter ids.
+        # Build a lookup from bundle-relative href to manifest item id
+        # for stable chapter ids. ebooklib stores file_name as
+        # OPF-relative; we normalize to bundle-relative up front so
+        # matching works against whichever convention a ToC entry uses.
         href_to_item_id = {}
         for item in book.get_items():
             name = getattr(item, "file_name", None) or getattr(item, "get_name", lambda: "")()
             if name:
-                href_to_item_id[name] = item.get_id()
+                href_to_item_id[self._to_bundle_relative(name)] = item.get_id()
 
         chapters: List[Chapter] = []
         order = 0
@@ -473,20 +515,24 @@ class BookContent:
             bare = urllib.parse.unquote(bare)
             fragment = urllib.parse.unquote(fragment)
 
-            key = (bare, fragment)
+            # ToC hrefs are OPF-relative in ebooklib; normalize to
+            # bundle-relative so Chapter.href resolves against self.path.
+            bundle_href = self._to_bundle_relative(bare)
+
+            key = (bundle_href, fragment)
             if key in seen:
                 return
             seen.add(key)
 
             order += 1
-            item_id = href_to_item_id.get(bare, "")
+            item_id = href_to_item_id.get(bundle_href, "")
             chapter_id = item_id if item_id else str(order)
 
             chapters.append(
                 Chapter(
                     id=chapter_id,
                     title=title,
-                    href=bare,
+                    href=bundle_href,
                     fragment=fragment,
                     order=order,
                     depth=depth,
@@ -537,8 +583,13 @@ class BookContent:
         except Exception:
             return []
 
-        ncx_dir_in_epub = pathlib.PurePosixPath(ncx_item.file_name).parent
-        return _parse_ncx_bytes(ncx_bytes, ncx_dir_in_epub)
+        # NCX content srcs resolve relative to the NCX file's location.
+        # file_name is OPF-relative, so prepend the OPF dir to get the
+        # bundle-relative directory of the NCX file.
+        ncx_bundle_path = pathlib.PurePosixPath(
+            self._to_bundle_relative(ncx_item.file_name)
+        )
+        return _parse_ncx_bytes(ncx_bytes, ncx_bundle_path.parent)
 
     def _chapters_from_spine(self, book: epub.EpubBook) -> List[Chapter]:
         """Last-resort chapter list from the EPUB spine alone.
@@ -550,7 +601,7 @@ class BookContent:
         for order, entry in enumerate(book.spine, start=1):
             spine_id = entry[0] if isinstance(entry, tuple) else entry
             item = book.get_item_with_id(spine_id)
-            href = item.file_name if item else ""
+            href = self._to_bundle_relative(item.file_name) if item else ""
             chapters.append(
                 Chapter(
                     id=spine_id or str(order),
@@ -564,19 +615,20 @@ class BookContent:
         return chapters
 
     def _read_chapter_bytes(self, href: str) -> bytes:
-        """Return raw bytes for a chapter file.
+        """Return raw bytes for a chapter file, given a bundle-relative href.
 
-        Tries ebooklib's ``get_item_with_href`` first (covers most
-        cases); falls back to iterating items and matching on
-        ``file_name``; ultimately falls back to reading the file
-        directly from disk relative to the bundle root.
+        ebooklib's ``get_item_with_href`` and ``EpubItem.file_name`` use
+        the OPF-relative convention, so we strip the OPF-dir prefix
+        before asking ebooklib. The disk fallback keeps the
+        bundle-relative form so ``self.path / href`` resolves correctly.
         """
         book = self._load_book()
-        item = book.get_item_with_href(href)
+        opf_relative = self._to_opf_relative(href)
+        item = book.get_item_with_href(opf_relative)
         if item is None:
             # ebooklib's lookup is exact-match; try a scan.
             for candidate in book.get_items():
-                if candidate.file_name == href:
+                if candidate.file_name == opf_relative:
                     item = candidate
                     break
         if item is not None:
@@ -604,7 +656,35 @@ class BookContent:
 # ---------------------------------------------------------------------------
 
 
+_NS_CONTAINER = "urn:oasis:names:tc:opendocument:xmlns:container"
 _NS_NCX = "http://www.daisy.org/z3986/2005/ncx/"
+
+
+def _opf_dir_from_container(epub_root: pathlib.Path) -> pathlib.PurePosixPath:
+    """Return the OPF file's directory relative to the EPUB bundle root.
+
+    Parses ``META-INF/container.xml`` and reads the ``<rootfile
+    full-path="…">`` attribute to locate the OPF, then returns its
+    parent directory as a :class:`pathlib.PurePosixPath`.
+
+    Used to normalize ebooklib's manifest item hrefs (which are
+    OPF-relative) to bundle-relative paths so :attr:`Chapter.href` and
+    the NCX fallback both speak the same convention — callers can
+    always do ``bundle_root / chapter.href``. Returns the empty
+    PurePosixPath (``PurePosixPath('.')``) when the OPF sits at the
+    bundle root, and falls back to empty on any parse error.
+    """
+    container = epub_root / "META-INF" / "container.xml"
+    if not container.exists():
+        return pathlib.PurePosixPath()
+    try:
+        root = ET.parse(container).getroot()
+    except ET.ParseError:
+        return pathlib.PurePosixPath()
+    rootfile = root.find(f".//{{{_NS_CONTAINER}}}rootfile")
+    if rootfile is None or not rootfile.get("full-path"):
+        return pathlib.PurePosixPath()
+    return pathlib.PurePosixPath(rootfile.get("full-path")).parent
 
 
 def _parse_ncx_bytes(
