@@ -1,4 +1,7 @@
+import pathlib
 from datetime import datetime
+from py_apple_books.content import BookContent
+from py_apple_books.exceptions import BookNotDownloadedError, DRMProtectedError
 from py_apple_books.models import Book, Collection, Annotation, AnnotationColor
 from py_apple_books.models.manager import ModelIterable
 from py_apple_books.utils import APPLE_EPOCH_OFFSET
@@ -109,3 +112,48 @@ class PyAppleBooks:
     def get_recently_read_books(self, limit: int = 10, order_by: str = "-last_opened_date") -> ModelIterable:
         """Get recently opened books, ordered by last opened date."""
         return Book.manager.filter(last_opened_date__isnull=False, limit=limit, order_by=order_by)
+
+    # -- content actions --
+    def get_book_content(self, book_id: int) -> BookContent:
+        """Return a :class:`BookContent` handle for reading a book's full text.
+
+        Performs three pre-checks before returning:
+
+        1. The book's file is recorded in the library (``ZPATH`` is set).
+        2. The file is locally downloaded, not an iCloud placeholder.
+        3. The file is not DRM-protected (no ``META-INF/encryption.xml``).
+
+        :raises BookNotDownloadedError: if the book has no local file
+            (``path`` is None) or exists only as an iCloud placeholder. The
+            fix in both cases is to open the book in Apple Books to trigger
+            a download.
+        :raises DRMProtectedError: if the book is FairPlay-protected — a
+            non-sample Apple Books Store purchase. Its chapters are
+            readable only through the Apple Books reader.
+        """
+        book = self.get_book_by_id(book_id)
+
+        if not book.path:
+            raise BookNotDownloadedError(
+                f"'{book.title}' has not been downloaded to this Mac. "
+                f"Open it in Apple Books to download a local copy, then "
+                f"try again."
+            )
+
+        content = BookContent(pathlib.Path(book.path))
+
+        if not content.is_downloaded:
+            raise BookNotDownloadedError(
+                f"'{book.title}' is stored in iCloud and has not been "
+                f"downloaded to this Mac. Open it in Apple Books to trigger "
+                f"a download, then try again."
+            )
+
+        if content.is_drm_protected:
+            raise DRMProtectedError(
+                f"'{book.title}' is a DRM-protected Apple Books Store "
+                f"purchase (FairPlay). Its text content cannot be read "
+                f"directly; only imported EPUBs and PDFs are readable."
+            )
+
+        return content
