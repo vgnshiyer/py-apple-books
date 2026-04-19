@@ -35,6 +35,12 @@ class Annotation(Model):
     note: str
     is_underline: bool
     style: int
+    # ZANNOTATIONTYPE disambiguates what kind of annotation this is:
+    #   1 = highlight (with selected text)
+    #   2 = user note (text + note body)
+    #   3 = automatic "current reading position" bookmark (zero-width,
+    #       no selected text, one per book, updated as the user reads)
+    type: int
 
     # Location
     chapter: str

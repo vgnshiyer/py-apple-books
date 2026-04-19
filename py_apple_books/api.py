@@ -1,10 +1,18 @@
 import pathlib
 from datetime import datetime
-from py_apple_books.content import BookContent
+from typing import Optional
+from py_apple_books.content import BookContent, Chapter
 from py_apple_books.exceptions import BookNotDownloadedError, DRMProtectedError
 from py_apple_books.models import Book, Collection, Annotation, AnnotationColor
 from py_apple_books.models.manager import ModelIterable
 from py_apple_books.utils import APPLE_EPOCH_OFFSET
+
+
+# Apple Books' ``ZANNOTATIONTYPE`` value for the automatic "current reading
+# position" bookmark. Distinct from highlights (1) and notes (2); one per
+# book, updated as the user reads, with empty selected_text/note and a
+# zero-width CFI range.
+_ANNOTATION_TYPE_READING_BOOKMARK = 3
 
 
 class PyAppleBooks:
@@ -157,3 +165,50 @@ class PyAppleBooks:
             )
 
         return content
+
+    def get_current_reading_location(self, book_id: int) -> Optional[Annotation]:
+        """Return the auto-tracked 'current reading position' bookmark, or
+        None if none exists.
+
+        Apple Books silently creates and updates one bookmark-style
+        annotation per book as the user reads — it's how the reader
+        restores your place when you reopen a book. These annotations
+        have ``ZANNOTATIONTYPE = 3``, empty selected text and note, and
+        a zero-width CFI range in :attr:`Annotation.location`.
+
+        Callers that also want the chapter resolved from the CFI should
+        use :meth:`get_current_reading_chapter` instead, which does both
+        lookups in one call.
+        """
+        book = self.get_book_by_id(book_id)
+        if not book.asset_id:
+            return None
+        results = list(
+            Annotation.manager.filter(
+                asset_id=book.asset_id,
+                type=_ANNOTATION_TYPE_READING_BOOKMARK,
+                is_deleted=False,
+                limit=1,
+            )
+        )
+        return results[0] if results else None
+
+    def get_current_reading_chapter(self, book_id: int) -> Optional[Chapter]:
+        """Return the :class:`Chapter` the user was last reading, or None.
+
+        Combines :meth:`get_current_reading_location` with
+        :meth:`BookContent.chapter_at_cfi`:
+
+        1. Look up the book's auto-bookmark annotation.
+        2. Parse its CFI to identify the current spine item.
+        3. Return the corresponding :class:`Chapter` entry.
+
+        :raises BookNotDownloadedError: if the book isn't available
+            locally (same preconditions as :meth:`get_book_content`).
+        :raises DRMProtectedError: if the book is DRM-protected.
+        """
+        bookmark = self.get_current_reading_location(book_id)
+        if bookmark is None or not bookmark.location:
+            return None
+        content = self.get_book_content(book_id)
+        return content.chapter_at_cfi(bookmark.location)

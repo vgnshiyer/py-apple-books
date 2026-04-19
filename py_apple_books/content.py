@@ -239,6 +239,113 @@ class BookContent:
 
         return self._chapters_from_spine(book)
 
+    # -- CFI resolution -----------------------------------------------------
+
+    def chapter_at_cfi(self, cfi: str) -> Optional["Chapter"]:
+        """Resolve an EPUB CFI to the :class:`Chapter` that contains it.
+
+        A CFI like
+        ``epubcfi(/6/26[id134]!/4[text]/2[fm02]/2/2[calibre_pb_0]/2/2/1,:0,:1)``
+        encodes a position within an EPUB. The segment before ``!``
+        identifies the spine item; the segment after identifies a
+        location within that XHTML. For chapter-level resolution we only
+        need the spine item, which we identify in two ways (in order of
+        preference):
+
+        1. **Bracket hint**: CFIs frequently embed the manifest item id
+           as a hint, e.g. ``/6/26[id134]`` means the spine entry is the
+           item with id ``id134``. We look that up in ebooklib's
+           manifest and match its href against :meth:`list_chapters`.
+        2. **Numeric spine index**: When no bracket hint is present,
+           CFI step ``/6/N`` points at spine item ``(N // 2) - 1``
+           (CFI uses even steps for elements, 1-based).
+
+        Among chapters with matching href we prefer the one whose
+        :attr:`Chapter.fragment` appears as a later bracket hint in the
+        CFI path, so multi-section files (Project Gutenberg style) land
+        on the correct subsection instead of the file's first chapter.
+
+        :param cfi: Raw ``epubcfi(...)`` string as stored in
+            :attr:`Annotation.location`.
+        :return: The matching :class:`Chapter`, or None if the CFI is
+            malformed or can't be resolved.
+        """
+        if not self.is_epub or not cfi:
+            return None
+
+        m = re.match(r"^\s*epubcfi\((.+)\)\s*$", cfi)
+        if not m:
+            return None
+
+        body = m.group(1)
+        spine_path, sep, content_path = body.partition("!")
+
+        spine_brackets = re.findall(r"\[([^\]]+)\]", spine_path)
+        content_brackets = (
+            re.findall(r"\[([^\]]+)\]", content_path) if sep else []
+        )
+
+        chapters = self.list_chapters()
+        if not chapters:
+            return None
+
+        book = self._load_book()
+
+        # Resolve the CFI to a spine index first. The bracket hint
+        # (e.g. ``[item4]``) is the manifest item id of the spine entry;
+        # otherwise we decode the numeric step (``/6/N`` → spine item
+        # (N // 2) - 1).
+        spine_idx: Optional[int] = None
+        if spine_brackets:
+            hint = spine_brackets[-1]
+            for i, entry in enumerate(book.spine):
+                spine_id = entry[0] if isinstance(entry, tuple) else entry
+                if spine_id == hint:
+                    spine_idx = i
+                    break
+        if spine_idx is None:
+            nums = re.findall(r"/(\d+)", spine_path)
+            if len(nums) >= 2:
+                candidate = int(nums[1]) // 2 - 1
+                if 0 <= candidate < len(book.spine):
+                    spine_idx = candidate
+        if spine_idx is None:
+            return None
+
+        # Find the nearest ToC entry around the bookmark. Prefer walking
+        # backward first — the reader is most naturally "in" the chapter
+        # that started before their current page. Real-world EPUBs have
+        # transitional spine items (front-matter, inline TOC pages,
+        # half-title pages) that aren't listed in the NCX / nav doc, so
+        # the target spine entry frequently isn't a ToC entry itself.
+        # If backward finds nothing (e.g. bookmark on a title page
+        # before Chapter 1), walk forward to the first ToC entry after
+        # the bookmark.
+        def _scan(idx_range) -> Optional["Chapter"]:
+            for i in idx_range:
+                entry = book.spine[i]
+                spine_id = entry[0] if isinstance(entry, tuple) else entry
+                item = book.get_item_with_id(spine_id)
+                if item is None:
+                    continue
+                same_file = [ch for ch in chapters if ch.href == item.file_name]
+                if not same_file:
+                    continue
+                # On the exact spine hit, honor any fragment hint in the
+                # content-path so multi-section files land on the right
+                # subsection.
+                if i == spine_idx:
+                    for hint in content_brackets:
+                        for ch in same_file:
+                            if ch.fragment and ch.fragment == hint:
+                                return ch
+                return min(same_file, key=lambda c: (c.depth, c.order))
+            return None
+
+        return _scan(range(spine_idx, -1, -1)) or _scan(
+            range(spine_idx + 1, len(book.spine))
+        )
+
     # -- chapter reading ----------------------------------------------------
 
     def get_chapter_content(self, chapter_id: str) -> str:
