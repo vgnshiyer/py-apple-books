@@ -12,6 +12,12 @@ setup(
     author='Vignesh Iyer',
     author_email='vgnshiyer@gmail.com',
     packages=find_packages(),
+    install_requires=[
+        # EPUB parsing: handles EPUB2 (NCX) and EPUB3 (nav doc) ToCs.
+        'ebooklib>=0.20',
+        # XHTML → plain text for chapter content extraction.
+        'beautifulsoup4>=4.12',
+    ],
     license='MIT',
     url='https://github.com/vgnshiyer/py-apple-books',
     classifiers=[
