@@ -22,12 +22,11 @@ import pytest
 from py_apple_books.content import (
     BookContent,
     Chapter,
-    _extract_chapter_text,
-    _normalize_whitespace,
     _parse_ncx_bytes,
     is_downloaded,
 )
 from py_apple_books.exceptions import AppleBooksError
+from py_apple_books.utils import extract_chapter_text, normalize_whitespace
 
 
 # ---------------------------------------------------------------------------
@@ -37,27 +36,27 @@ from py_apple_books.exceptions import AppleBooksError
 
 class TestNormalizeWhitespace:
     def test_empty_string(self):
-        assert _normalize_whitespace("") == ""
+        assert normalize_whitespace("") == ""
 
     def test_whitespace_only_string(self):
-        assert _normalize_whitespace("  \t\n  ") == ""
+        assert normalize_whitespace("  \t\n  ") == ""
 
     def test_collapses_runs_of_spaces(self):
-        assert _normalize_whitespace("hello    world") == "hello world"
+        assert normalize_whitespace("hello    world") == "hello world"
 
     def test_collapses_tabs(self):
-        assert _normalize_whitespace("hello\t\tworld") == "hello world"
+        assert normalize_whitespace("hello\t\tworld") == "hello world"
 
     def test_preserves_single_paragraph_break(self):
-        assert _normalize_whitespace("para 1\n\npara 2") == "para 1\n\npara 2"
+        assert normalize_whitespace("para 1\n\npara 2") == "para 1\n\npara 2"
 
     def test_collapses_multiple_blank_lines(self):
         assert (
-            _normalize_whitespace("para 1\n\n\n\n\npara 2") == "para 1\n\npara 2"
+            normalize_whitespace("para 1\n\n\n\n\npara 2") == "para 1\n\npara 2"
         )
 
     def test_strips_leading_and_trailing(self):
-        assert _normalize_whitespace("\n\n  hello world  \n\n") == "hello world"
+        assert normalize_whitespace("\n\n  hello world  \n\n") == "hello world"
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +186,11 @@ class TestParseNcxBytes:
 class TestExtractChapterText:
     def test_simple_paragraph(self):
         html = b"<html><body><p>Hello world</p></body></html>"
-        assert _extract_chapter_text(html, None, set()) == "Hello world"
+        assert extract_chapter_text(html, None, set()) == "Hello world"
 
     def test_multiple_paragraphs_get_paragraph_breaks(self):
         html = b"<html><body><p>First</p><p>Second</p></body></html>"
-        assert _extract_chapter_text(html, None, set()) == "First\n\nSecond"
+        assert extract_chapter_text(html, None, set()) == "First\n\nSecond"
 
     def test_script_and_style_are_stripped(self):
         html = (
@@ -202,7 +201,7 @@ class TestExtractChapterText:
             b"<p>Visible text</p>"
             b"</body></html>"
         )
-        out = _extract_chapter_text(html, None, set())
+        out = extract_chapter_text(html, None, set())
         assert "Visible text" in out
         assert "var x" not in out
         assert "color: red" not in out
@@ -210,7 +209,7 @@ class TestExtractChapterText:
 
     def test_inline_tags_stay_inline(self):
         html = b"<html><body><p>foo <em>bar</em> baz</p></body></html>"
-        assert _extract_chapter_text(html, None, set()) == "foo bar baz"
+        assert extract_chapter_text(html, None, set()) == "foo bar baz"
 
     def test_xml_declaration_handled(self):
         html = (
@@ -219,7 +218,7 @@ class TestExtractChapterText:
             b"<head><title>T</title></head>"
             b"<body><p>Hi</p></body></html>"
         )
-        assert _extract_chapter_text(html, None, set()) == "Hi"
+        assert extract_chapter_text(html, None, set()) == "Hi"
 
     def test_void_elements_do_not_suppress_body(self):
         # Regression for the <meta>/<link> bug that suppressed all body
@@ -234,7 +233,7 @@ class TestExtractChapterText:
             b"<p>Real content</p>"
             b"</body></html>"
         )
-        assert "Real content" in _extract_chapter_text(html, None, set())
+        assert "Real content" in extract_chapter_text(html, None, set())
 
     def test_start_anchor_on_empty_a_inside_paragraph(self):
         # Regression for "The Goal" / Introduction. The anchor is an
@@ -249,7 +248,7 @@ class TestExtractChapterText:
             b"<p>And a follow-up paragraph too.</p>"
             b"</body></html>"
         )
-        out = _extract_chapter_text(html, "p4", set())
+        out = extract_chapter_text(html, "p4", set())
         assert "real opening paragraph" in out
         assert "follow-up paragraph" in out
 
@@ -264,14 +263,14 @@ class TestExtractChapterText:
             b'<a id="C"/><p>Text in section C</p>'
             b"</body></html>"
         )
-        out = _extract_chapter_text(html, "B", {"A", "C"})
+        out = extract_chapter_text(html, "B", {"A", "C"})
         assert "section B" in out
         assert "section A" not in out
         assert "section C" not in out
 
     def test_missing_start_anchor_falls_back_to_whole_document(self):
         html = b"<html><body><p>Hello</p></body></html>"
-        out = _extract_chapter_text(html, "nonexistent", set())
+        out = extract_chapter_text(html, "nonexistent", set())
         assert out == "Hello"
 
     def test_image_only_body_returns_empty(self):
@@ -283,7 +282,7 @@ class TestExtractChapterText:
             b'<img alt="Book 1" src="img.jpg"/>'
             b"</div></body></html>"
         )
-        assert _extract_chapter_text(html, None, set()) == ""
+        assert extract_chapter_text(html, None, set()) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -442,11 +441,11 @@ class TestListChapters:
         assert titles == ["Prologue", "Chapter Alpha", "Epilogue"]
 
 
-class TestGetChapterContent:
+class TestGetChapter:
     def test_by_chapter_id(self, simple_epub):
         content = BookContent(simple_epub.path)
         chapters = content.list_chapters()
-        text = content.get_chapter_content(chapters[0].id)
+        text = content.get_chapter(chapters[0].id)
         assert "Chapter 1" in text
         assert "Body paragraph for Chapter 1" in text
 
@@ -454,66 +453,37 @@ class TestGetChapterContent:
         """The id parameter also accepts ``str(order)`` as a fallback
         lookup for callers that only have a position."""
         content = BookContent(simple_epub.path)
-        text = content.get_chapter_content("2")
+        text = content.get_chapter("2")
         assert "Chapter 2" in text
 
     def test_paragraph_breaks_preserved(self, simple_epub):
         content = BookContent(simple_epub.path)
-        text = content.get_chapter_content(content.list_chapters()[0].id)
+        text = content.get_chapter(content.list_chapters()[0].id)
         # Two <p> tags should produce a paragraph break.
         assert "\n\n" in text
 
     def test_raises_on_unknown_chapter(self, simple_epub):
         with pytest.raises(AppleBooksError):
-            BookContent(simple_epub.path).get_chapter_content("nonexistent")
+            BookContent(simple_epub.path).get_chapter("nonexistent")
 
     def test_raises_for_non_epub(self, tmp_path):
         f = tmp_path / "book.pdf"
         f.write_bytes(b"%PDF-1.4\n")
         with pytest.raises(AppleBooksError):
-            BookContent(f).get_chapter_content("any")
+            BookContent(f).get_chapter("any")
 
-
-class TestChapterAtCfi:
-    def test_bracket_hint_resolves_to_chapter(self, simple_epub):
+    def test_accepts_any_spine_entry_id(self, simple_epub):
+        """``get_chapter`` must also accept manifest ids that aren't in
+        the ToC — e.g. sub-section spine entries. The generated fixture
+        doesn't have those, so we verify the general contract: every
+        manifest item id in the spine is fetchable."""
         content = BookContent(simple_epub.path)
-        chapters = content.list_chapters()
-        # The third chapter's manifest id (ebooklib defaults to "chap1",
-        # "chap2", etc. based on file_name). We verify via the resolver
-        # and cross-check.
         book = content._load_book()
         spine_ids = [e[0] for e in book.spine if isinstance(e, tuple)]
-        target_id = spine_ids[2]  # skip "nav"
-        cfi = f"epubcfi(/6/6[{target_id}]!/4/2/1:0)"
-        resolved = content.chapter_at_cfi(cfi)
-        assert resolved is not None
-        # The resolver returns the outermost ToC chapter that matches
-        # the href; for our flat fixture that is just the chapter itself.
-        assert resolved.href == chapters[1].href or resolved.href == chapters[0].href \
-            or resolved.href == chapters[2].href
-
-    def test_invalid_cfi_returns_none(self, simple_epub):
-        assert BookContent(simple_epub.path).chapter_at_cfi("not a cfi") is None
-
-    def test_empty_cfi_returns_none(self, simple_epub):
-        assert BookContent(simple_epub.path).chapter_at_cfi("") is None
-
-    def test_unknown_bracket_hint_falls_back_to_numeric(self, simple_epub):
-        """When the bracketed manifest id isn't in the book, the
-        resolver should fall back to numeric spine-index decoding."""
-        content = BookContent(simple_epub.path)
-        # /6/4 (even step 4) → spine index 1; our spine is
-        # ["nav", c1, c2, c3], so spine[1] is Chapter 1.
-        cfi = "epubcfi(/6/4[ghost-id]!/4/2/1:0)"
-        resolved = content.chapter_at_cfi(cfi)
-        assert resolved is not None
-        assert resolved.title == "Chapter 1"
-
-    def test_raises_for_non_epub(self, tmp_path):
-        f = tmp_path / "book.pdf"
-        f.write_bytes(b"%PDF-1.4\n")
-        # Non-EPUBs short-circuit and return None rather than raising.
-        assert BookContent(f).chapter_at_cfi("epubcfi(/6/4!/4/2/1:0)") is None
+        # Every spine id should be fetchable (no raise).
+        for sid in spine_ids:
+            text = content.get_chapter(sid)
+            assert isinstance(text, str)
 
 
 # ---------------------------------------------------------------------------

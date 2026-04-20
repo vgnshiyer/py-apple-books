@@ -19,18 +19,17 @@ NCX by media-type and parse it ourselves.
 """
 
 import pathlib
-import re
 import subprocess
 import urllib.parse
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Set, Union
+from typing import Any, Iterable, List, Optional, Set, Tuple, Union
 
-from bs4 import BeautifulSoup, NavigableString, Tag
 from ebooklib import epub
 
 from py_apple_books.exceptions import AppleBooksError
+from py_apple_books.utils import extract_chapter_text
 
 PathLike = Union[str, pathlib.Path]
 
@@ -240,172 +239,88 @@ class BookContent:
 
         return self._chapters_from_spine(book)
 
-    # -- CFI resolution -----------------------------------------------------
-
-    def chapter_at_cfi(self, cfi: str) -> Optional["Chapter"]:
-        """Resolve an EPUB CFI to the :class:`Chapter` that contains it.
-
-        A CFI like
-        ``epubcfi(/6/26[id134]!/4[text]/2[fm02]/2/2[calibre_pb_0]/2/2/1,:0,:1)``
-        encodes a position within an EPUB. The segment before ``!``
-        identifies the spine item; the segment after identifies a
-        location within that XHTML. For chapter-level resolution we only
-        need the spine item, which we identify in two ways (in order of
-        preference):
-
-        1. **Bracket hint**: CFIs frequently embed the manifest item id
-           as a hint, e.g. ``/6/26[id134]`` means the spine entry is the
-           item with id ``id134``. We look that up in ebooklib's
-           manifest and match its href against :meth:`list_chapters`.
-        2. **Numeric spine index**: When no bracket hint is present,
-           CFI step ``/6/N`` points at spine item ``(N // 2) - 1``
-           (CFI uses even steps for elements, 1-based).
-
-        Among chapters with matching href we prefer the one whose
-        :attr:`Chapter.fragment` appears as a later bracket hint in the
-        CFI path, so multi-section files (Project Gutenberg style) land
-        on the correct subsection instead of the file's first chapter.
-
-        :param cfi: Raw ``epubcfi(...)`` string as stored in
-            :attr:`Annotation.location`.
-        :return: The matching :class:`Chapter`, or None if the CFI is
-            malformed or can't be resolved.
-        """
-        if not self.is_epub or not cfi:
-            return None
-
-        m = re.match(r"^\s*epubcfi\((.+)\)\s*$", cfi)
-        if not m:
-            return None
-
-        body = m.group(1)
-        spine_path, sep, content_path = body.partition("!")
-
-        spine_brackets = re.findall(r"\[([^\]]+)\]", spine_path)
-        content_brackets = (
-            re.findall(r"\[([^\]]+)\]", content_path) if sep else []
-        )
-
-        chapters = self.list_chapters()
-        if not chapters:
-            return None
-
-        book = self._load_book()
-
-        # Resolve the CFI to a spine index first. The bracket hint
-        # (e.g. ``[item4]``) is the manifest item id of the spine entry;
-        # otherwise we decode the numeric step (``/6/N`` → spine item
-        # (N // 2) - 1).
-        spine_idx: Optional[int] = None
-        if spine_brackets:
-            hint = spine_brackets[-1]
-            for i, entry in enumerate(book.spine):
-                spine_id = entry[0] if isinstance(entry, tuple) else entry
-                if spine_id == hint:
-                    spine_idx = i
-                    break
-        if spine_idx is None:
-            nums = re.findall(r"/(\d+)", spine_path)
-            if len(nums) >= 2:
-                candidate = int(nums[1]) // 2 - 1
-                if 0 <= candidate < len(book.spine):
-                    spine_idx = candidate
-        if spine_idx is None:
-            return None
-
-        # Find the nearest ToC entry around the bookmark. Prefer walking
-        # backward first — the reader is most naturally "in" the chapter
-        # that started before their current page. Real-world EPUBs have
-        # transitional spine items (front-matter, inline TOC pages,
-        # half-title pages) that aren't listed in the NCX / nav doc, so
-        # the target spine entry frequently isn't a ToC entry itself.
-        # If backward finds nothing (e.g. bookmark on a title page
-        # before Chapter 1), walk forward to the first ToC entry after
-        # the bookmark.
-        def _scan(idx_range) -> Optional["Chapter"]:
-            for i in idx_range:
-                entry = book.spine[i]
-                spine_id = entry[0] if isinstance(entry, tuple) else entry
-                item = book.get_item_with_id(spine_id)
-                if item is None:
-                    continue
-                item_href = self._to_bundle_relative(item.file_name)
-                same_file = [ch for ch in chapters if ch.href == item_href]
-                if not same_file:
-                    continue
-                # On the exact spine hit, honor any fragment hint in the
-                # content-path so multi-section files land on the right
-                # subsection.
-                if i == spine_idx:
-                    for hint in content_brackets:
-                        for ch in same_file:
-                            if ch.fragment and ch.fragment == hint:
-                                return ch
-                return min(same_file, key=lambda c: (c.depth, c.order))
-            return None
-
-        return _scan(range(spine_idx, -1, -1)) or _scan(
-            range(spine_idx + 1, len(book.spine))
-        )
-
     # -- chapter reading ----------------------------------------------------
 
-    def get_chapter_content(self, chapter_id: str) -> str:
-        """Return the plain-text content of a chapter.
+    def get_chapter(self, chapter_id: str) -> str:
+        """Return the plain-text content of a chapter or sub-section.
 
-        Looks up ``chapter_id`` against the result of :meth:`list_chapters`
-        (matches either :attr:`Chapter.id` or the 1-based :attr:`Chapter.order`
-        rendered as a string). For chapters carrying a fragment, the
-        returned text is scoped to the region from that anchor up to
-        the next fragment anchor in the same file, preventing sibling
-        sections in a multi-section XHTML file from leaking into one
-        another.
+        ``chapter_id`` is a manifest item id — i.e. any spine entry in
+        the EPUB. Two lookup paths:
+
+        1. **ToC chapter** — the id matches one of :meth:`list_chapters`
+           entries. Returns text scoped to that navPoint's fragment
+           when the XHTML file hosts multiple navPoints (Project
+           Gutenberg layout), so sibling sections don't leak into one
+           another.
+        2. **Any other spine entry** (sub-sections not in the ToC) —
+           falls through to ebooklib's manifest lookup directly and
+           returns the whole file's text. This handles EPUBs whose
+           spine is finer-grained than the ToC (e.g. Isaacson's *Elon
+           Musk*, where each chapter has a ``chXX_sub01`` fine-section
+           file that the ToC doesn't list).
 
         HTML → plain text extraction is done with :mod:`bs4` using the
         stdlib ``html.parser`` backend.
 
-        :param chapter_id: Identifier from :meth:`list_chapters`.
-        :return: Plain text, with paragraph breaks preserved.
-        :raises AppleBooksError: if the book is not an EPUB, no chapter
-            matches, or the chapter file cannot be read.
+        :param chapter_id: Manifest item id from :meth:`list_chapters`
+            or from a :class:`~py_apple_books.models.location.Location`.
+        :return: Plain text of the chapter, with paragraph breaks
+            preserved.
+        :raises AppleBooksError: if the book is not an EPUB or no spine
+            entry matches ``chapter_id``.
         """
         if not self.is_epub:
             raise AppleBooksError(
-                "get_chapter_content() is only supported for EPUB bundles; "
+                "get_chapter() is only supported for EPUB bundles; "
                 f"path {self.path!s} is not a .epub directory."
             )
 
-        chapters = self.list_chapters()
-        if not chapters:
-            raise AppleBooksError("Book has no chapters to read.")
-
         wanted_id = str(chapter_id)
+
+        # Path 1: match a ToC chapter (enables fragment scoping).
+        chapters = self.list_chapters()
         match: Optional[Chapter] = None
         for ch in chapters:
             if ch.id == wanted_id or str(ch.order) == wanted_id:
                 match = ch
                 break
-        if match is None:
-            raise AppleBooksError(
-                f"No chapter matches id {chapter_id!r}. "
-                f"Use list_chapters() to see available ids."
+
+        if match is not None:
+            html_bytes = self._read_chapter_bytes(match.href)
+            # Other navPoint fragments in the same file become stop
+            # anchors so sibling sections don't bleed into one another.
+            stop_anchors: Set[str] = {
+                ch.fragment
+                for ch in chapters
+                if ch.href == match.href
+                and ch.fragment
+                and ch.fragment != match.fragment
+            }
+            return extract_chapter_text(
+                html_bytes,
+                start_anchor=match.fragment or None,
+                stop_anchors=stop_anchors,
             )
 
-        html_bytes = self._read_chapter_bytes(match.href)
-
-        # Every *other* fragment in the same file is a stop anchor, so
-        # sibling sections don't leak into one another when parent/child
-        # navPoints share an XHTML file (Project Gutenberg style).
-        stop_anchors: Set[str] = {
-            ch.fragment
-            for ch in chapters
-            if ch.href == match.href and ch.fragment and ch.fragment != match.fragment
-        }
-
-        return _extract_chapter_text(
+        # Path 2: fall back to raw spine — works for sub-sections that
+        # aren't in the ToC. ebooklib's manifest knows every spine item.
+        book = self._load_book()
+        item = book.get_item_with_id(wanted_id)
+        if item is None:
+            raise AppleBooksError(
+                f"No chapter or spine entry with id {chapter_id!r}. "
+                f"Use list_chapters() to see available ids."
+            )
+        try:
+            html_bytes = item.get_content()
+        except Exception as e:
+            raise AppleBooksError(
+                f"Could not read spine entry {chapter_id!r}: {e}"
+            ) from e
+        return extract_chapter_text(
             html_bytes,
-            start_anchor=match.fragment or None,
-            stop_anchors=stop_anchors,
+            start_anchor=None,
+            stop_anchors=set(),
         )
 
     # -- internal helpers ---------------------------------------------------
@@ -772,112 +687,5 @@ def _parse_ncx_bytes(
     return chapters
 
 
-# ---------------------------------------------------------------------------
-# XHTML → plain text extraction (bs4)
-# ---------------------------------------------------------------------------
-
-
-# Tags whose contents should be dropped entirely.
-_SKIP_TAGS = {"script", "style", "head"}
-
-# Tags that produce a paragraph break in the extracted text.
-_BLOCK_LEVEL_TAGS = {
-    "address", "article", "aside", "blockquote", "br", "details", "div",
-    "dl", "dd", "dt", "figure", "footer", "header", "hgroup", "hr",
-    "h1", "h2", "h3", "h4", "h5", "h6",
-    "li", "main", "nav", "ol", "p", "pre", "section", "table", "tr",
-    "td", "th", "ul",
-}
-
-
-def _extract_chapter_text(
-    html_bytes: bytes,
-    start_anchor: Optional[str],
-    stop_anchors: Set[str],
-) -> str:
-    """Extract plain text from an XHTML chapter, scoped to an anchor window.
-
-    Delegates the heavy lifting to :mod:`bs4`:
-
-    * Drops ``<script>`` / ``<style>`` / ``<head>`` outright via
-      :meth:`Tag.decompose`.
-    * Pre-inserts ``"\\n"`` text nodes around every block-level tag so
-      the final :meth:`Tag.get_text` naturally produces paragraph-
-      separated output.
-    * For fragment-scoped reads, walks only the siblings of the anchor
-      element and stops at the first sibling whose subtree contains a
-      stop-anchor id.
-
-    Falls back to whole-document extraction when the start anchor is
-    set but can't be found in the source — some EPUBs ship stale NCX
-    ids, so we'd rather return the full file than nothing.
-    """
-    soup = BeautifulSoup(html_bytes, "html.parser")
-
-    # Drop ignorable content up front.
-    for tag_name in _SKIP_TAGS:
-        for tag in soup.find_all(tag_name):
-            tag.decompose()
-
-    # Insert paragraph-break markers around block-level tags so bs4's
-    # get_text() produces readable output without manual recursion.
-    for tag in list(soup.find_all(_BLOCK_LEVEL_TAGS)):
-        tag.insert_before("\n")
-        tag.insert_after("\n")
-
-    if start_anchor:
-        anchor_el = soup.find(id=start_anchor)
-        if anchor_el is not None:
-            return _text_in_window(soup, anchor_el, stop_anchors)
-
-    root = soup.body if soup.body is not None else soup
-    return _normalize_whitespace(root.get_text())
-
-
-def _text_in_window(
-    soup: BeautifulSoup, anchor_el: Tag, stop_anchors: Set[str]
-) -> str:
-    """Collect text strings in document order from ``anchor_el`` forward,
-    stopping at the first element whose id is in ``stop_anchors``.
-
-    Walks :attr:`soup.descendants` (pre-order DFS) rather than the
-    sibling chain. This is essential because EPUB section anchors are
-    often empty ``<a id="…"/>`` tags *nested inside* a heading or
-    paragraph — the real chapter body lives in sibling ``<p>`` tags of
-    the outer container, not of the anchor itself. A sibling-only walk
-    would never escape the heading and would return nothing.
-
-    Assumes the caller has already pre-inserted ``"\\n"`` text nodes
-    around block-level tags so the collected string has natural
-    paragraph breaks.
-    """
-    collecting = False
-    parts: List[str] = []
-    for node in soup.descendants:
-        if isinstance(node, Tag):
-            if node is anchor_el:
-                collecting = True
-                continue
-            if collecting and node.get("id") in stop_anchors:
-                break
-        elif collecting and isinstance(node, NavigableString):
-            parts.append(str(node))
-    return _normalize_whitespace("".join(parts))
-
-
-def _normalize_whitespace(text: str) -> str:
-    """Collapse runs of whitespace while preserving paragraph breaks."""
-    text = re.sub(r"[ \t\f\v]+", " ", text)
-    lines = [line.strip() for line in text.splitlines()]
-    out: List[str] = []
-    prev_blank = True
-    for line in lines:
-        if line:
-            out.append(line)
-            prev_blank = False
-        elif not prev_blank:
-            out.append("")
-            prev_blank = True
-    return "\n".join(out).strip()
 
 

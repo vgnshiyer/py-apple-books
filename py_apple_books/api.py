@@ -2,10 +2,14 @@ import pathlib
 from datetime import datetime
 from typing import Optional
 from py_apple_books.content import BookContent, Chapter
-from py_apple_books.exceptions import BookNotDownloadedError, DRMProtectedError
+from py_apple_books.exceptions import (
+    AppleBooksError,
+    BookNotDownloadedError,
+    DRMProtectedError,
+)
 from py_apple_books.models import Book, Collection, Annotation, AnnotationColor
 from py_apple_books.models.manager import ModelIterable
-from py_apple_books.utils import APPLE_EPOCH_OFFSET
+from py_apple_books.utils import APPLE_EPOCH_OFFSET, snap_window
 
 
 # Apple Books' ``ZANNOTATIONTYPE`` value for the automatic "current reading
@@ -108,15 +112,33 @@ class PyAppleBooks:
             order_by=order_by,
         )
 
-    def search_annotation_by_text(self, text: str, limit: int = None, order_by: str = None) -> ModelIterable:
-        """Search user annotations by any text that contains the given text."""
-        return Annotation.manager.filter(selected_text__contains=text,
-                                         representative_text__contains=text,
-                                         note__contains=text,
-                                         type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
-                                         use_or=True,
-                                         limit=limit,
-                                         order_by=order_by)
+    def search_annotation_by_text(self, text: str, limit: int = None, order_by: str = None):
+        """Search user annotations by any text that contains the given text.
+
+        The OR across ``selected_text`` / ``representative_text`` / ``note``
+        can't cleanly combine with an AND on ``type`` in the current
+        manager (``use_or`` applies to every WHERE clause uniformly),
+        so we over-fetch from the manager and strip bookmarks in
+        Python. The over-fetch factor compensates for the filter loss
+        when the caller supplies a limit.
+
+        Returns a list (not a :class:`ModelIterable`) to reflect the
+        post-processing step.
+        """
+        fetch_limit = (limit * 2) if limit else None
+        raw = list(Annotation.manager.filter(
+            selected_text__contains=text,
+            representative_text__contains=text,
+            note__contains=text,
+            use_or=True,
+            limit=fetch_limit,
+            order_by=order_by,
+        ))
+        filtered = [
+            a for a in raw
+            if getattr(a, "type", None) != _ANNOTATION_TYPE_READING_BOOKMARK
+        ]
+        return filtered[:limit] if limit else filtered
 
     def get_annotations_by_date_range(self, after: datetime = None, before: datetime = None,
                                        limit: int = None, order_by: str = None) -> ModelIterable:
@@ -234,19 +256,97 @@ class PyAppleBooks:
     def get_current_reading_chapter(self, book_id: int) -> Optional[Chapter]:
         """Return the :class:`Chapter` the user was last reading, or None.
 
-        Combines :meth:`get_current_reading_location` with
-        :meth:`BookContent.chapter_at_cfi`:
-
-        1. Look up the book's auto-bookmark annotation.
-        2. Parse its CFI to identify the current spine item.
-        3. Return the corresponding :class:`Chapter` entry.
+        Looks up the book's auto-bookmark annotation, pulls
+        :attr:`Location.chapter_id` off the parsed CFI, and matches it
+        against :meth:`BookContent.list_chapters`. Returns None when
+        the book has no bookmark, the CFI lacks a bracket hint, or the
+        hinted spine entry isn't a ToC chapter (only the current-reading
+        surface cares about ToC-level resolution; generic content reads
+        go through :meth:`get_annotation_surrounding_text` which handles
+        sub-sections via :meth:`BookContent.get_chapter`).
 
         :raises BookNotDownloadedError: if the book isn't available
             locally (same preconditions as :meth:`get_book_content`).
         :raises DRMProtectedError: if the book is DRM-protected.
         """
         bookmark = self.get_current_reading_location(book_id)
-        if bookmark is None or not bookmark.location:
+        if bookmark is None or not bookmark.location or not bookmark.location.chapter_id:
             return None
         content = self.get_book_content(book_id)
-        return content.chapter_at_cfi(bookmark.location)
+        target_id = bookmark.location.chapter_id
+        for ch in content.list_chapters():
+            if ch.id == target_id:
+                return ch
+        return None
+
+    def get_annotation_surrounding_text(
+        self,
+        annotation_id: int,
+        chars_before: int = 300,
+        chars_after: int = 300,
+    ) -> str:
+        """Return a text window around an annotation's highlight.
+
+        Pulls the annotation's CFI from its :class:`Location`, fetches
+        the chapter (or sub-section) text via
+        :meth:`BookContent.get_chapter`, finds the annotation's
+        selected text inside the chapter, and returns a snippet of
+        ``chars_before`` characters before and ``chars_after`` after,
+        snapped to whitespace so the window never starts or ends
+        mid-word.
+
+        Degrades gracefully (returns ``""``) in any of these cases:
+
+        * the annotation has no CFI or the CFI carries no bracket hint
+          (so there's no chapter to fetch);
+        * the book isn't available locally (iCloud placeholder,
+          never-downloaded);
+        * the book is DRM-protected;
+        * the spine entry isn't readable for any reason;
+        * the anchor text can't be located in the chapter.
+
+        :param annotation_id: Annotation id from any of the annotation
+            facade methods (``list_annotations``, ``recent_annotations``,
+            etc.) or from
+            :meth:`get_current_reading_location`.
+        :param chars_before: Characters of context to include before
+            the annotation's anchor text.
+        :param chars_after: Characters of context after.
+        """
+        try:
+            annotation = self.get_annotation_by_id(annotation_id)
+        except IndexError:
+            return ""
+
+        if not annotation.location or not annotation.location.chapter_id:
+            return ""
+
+        book = getattr(annotation, "book", None)
+        if book is None:
+            return ""
+
+        try:
+            content = self.get_book_content(book.id)
+            chapter_text = content.get_chapter(annotation.location.chapter_id)
+        except AppleBooksError:
+            return ""
+
+        anchor = (
+            (annotation.selected_text or "").strip()
+            or (annotation.representative_text or "").strip()
+            or None
+        )
+
+        if not chapter_text:
+            return ""
+
+        if anchor:
+            idx = chapter_text.find(anchor)
+            if idx >= 0:
+                return snap_window(
+                    chapter_text, idx, len(anchor), chars_before, chars_after
+                )
+
+        # Fallback: opening of the chapter if anchor isn't findable.
+        end = min(len(chapter_text), chars_before + chars_after)
+        return snap_window(chapter_text, 0, 0, 0, end)
