@@ -1,10 +1,12 @@
 import pathlib
 from datetime import datetime
 from typing import Optional
+from py_apple_books import collection_writer
 from py_apple_books.content import BookContent, Chapter
 from py_apple_books.exceptions import (
     AppleBooksError,
     BookNotDownloadedError,
+    CollectionNotFoundError,
     DRMProtectedError,
 )
 from py_apple_books.models import Book, Collection, Annotation, AnnotationColor
@@ -28,17 +30,60 @@ class PyAppleBooks:
     """Facade class for accessing Apple Books data."""
 
     # -- collection actions --
+    #
+    # Deleted collections are soft-deleted tombstones (ZDELETEDFLAG=1)
+    # kept for iCloud sync — user-facing reads exclude them.
+
     def list_collections(self, limit: int = None, order_by: str = None) -> ModelIterable:
-        """List all collections."""
-        return Collection.manager.all(limit=limit, order_by=order_by)
+        """List all collections (excluding deleted ones)."""
+        return Collection.manager.filter(is_deleted=0, limit=limit, order_by=order_by)
 
     def get_collection_by_id(self, collection_id: str) -> Collection:
-        """Get a collection and its books."""
-        return Collection.manager.filter(id=collection_id)[0]
+        """Get a collection and its books.
+
+        Raises :class:`CollectionNotFoundError` (an ``IndexError``
+        subclass, so legacy handlers keep working) when the id doesn't
+        exist or points at a deleted collection.
+        """
+        try:
+            return Collection.manager.filter(id=collection_id, is_deleted=0)[0]
+        except IndexError:
+            raise CollectionNotFoundError(f"No collection with id {collection_id}.")
 
     def get_collection_by_title(self, title: str) -> ModelIterable:
         """Get a collection and its books."""
-        return Collection.manager.filter(title__contains=title)
+        return Collection.manager.filter(title__contains=title, is_deleted=0)
+
+    # -- collection write actions --
+    #
+    # These modify the Apple Books library database directly (Apple
+    # exposes no automation API for collections). Every call refuses
+    # while Books.app is running, takes a WAL-inclusive backup by
+    # default, validates the schema, and runs in a single transaction.
+    # See py_apple_books.collection_writer for the invariants
+    # maintained and the iCloud-sync caveat.
+
+    def create_collection(self, title: str, details: str = None, backup: bool = True) -> Collection:
+        """Create a user collection and return it."""
+        new_id = collection_writer.create_collection(title, details, backup=backup)
+        return self.get_collection_by_id(new_id)
+
+    def rename_collection(self, collection_id, new_title: str, backup: bool = True) -> Collection:
+        """Rename a user-created collection and return it refreshed."""
+        collection_writer.rename_collection(collection_id, new_title, backup=backup)
+        return self.get_collection_by_id(collection_id)
+
+    def delete_collection(self, collection_id, backup: bool = True) -> None:
+        """Delete a user-created collection (soft-delete; books are untouched)."""
+        collection_writer.delete_collection(collection_id, backup=backup)
+
+    def add_book_to_collection(self, collection_id, book_id, backup: bool = True) -> bool:
+        """Add a book to a collection. Returns False if it was already there."""
+        return collection_writer.add_book_to_collection(collection_id, book_id, backup=backup)
+
+    def remove_book_from_collection(self, collection_id, book_id, backup: bool = True) -> bool:
+        """Remove a book from a collection. Returns False if it wasn't in it."""
+        return collection_writer.remove_book_from_collection(collection_id, book_id, backup=backup)
 
     # -- book actions --
     def list_books(self, limit: int = None, order_by: str = None) -> ModelIterable:

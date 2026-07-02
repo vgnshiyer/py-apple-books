@@ -157,12 +157,6 @@ class ModelManager:
         related_ids = self.compiler.execute(query)
         return [row[0] for row in related_ids]
 
-    # TODO
-    def add(self, data: dict) -> str:
-        pass
-
-    def update(self, id: int, data: dict) -> str:
-        pass
-
-    def delete(self, id: int) -> str:
-        pass
+    # Write operations intentionally do NOT live on the manager: the
+    # manager's connection is read-only by design. See
+    # py_apple_books.collection_writer for the guarded write path.

@@ -57,35 +57,9 @@ class Query:
 
         return query
 
-    @staticmethod
-    def insert(table_name: str,
-               data: Dict[str, Any]) -> str:
-        """
-        Build and execute an INSERT query
-        """
-        fields = ', '.join(data.keys())
-        values = ', '.join([f"'{value}'" for value in data.values()])
-        query = f"INSERT INTO {table_name} ({fields}) VALUES ({values})"
-        return query
-
-    @staticmethod
-    def update(table_name: str,
-               data: Dict[str, Any],
-               where: List[Where]) -> str:
-        """
-        Build and execute an UPDATE query
-        """
-        set_clause = ', '.join([f"{field} = '{value}'" for field, value in data.items()])
-        where_clause = ' AND '.join([str(clause) for clause in where])
-        query = f"UPDATE {table_name} SET {set_clause} WHERE {where_clause}"
-        return query
-
-    @staticmethod
-    def delete(table_name: str,
-               where: List[Where]) -> str:
-        """
-        Build and execute a DELETE query
-        """
-        where_clause = ' AND '.join([str(clause) for clause in where])
-        query = f"DELETE FROM {table_name} WHERE {where_clause}"
-        return query
+    # NOTE: insert/update/delete string-builders were removed on purpose.
+    # They interpolated values into SQL without escaping (a title with an
+    # apostrophe would break the statement), and the read path they belong
+    # to now opens the database read-only anyway. Write operations live in
+    # :mod:`py_apple_books.collection_writer`, which uses parameterized
+    # queries on a dedicated guarded connection.
