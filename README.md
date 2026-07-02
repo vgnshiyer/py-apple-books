@@ -23,6 +23,28 @@ pip install py_apple_books
 | `get_collection_by_id(collection_id)` | Get a collection by its ID | `collection_id: str` | Collection |
 | `get_collection_by_title(title)` | Search collections by title substring | `title: str` | ModelIterable |
 
+### Collection writes (v1.9.0+)
+
+Apple exposes no automation API for collections, so these write directly to the
+library's SQLite store — behind guard rails: every call refuses while Books.app
+is running, takes a WAL-inclusive timestamped backup (kept under
+`~/.py_apple_books/backups/`, restorable via `write_safety.restore_library`),
+validates the schema and aborts on drift, and runs in a single transaction that
+maintains Core Data's bookkeeping. Only user-created collections can be renamed
+or deleted; membership edits also work on "Want to Read".
+
+⚠️ With iCloud "Collections, bookmarks and highlights" sync enabled, direct
+writes may not propagate to other devices and can be reverted by a cloud
+re-sync. Verify a small edit cross-device before relying on it.
+
+| Function | Description | Parameters | Return Type |
+|----------|-------------|------------|-------------|
+| `create_collection(title, details?)` | Create a user collection | `title: str`, `details?: str` | Collection |
+| `rename_collection(collection_id, new_title)` | Rename a user collection | `collection_id`, `new_title: str` | Collection |
+| `delete_collection(collection_id)` | Soft-delete a user collection (books untouched) | `collection_id` | None |
+| `add_book_to_collection(collection_id, book_id)` | Add a book (idempotent) | `collection_id`, `book_id` | bool |
+| `remove_book_from_collection(collection_id, book_id)` | Remove a book (idempotent) | `collection_id`, `book_id` | bool |
+
 ### Books
 
 | Function | Description | Parameters | Return Type |
