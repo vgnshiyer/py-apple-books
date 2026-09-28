@@ -16,19 +16,27 @@ handle real-world EPUB quirks. A small stdlib fallback kicks in when an
 EPUB's OPF omits the ``<spine toc=…>`` attribute (e.g. *The 4-Hour
 Workweek*); in that case ebooklib returns an empty ToC, so we detect the
 NCX by media-type and parse it ourselves.
+
+Every file read from an EPUB bundle is confined to that bundle: entries
+that resolve outside it (absolute or ``../`` hrefs, symlinks) or that
+aren't regular files (FIFOs, device nodes) are refused, since a crafted
+book could otherwise expose unrelated local files or block forever.
 """
 
 import pathlib
+import posixpath
+import stat
 import subprocess
 import urllib.parse
 import xml.etree.ElementTree as ET
+import zipfile
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Set, Tuple, Union
 
 from ebooklib import epub
 
-from py_apple_books.exceptions import AppleBooksError
+from py_apple_books.exceptions import AppleBooksError, UnsafeEpubEntryError
 from py_apple_books.utils import extract_chapter_text
 
 PathLike = Union[str, pathlib.Path]
@@ -110,6 +118,91 @@ def is_downloaded(path: PathLike) -> bool:
 
     # Symlink / other: treat as present; any downstream read will fail cleanly.
     return True
+
+
+# ---------------------------------------------------------------------------
+# Bundle containment (every read from an EPUB bundle goes through here)
+# ---------------------------------------------------------------------------
+
+
+# Upper bound for a single bundle entry. Real books carry fonts and videos
+# in the tens of MiB (largest seen: a 22 MiB font), so this only stops a
+# hostile entry from exhausting memory — ebooklib reads every manifest
+# item eagerly.
+_MAX_ENTRY_BYTES = 256 * 1024 * 1024
+
+
+def _safe_bundle_path(root: pathlib.Path, rel: str) -> pathlib.Path:
+    """Resolve a bundle-relative entry name, refusing anything unsafe.
+
+    Symlinks are resolved before the containment check, so a link that
+    points outside the bundle is caught just like an absolute or
+    ``../`` name. The entry must be a regular file: FIFOs and device
+    nodes (``/dev/stdin``, ``/dev/zero``) would block or never end, and
+    are rejected from ``stat`` alone, without opening them.
+
+    :param root: The EPUB bundle directory.
+    :param rel: Entry name relative to ``root`` (``/``-separated).
+    :raises UnsafeEpubEntryError: if the entry escapes the bundle, isn't
+        a regular file, or exceeds :data:`_MAX_ENTRY_BYTES`.
+    :raises OSError: if the entry can't be stat'ed (e.g.
+        :class:`FileNotFoundError` when it doesn't exist).
+    """
+    try:
+        root = root.resolve()
+        path = (root / posixpath.normpath(rel)).resolve()
+    except (OSError, RuntimeError):  # RuntimeError: symlink loop
+        raise UnsafeEpubEntryError(
+            f"EPUB entry {rel!r} can't be resolved inside the book bundle."
+        ) from None
+    if not path.is_relative_to(root):
+        raise UnsafeEpubEntryError(
+            f"EPUB entry {rel!r} points outside the book bundle."
+        )
+    st = path.stat()
+    if not stat.S_ISREG(st.st_mode):
+        raise UnsafeEpubEntryError(
+            f"EPUB entry {rel!r} is not a regular file."
+        )
+    if st.st_size > _MAX_ENTRY_BYTES:
+        raise UnsafeEpubEntryError(
+            f"EPUB entry {rel!r} is larger than "
+            f"{_MAX_ENTRY_BYTES // (1024 * 1024)} MiB."
+        )
+    return path
+
+
+def _escapes_bundle(href: str) -> bool:
+    """True if a bundle-relative href climbs above the bundle root or
+    is absolute. Lexical only — :func:`_safe_bundle_path` is what
+    enforces containment on read."""
+    norm = posixpath.normpath(href)
+    return norm == ".." or norm.startswith("../") or norm.startswith("/")
+
+
+class _ContainedEpubReader(epub.EpubReader):
+    """:class:`ebooklib.epub.EpubReader` confined to the book bundle.
+
+    ebooklib's directory backend opens ``os.path.join(root, name)`` for
+    the container, the OPF and every manifest item at load time, with no
+    containment check. Routing those reads through
+    :func:`_safe_bundle_path` makes a crafted book fail to load instead.
+    Zipped EPUBs keep ebooklib's own reader: archive members are looked
+    up by name and can't leave the archive.
+    """
+
+    def read_file(self, name):
+        if isinstance(self.zf, zipfile.ZipFile):
+            return super().read_file(name)
+        try:
+            path = _safe_bundle_path(pathlib.Path(self.file_name), name)
+            return path.read_bytes()
+        except OSError as e:
+            # Name the entry, not the absolute path — messages reach
+            # MCP clients verbatim.
+            raise AppleBooksError(
+                f"Could not read EPUB entry {name!r}: {e.strerror}"
+            ) from e
 
 
 # ---------------------------------------------------------------------------
@@ -221,11 +314,7 @@ class BookContent:
         :raises AppleBooksError: if the book is not an EPUB or ebooklib
             cannot read the package.
         """
-        if not self.is_epub:
-            raise AppleBooksError(
-                "list_chapters() is only supported for EPUB bundles; "
-                f"path {self.path!s} is not a .epub directory."
-            )
+        self._require_epub()
 
         book = self._load_book()
 
@@ -269,11 +358,7 @@ class BookContent:
         :raises AppleBooksError: if the book is not an EPUB or no spine
             entry matches ``chapter_id``.
         """
-        if not self.is_epub:
-            raise AppleBooksError(
-                "get_chapter() is only supported for EPUB bundles; "
-                f"path {self.path!s} is not a .epub directory."
-            )
+        self._require_epub()
 
         wanted_id = str(chapter_id)
 
@@ -325,15 +410,38 @@ class BookContent:
 
     # -- internal helpers ---------------------------------------------------
 
+    def _require_epub(self) -> None:
+        """Raise unless the path is an EPUB bundle. The message names
+        the format or file name, never the absolute path — it reaches
+        MCP clients verbatim."""
+        if self.is_epub:
+            return
+        if self.is_pdf:
+            raise AppleBooksError(
+                "This book is a PDF; chapter listing/reading is only "
+                "supported for EPUB books."
+            )
+        raise AppleBooksError(
+            f"'{self.path.name}' is not an EPUB bundle directory; chapter "
+            f"listing/reading is only supported for EPUB books."
+        )
+
     def _load_book(self) -> epub.EpubBook:
-        """Lazily read and cache the EPUB via ebooklib."""
+        """Lazily read and cache the EPUB via ebooklib, confined to the
+        bundle (see :class:`_ContainedEpubReader`)."""
         if self._book is None:
+            # Same steps as epub.read_epub(), with the contained reader.
+            reader = _ContainedEpubReader(str(self.path))
             try:
-                self._book = epub.read_epub(str(self.path))
+                book = reader.load()
+                reader.process()
+            except AppleBooksError:
+                raise
             except Exception as e:
                 raise AppleBooksError(
-                    f"Could not read EPUB at {self.path}: {e}"
+                    f"Could not read EPUB '{self.path.name}': {e}"
                 ) from e
+            self._book = book
         return self._book
 
     def _opf_dir(self) -> pathlib.PurePosixPath:
@@ -433,6 +541,10 @@ class BookContent:
             # ToC hrefs are OPF-relative in ebooklib; normalize to
             # bundle-relative so Chapter.href resolves against self.path.
             bundle_href = self._to_bundle_relative(bare)
+            # Never advertise an entry pointing outside the bundle —
+            # reading it would be refused anyway.
+            if _escapes_bundle(bundle_href):
+                return
 
             key = (bundle_href, fragment)
             if key in seen:
@@ -535,7 +647,8 @@ class BookContent:
         ebooklib's ``get_item_with_href`` and ``EpubItem.file_name`` use
         the OPF-relative convention, so we strip the OPF-dir prefix
         before asking ebooklib. The disk fallback keeps the
-        bundle-relative form so ``self.path / href`` resolves correctly.
+        bundle-relative form so ``self.path / href`` resolves correctly,
+        and refuses hrefs that leave the bundle.
         """
         book = self._load_book()
         opf_relative = self._to_opf_relative(href)
@@ -552,17 +665,16 @@ class BookContent:
             except Exception:
                 pass  # fall through to disk read
 
-        abs_path = self.path / href
-        if not abs_path.exists():
+        try:
+            return _safe_bundle_path(self.path, href).read_bytes()
+        except (FileNotFoundError, NotADirectoryError):
             raise AppleBooksError(
                 f"Chapter file {href!r} is declared in the EPUB "
                 f"manifest but missing on disk."
-            )
-        try:
-            return abs_path.read_bytes()
+            ) from None
         except OSError as e:
             raise AppleBooksError(
-                f"Could not read chapter file {abs_path}: {e}"
+                f"Could not read chapter file {href!r}: {e.strerror}"
             ) from e
 
 
@@ -587,19 +699,19 @@ def _opf_dir_from_container(epub_root: pathlib.Path) -> pathlib.PurePosixPath:
     the NCX fallback both speak the same convention — callers can
     always do ``bundle_root / chapter.href``. Returns the empty
     PurePosixPath (``PurePosixPath('.')``) when the OPF sits at the
-    bundle root, and falls back to empty on any parse error.
+    bundle root, and falls back to empty on any parse error, on an
+    unsafe ``container.xml``, or when the OPF path leaves the bundle.
     """
-    container = epub_root / "META-INF" / "container.xml"
-    if not container.exists():
-        return pathlib.PurePosixPath()
     try:
-        root = ET.parse(container).getroot()
-    except ET.ParseError:
+        container = _safe_bundle_path(epub_root, "META-INF/container.xml")
+        root = ET.fromstring(container.read_bytes())
+    except (AppleBooksError, OSError, ET.ParseError):
         return pathlib.PurePosixPath()
     rootfile = root.find(f".//{{{_NS_CONTAINER}}}rootfile")
-    if rootfile is None or not rootfile.get("full-path"):
+    full_path = rootfile.get("full-path") if rootfile is not None else None
+    if not full_path or _escapes_bundle(full_path):
         return pathlib.PurePosixPath()
-    return pathlib.PurePosixPath(rootfile.get("full-path")).parent
+    return pathlib.PurePosixPath(full_path).parent
 
 
 def _parse_ncx_bytes(
@@ -658,10 +770,14 @@ def _parse_ncx_bytes(
             fragment = urllib.parse.unquote(fragment)
 
             # NCX src is relative to the NCX file; normalize to an
-            # EPUB-root-relative path.
-            href_rel = (ncx_dir_in_epub / bare).as_posix()
-            # PurePosixPath keeps leading "./"; strip it for cleanliness.
-            href_rel = href_rel.lstrip("./")
+            # EPUB-root-relative path. normpath resolves "../" segments
+            # without mangling dot-prefixed names (".x.xhtml").
+            href_rel = posixpath.normpath((ncx_dir_in_epub / bare).as_posix())
+            if href_rel == ".":
+                href_rel = ""
+            # Drop entries that climb out of the bundle or are absolute.
+            if _escapes_bundle(href_rel):
+                continue
 
             order += 1
             np_id = np.get("id")

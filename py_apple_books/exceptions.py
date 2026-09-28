@@ -19,6 +19,15 @@ class DRMProtectedError(AppleBooksError):
     """
 
 
+class UnsafeEpubEntryError(AppleBooksError):
+    """Raised when a file inside an EPUB bundle resolves outside the
+    bundle (absolute or ``../`` href, symlink), isn't a regular file
+    (FIFO, device node), or is implausibly large. Reading it could expose
+    unrelated local files or block forever, so the read is refused — a
+    crafted book fails to load instead.
+    """
+
+
 class WriteError(AppleBooksError):
     """Base exception for write operations against the Books library."""
 
