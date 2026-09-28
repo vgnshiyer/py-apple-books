@@ -284,6 +284,52 @@ class TestExtractChapterText:
         )
         assert extract_chapter_text(html, None, set()) == ""
 
+    def test_fragment_scoping_drops_comments(self):
+        # Regression: the fragment path kept HTML comments (bs4 Comment
+        # subclasses NavigableString) while the whole-file path dropped
+        # them — leaking commented-out markup into 29 real chapters.
+        html = (
+            b"<html><body>"
+            b'<a id="A"/><p>Text <!-- editor note --> in A</p>'
+            b"<?pi instruction?>"
+            b'<a id="B"/><p>Text in B</p>'
+            b"</body></html>"
+        )
+        out = extract_chapter_text(html, "A", {"B"})
+        assert out == "Text in A"
+        assert "editor note" not in out
+        assert "instruction" not in out
+
+    def test_fragment_scoping_drops_ruby_annotations(self):
+        # Furigana in <rt>/<rp> are dropped by get_text() on the
+        # whole-file path; the fragment path must agree.
+        body = (
+            "<p><ruby>漢<rp>(</rp><rt>かん</rt><rp>)</rp></ruby>"
+            "<ruby>字<rp>(</rp><rt>じ</rt><rp>)</rp></ruby>を読む。</p>"
+        )
+        whole = extract_chapter_text(
+            f"<html><body>{body}</body></html>".encode(), None, set()
+        )
+        fragment = extract_chapter_text(
+            f'<html><body><a id="s"/>{body}</body></html>'.encode(), "s", set()
+        )
+        assert whole == fragment == "漢字を読む。"
+
+    def test_fragment_and_whole_file_paths_agree(self):
+        body = (
+            "<p>One <![CDATA[cdata]]> two</p><!-- hidden -->"
+            "<template><p>tpl</p></template><p>three</p>"
+        )
+        whole = extract_chapter_text(
+            f"<html><body>{body}</body></html>".encode(), None, set()
+        )
+        fragment = extract_chapter_text(
+            f'<html><body><a id="s"/>{body}</body></html>'.encode(), "s", set()
+        )
+        assert fragment == whole
+        assert "cdata" in whole
+        assert "hidden" not in whole and "tpl" not in whole
+
 
 # ---------------------------------------------------------------------------
 # is_downloaded
