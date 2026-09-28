@@ -451,26 +451,37 @@ class BookContent:
 
         # Path 2: fall back to raw spine — works for sub-sections that
         # aren't in the ToC. ebooklib's manifest knows every spine item.
+        return self._spine_item_text(wanted_id)
+
+    # -- internal helpers ---------------------------------------------------
+
+    def _spine_item_text(self, item_id: str) -> str:
+        """Plain text of the whole file behind manifest item ``item_id``,
+        with no ToC fragment scoping — :meth:`get_chapter`'s path 2, also
+        used to locate annotations by their CFI's manifest id.
+
+        :raises AppleBooksError: if the book is not an EPUB, no manifest
+            item has that id, or its content can't be read.
+        """
+        self._require_epub()
         book = self._load_book()
-        item = book.get_item_with_id(wanted_id)
+        item = book.get_item_with_id(item_id)
         if item is None:
             raise AppleBooksError(
-                f"No chapter or spine entry with id {chapter_id!r}. "
+                f"No chapter or spine entry with id {item_id!r}. "
                 f"Use list_chapters() to see available ids."
             )
         try:
             html_bytes = item.get_content()
         except Exception as e:
             raise AppleBooksError(
-                f"Could not read spine entry {chapter_id!r}: {e}"
+                f"Could not read spine entry {item_id!r}: {e}"
             ) from e
         return extract_chapter_text(
             html_bytes,
             start_anchor=None,
             stop_anchors=set(),
         )
-
-    # -- internal helpers ---------------------------------------------------
 
     def _require_epub(self) -> None:
         """Raise unless the path is an EPUB bundle. The message names

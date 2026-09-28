@@ -10,7 +10,7 @@ Split into four layers:
 * **BookContent tests** using the generated EPUB fixtures from
   ``conftest.py``.
 * **Facade tests** for the content-backed :class:`PyAppleBooks` methods
-  (DRM error wording), with the database lookups
+  (DRM error wording, annotation context), with the database lookups
   stubbed out.
 
 Bundle-containment (security) tests live in ``test_content_security.py``.
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -33,6 +34,7 @@ from py_apple_books.content import (
     is_downloaded,
 )
 from py_apple_books.exceptions import AppleBooksError, DRMProtectedError
+from py_apple_books.models.location import Location
 from py_apple_books.utils import extract_chapter_text, normalize_whitespace
 
 
@@ -656,6 +658,92 @@ class TestGetChapter:
         for sid in spine_ids:
             text = content.get_chapter(sid)
             assert isinstance(text, str)
+
+
+# ---------------------------------------------------------------------------
+# PyAppleBooks.get_annotation_surrounding_text
+# ---------------------------------------------------------------------------
+
+
+_ANCHORED_CHAPTER = (
+    "<html><body>"
+    "<p>Opening paragraph of the file.</p>"
+    "<p>The reader highlighted this sentence\n    which wraps across lines.</p>"
+    "<p>Closing words of the chapter.</p>"
+    '<h2 id="next">Next Chapter Heading</h2>'
+    "</body></html>"
+)
+
+
+@pytest.fixture
+def anchored_epub(epub_factory):
+    """Calibre-split layout: chapter 1's only ToC entry points at an
+    anchor at the *end* of its file, so fragment-scoped
+    :meth:`BookContent.get_chapter` text starts after everything the
+    reader highlighted."""
+    built = epub_factory()
+    root = built.path / "EPUB"
+    (root / "chap1.xhtml").write_text(_ANCHORED_CHAPTER)
+    nav = root / "nav.xhtml"
+    nav.write_text(
+        nav.read_text().replace('href="chap1.xhtml"', 'href="chap1.xhtml#next"')
+    )
+    return built
+
+
+class TestAnnotationSurroundingText:
+    def _api(self, bundle, selected_text, representative_text=None):
+        content = BookContent(bundle)
+        item_id = content._load_book().get_item_with_href("chap1.xhtml").get_id()
+        annotation = SimpleNamespace(
+            location=Location(f"epubcfi(/6/4[{item_id}]!/4/4/1,:4,:30)"),
+            selected_text=selected_text,
+            representative_text=representative_text,
+            book=SimpleNamespace(id=1),
+        )
+        api = PyAppleBooks()
+        api.get_annotation_by_id = lambda annotation_id: annotation
+        api.get_book_content = lambda book_id: BookContent(bundle)
+        return api, content, item_id
+
+    def test_finds_highlight_before_fragment_anchor(self, anchored_epub):
+        # Stored selected_text keeps the EPUB's line breaks; extraction
+        # collapses them, so an exact find() would miss.
+        selected = "highlighted this sentence\n    which wraps across lines."
+        api, content, item_id = self._api(anchored_epub.path, selected)
+        assert content.get_chapter(item_id) == "Next Chapter Heading"
+
+        window = api.get_annotation_surrounding_text(1)
+        assert "highlighted this sentence which wraps across lines." in window
+        assert "Opening paragraph" in window
+        # MCP 0.8.1 wraps the highlight with the same token regex.
+        pattern = r"\s+".join(re.escape(t) for t in selected.split())
+        assert re.search(pattern, window)
+
+    def test_window_is_snapped_around_the_highlight(self, anchored_epub):
+        api, _, _ = self._api(anchored_epub.path, "Closing words")
+        window = api.get_annotation_surrounding_text(1, chars_before=10, chars_after=10)
+        assert window.startswith("…") and window.endswith("…")
+        assert "Closing words" in window
+        assert "Opening paragraph" not in window
+
+    def test_miss_returns_empty_not_chapter_opening(self, anchored_epub):
+        api, _, _ = self._api(anchored_epub.path, "words that are not in the book")
+        assert api.get_annotation_surrounding_text(1) == ""
+
+    def test_annotation_without_text_returns_empty(self, anchored_epub):
+        api, _, _ = self._api(anchored_epub.path, "", representative_text="  ")
+        assert api.get_annotation_surrounding_text(1) == ""
+
+    def test_falls_back_to_representative_text(self, anchored_epub):
+        api, _, _ = self._api(
+            anchored_epub.path, None, representative_text="Opening paragraph"
+        )
+        assert "Opening paragraph" in api.get_annotation_surrounding_text(1)
+
+    def test_regex_metacharacters_are_literal(self, anchored_epub):
+        api, _, _ = self._api(anchored_epub.path, "lines.) (Closing")
+        assert api.get_annotation_surrounding_text(1) == ""
 
 
 # ---------------------------------------------------------------------------
