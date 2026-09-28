@@ -4,7 +4,15 @@ from py_apple_books.models.annotation import Annotation
 from py_apple_books.models.relations import OneToMany
 from py_apple_books.utils import apple_timestamp_to_datetime
 import pathlib
+import re
 from datetime import datetime
+from typing import Optional
+
+# Apple Books stores a missing author as a Private Use Area glyph plus a
+# localization key (U+E83A + 'UnknownAuthor'), which Books.app renders as
+# "Unknown Author". Matched narrowly so a real name that merely starts
+# with a PUA glyph is left alone.
+_UNKNOWN_AUTHOR_PLACEHOLDER = re.compile(r"[\uE000-\uF8FF][A-Za-z]+")
 
 
 @dataclass
@@ -17,7 +25,8 @@ class Book(Model):
 
     # Basic book information
     title: str
-    author: str
+    # None when Apple Books has no author (see _UNKNOWN_AUTHOR_PLACEHOLDER).
+    author: Optional[str]
     description: str
     genre: str
     content_type: str
@@ -71,9 +80,11 @@ class Book(Model):
         self.purchased_date = apple_timestamp_to_datetime(self.purchased_date)
         self.duration = float(self.duration) / 1000 if self.duration else None
         self.reading_progress = float(self.reading_progress) * 100 if self.reading_progress else None
+        if self.author and _UNKNOWN_AUTHOR_PLACEHOLDER.fullmatch(self.author):
+            self.author = None
 
     def __str__(self):
-        return f"ID: {self.id}\nTitle: {self.title}\nAuthor: {self.author}\nDescription: {self.description}"
+        return f"ID: {self.id}\nTitle: {self.title}\nAuthor: {self.author or 'Unknown Author'}\nDescription: {self.description}"
 
     @property
     def progress_status(self) -> str:

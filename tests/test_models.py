@@ -85,3 +85,45 @@ class TestMappings:
         assert subset == {"title": "ZTITLE", "author": "ZAUTHOR"}
         subset["title"] = "MUTATED"
         assert Book._get_mappings("Book")["title"] == "ZTITLE"
+
+
+# ---------------------------------------------------------------------------
+# Book.author: Apple's unknown-author placeholder
+# ---------------------------------------------------------------------------
+
+# How Books stores "no author" in ZAUTHOR; Books.app shows "Unknown Author".
+UNKNOWN_AUTHOR = "\ue83aUnknownAuthor"
+
+
+def _is_private_use(ch: str) -> bool:
+    return "\ue000" <= ch <= "\uf8ff"
+
+
+class TestUnknownAuthor:
+    def test_placeholder_becomes_none(self, no_relations):
+        """Regression: the raw placeholder leaked into every listing,
+        bypassing callers' ``book.author or "Unknown Author"`` fallbacks."""
+        assert Book.from_db(_book_row(author=UNKNOWN_AUTHOR)).author is None
+
+    @pytest.mark.parametrize("glyph", ["\ue000", "\uf8ff"])
+    def test_whole_private_use_range_is_recognized(self, no_relations, glyph):
+        assert Book.from_db(_book_row(author=glyph + "UnknownAuthor")).author is None
+
+    @pytest.mark.parametrize("author", [
+        "Jane Austen",
+        "村上春樹",            # CJK sits outside the Private Use Area
+        "\uf8ff Education",    # PUA glyph (Apple logo) before a real name
+        "UnknownAuthor",       # no glyph, so not Apple's placeholder
+        "",
+        None,
+    ])
+    def test_other_authors_untouched(self, no_relations, author):
+        assert Book.from_db(_book_row(author=author)).author == author
+
+    def test_str_renders_missing_author(self, no_relations):
+        text = str(Book.from_db(_book_row(author=UNKNOWN_AUTHOR)))
+        assert "\nAuthor: Unknown Author\n" in text
+        assert not any(_is_private_use(ch) for ch in text)
+
+    def test_str_renders_real_author(self, no_relations):
+        assert "\nAuthor: Jane Austen\n" in str(Book.from_db(_book_row(author="Jane Austen")))
