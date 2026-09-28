@@ -91,6 +91,12 @@ class TestParseNcxBytes:
     def test_malformed_xml_returns_empty(self):
         assert _parse_ncx_bytes(b"<not valid", pathlib.PurePosixPath("")) == []
 
+    @pytest.mark.parametrize("encoding", ["Shift_JIS", "bogus"])
+    def test_undecodable_declared_encoding_returns_empty(self, encoding):
+        # expat raises ValueError / LookupError here, not ParseError.
+        xml = _ncx("").replace(b"UTF-8", encoding.encode())
+        assert _parse_ncx_bytes(xml, pathlib.PurePosixPath("OEBPS")) == []
+
     def test_missing_navmap_returns_empty(self):
         xml = (
             b'<?xml version="1.0"?>\n'
@@ -509,6 +515,39 @@ class TestBookContentProperties:
         )
         assert BookContent(simple_epub.path).is_drm_protected is True
 
+    @pytest.mark.parametrize("encoding", ["Shift_JIS", "bogus"])
+    def test_is_drm_protected_true_for_undecodable_encryption_xml(
+        self, simple_epub, encoding
+    ):
+        # Font obfuscation only, but in an encoding expat refuses with
+        # ValueError / LookupError: fail closed rather than raise.
+        _write_encryption_xml(
+            simple_epub.path,
+            [("http://www.idpf.org/2008/embedding", "EPUB/f.otf")],
+            encoding=encoding,
+        )
+        assert BookContent(simple_epub.path).is_drm_protected is True
+
+    @pytest.mark.parametrize(
+        "root",
+        [
+            "<encryption>",
+            '<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container">',
+        ],
+        ids=["no-namespace", "container-namespace"],
+    )
+    def test_is_drm_protected_true_without_xmlenc_namespace(
+        self, simple_epub, root
+    ):
+        (simple_epub.path / "META-INF" / "encryption.xml").write_text(
+            root
+            + "<EncryptedData><EncryptionMethod "
+            'Algorithm="http://www.w3.org/2001/04/xmlenc#aes128-cbc"/>'
+            '<CipherData><CipherReference URI="EPUB/chap1.xhtml"/></CipherData>'
+            "</EncryptedData></encryption>"
+        )
+        assert BookContent(simple_epub.path).is_drm_protected is True
+
     @pytest.mark.parametrize("name", ["sinf.xml", "rights.xml"])
     def test_is_drm_protected_true_for_license_files(self, simple_epub, name):
         (simple_epub.path / "META-INF" / name).write_text("<x/>")
@@ -522,10 +561,13 @@ class TestBookContentProperties:
         assert BookContent(f).is_drm_protected is False
 
 
-def _write_encryption_xml(bundle: pathlib.Path, entries) -> None:
+def _write_encryption_xml(
+    bundle: pathlib.Path, entries, encoding: str = "utf-8"
+) -> None:
     """Write ``META-INF/encryption.xml`` with one ``EncryptedData`` per
     ``(algorithm, uri)`` entry; ``algorithm=None`` omits the
-    ``EncryptionMethod``."""
+    ``EncryptionMethod``. ``encoding`` only goes into the XML
+    declaration (the content is ASCII)."""
     blocks = []
     for algorithm, uri in entries:
         method = (
@@ -537,7 +579,7 @@ def _write_encryption_xml(bundle: pathlib.Path, entries) -> None:
             f"</enc:EncryptedData>"
         )
     (bundle / "META-INF" / "encryption.xml").write_text(
-        '<?xml version="1.0"?>\n'
+        f'<?xml version="1.0" encoding="{encoding}"?>\n'
         '<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container" '
         'xmlns:enc="http://www.w3.org/2001/04/xmlenc#">'
         + "".join(blocks)
@@ -572,6 +614,19 @@ class TestGetBookContentDrmMessage:
                 self._api_for(simple_epub.path).get_book_content(1)
         assert "encrypted EPUB (DRM)" in str(exc.value)
         assert "FairPlay" not in str(exc.value)
+
+    @pytest.mark.parametrize("encoding", ["Shift_JIS", "bogus"])
+    def test_undecodable_encryption_xml_is_refused_not_raised(
+        self, simple_epub, encoding
+    ):
+        _write_encryption_xml(
+            simple_epub.path,
+            [("http://www.idpf.org/2008/embedding", "EPUB/f.otf")],
+            encoding=encoding,
+        )
+        with patch.object(BookContent, "is_downloaded", new=True):
+            with pytest.raises(DRMProtectedError, match="encrypted EPUB"):
+                self._api_for(simple_epub.path).get_book_content(1)
 
     def test_font_obfuscated_book_is_returned(self, simple_epub):
         _write_encryption_xml(

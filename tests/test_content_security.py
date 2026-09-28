@@ -378,6 +378,58 @@ class TestTocEscapes:
         with pytest.raises(UnsafeEpubEntryError):
             content._read_chapter_bytes("OEBPS/toc/" + escape)
 
+    @pytest.mark.parametrize("toc", ["nav", "ncx"])
+    def test_absolute_toc_href_with_opf_in_subdir_is_not_advertised(
+        self, lib, toc
+    ):
+        # With the OPF in OEBPS/, prefixing "/abs" gives "OEBPS//abs",
+        # which normalizes to an in-bundle-looking "OEBPS/abs".
+        absolute = str(lib / "outside" / "canary.txt")
+        links = [("Text/ch1.xhtml", "One"), (absolute, "Notes")]
+        if toc == "nav":
+            manifest = [_NAV_ITEM, _CH1_ITEM]
+            files = {"OEBPS/nav.xhtml": _nav(links)}
+            spine_toc = None
+        else:
+            manifest = [("ncx", "toc.ncx", "application/x-dtbncx+xml", ""), _CH1_ITEM]
+            files = {
+                "OEBPS/toc.ncx": _ncx(
+                    [(f"np{i}", t, h) for i, (h, t) in enumerate(links, 1)]
+                )
+            }
+            spine_toc = "ncx"
+        files["OEBPS/Text/ch1.xhtml"] = _CHAPTER.format(title="One")
+        bundle = _write_bundle(
+            _bundle_path(lib),
+            manifest=manifest,
+            files=files,
+            spine=["ch1"],
+            spine_toc=spine_toc,
+        )
+        chapters = BookContent(bundle).list_chapters()
+        assert [(c.title, c.href) for c in chapters] == [
+            ("One", "OEBPS/Text/ch1.xhtml")
+        ]
+
+    def test_nul_byte_href_is_refused_as_apple_books_error(self, lib):
+        # "%00" unquotes to a NUL byte, which makes resolve() raise
+        # ValueError; it must surface like any other unreadable entry.
+        bundle = _write_bundle(
+            _bundle_path(lib),
+            manifest=[_NAV_ITEM, _CH1_ITEM],
+            files={
+                "OEBPS/nav.xhtml": _nav(
+                    [("Text/ch1.xhtml", "One"), ("Text/x.xhtml%00", "Bad")]
+                ),
+                "OEBPS/Text/ch1.xhtml": _CHAPTER.format(title="One"),
+            },
+            spine=["ch1"],
+        )
+        content = BookContent(bundle)
+        assert [c.id for c in content.list_chapters()] == ["ch1", "2"]
+        with pytest.raises(UnsafeEpubEntryError):
+            content.get_chapter("2")
+
     def test_parse_ncx_drops_escaping_and_absolute_srcs(self):
         ncx = _ncx(
             [
@@ -432,6 +484,82 @@ class TestContainerEscapes:
         assert _opf_dir_from_container(bundle) == pathlib.PurePosixPath()
         with pytest.raises(UnsafeEpubEntryError):
             BookContent(bundle).list_chapters()
+
+    @pytest.mark.parametrize("encoding", ["Shift_JIS", "bogus"])
+    def test_undecodable_container_falls_back_to_bundle_root(self, lib, encoding):
+        bundle = _bundle_path(lib)
+        (bundle / "META-INF").mkdir(parents=True)
+        (bundle / "META-INF" / "container.xml").write_text(
+            _CONTAINER.format(opf="OEBPS/content.opf").replace(
+                '<?xml version="1.0"?>',
+                f'<?xml version="1.0" encoding="{encoding}"?>',
+            )
+        )
+        assert _opf_dir_from_container(bundle) == pathlib.PurePosixPath()
+
+
+# ---------------------------------------------------------------------------
+# The DRM gate reads encryption.xml before the book loads
+# ---------------------------------------------------------------------------
+
+
+_FONT_ONLY_ENCRYPTION = (
+    '<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container" '
+    'xmlns:enc="http://www.w3.org/2001/04/xmlenc#"><enc:EncryptedData>'
+    '<enc:EncryptionMethod Algorithm="http://www.idpf.org/2008/embedding"/>'
+    '<enc:CipherData><enc:CipherReference URI="OEBPS/f.otf"/></enc:CipherData>'
+    "</enc:EncryptedData></encryption>"
+)
+
+
+class TestDrmGate:
+    """``is_drm_protected`` runs on every ``get_book_content`` call, for
+    library-wide MCP tools too, so reading ``encryption.xml`` must stay
+    in the bundle, never block, and fail closed."""
+
+    def _bundle(self, lib) -> pathlib.Path:
+        return _write_bundle(
+            _bundle_path(lib),
+            manifest=[_NAV_ITEM, _CH1_ITEM],
+            files={
+                "OEBPS/nav.xhtml": _nav([("Text/ch1.xhtml", "One")]),
+                "OEBPS/Text/ch1.xhtml": _CHAPTER.format(title="One"),
+            },
+            spine=["ch1"],
+        )
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX FIFOs")
+    def test_fifo_encryption_xml_fails_closed_fast(self, lib):
+        fifo = self._bundle(lib) / "META-INF" / "encryption.xml"
+        os.mkfifo(fifo)
+        try:
+            content = BookContent(fifo.parent.parent)
+            assert _call_with_timeout(lambda: content.is_drm_protected) is True
+        finally:
+            try:
+                os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+            except OSError:
+                pass
+
+    @pytest.mark.parametrize("where", ["dev-zero", "outside"])
+    def test_symlinked_encryption_xml_fails_closed_fast(self, lib, where):
+        bundle = self._bundle(lib)
+        if where == "dev-zero":
+            target = pathlib.Path("/dev/zero")
+        else:
+            # Font-only, so reading it would wrongly clear the book.
+            target = lib / "outside" / "encryption.xml"
+            target.write_text(_FONT_ONLY_ENCRYPTION)
+        (bundle / "META-INF" / "encryption.xml").symlink_to(target)
+        content = BookContent(bundle)
+        assert _call_with_timeout(lambda: content.is_drm_protected) is True
+
+    def test_oversized_encryption_xml_is_not_parsed(self, lib, monkeypatch):
+        bundle = self._bundle(lib)
+        (bundle / "META-INF" / "encryption.xml").write_text(_FONT_ONLY_ENCRYPTION)
+        assert BookContent(bundle).is_drm_protected is False
+        monkeypatch.setattr(content_module, "_MAX_ENCRYPTION_XML_BYTES", 10)
+        assert BookContent(bundle).is_drm_protected is True
 
 
 # ---------------------------------------------------------------------------

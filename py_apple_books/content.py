@@ -153,7 +153,9 @@ def _safe_bundle_path(root: pathlib.Path, rel: str) -> pathlib.Path:
     try:
         root = root.resolve()
         path = (root / posixpath.normpath(rel)).resolve()
-    except (OSError, RuntimeError):  # RuntimeError: symlink loop
+    except (OSError, RuntimeError, ValueError):
+        # RuntimeError: symlink loop. ValueError: a NUL byte in the
+        # name (a ToC href containing "%00").
         raise UnsafeEpubEntryError(
             f"EPUB entry {rel!r} can't be resolved inside the book bundle."
         ) from None
@@ -212,8 +214,6 @@ class _ContainedEpubReader(epub.EpubReader):
 # ---------------------------------------------------------------------------
 
 
-_NS_XMLENC = "http://www.w3.org/2001/04/xmlenc#"
-
 # OCF font obfuscation algorithms. DRM-free publisher EPUBs (InDesign
 # exports, for one) list their embedded fonts in encryption.xml under
 # these; the text itself stays plain.
@@ -222,25 +222,47 @@ _FONT_OBFUSCATION_ALGORITHMS = {
     "http://ns.adobe.com/pdf/enc#RC",  # Adobe
 }
 
+# encryption.xml is parsed on every get_book_content call, before the
+# book loads. Real ones are a few KB; a larger one counts as encrypted
+# rather than being parsed.
+_MAX_ENCRYPTION_XML_BYTES = 1024 * 1024
+
+
+def _local_name(tag: str) -> str:
+    """An element tag without its ``{namespace}`` prefix."""
+    return tag.rpartition("}")[2]
+
 
 def _encryption_xml_hides_content(bundle: pathlib.Path) -> bool:
     """True if a bundle's ``META-INF/encryption.xml`` encrypts anything
     beyond font obfuscation.
 
-    Fails closed: an unreadable or malformed file, an ``EncryptedData``
-    without an algorithm, or a file that's still an iCloud placeholder
-    (reading it would trigger a download) all count as encrypted.
+    Fails closed: an unreadable, oversized or malformed file, an
+    ``EncryptedData`` without an algorithm, or a file that's still an
+    iCloud placeholder (reading it would trigger a download) all count
+    as encrypted. Elements are matched by local name, so a file that
+    leaves out the xmlenc namespace is still inspected.
     """
     try:
         enc = _safe_bundle_path(bundle, "META-INF/encryption.xml")
         st = enc.stat()
         if st.st_blocks == 0 and st.st_size > 0:
             return True
+        if st.st_size > _MAX_ENCRYPTION_XML_BYTES:
+            return True
         root = ET.fromstring(enc.read_bytes())
-    except (AppleBooksError, OSError, ET.ParseError):
+    except Exception:
+        # Not just OSError and ParseError: expat raises ValueError or
+        # LookupError for some declared encodings (Shift_JIS, unknown
+        # names). This gate must never raise.
         return True
-    for data in root.iter(f"{{{_NS_XMLENC}}}EncryptedData"):
-        method = data.find(f"{{{_NS_XMLENC}}}EncryptionMethod")
+    for data in root.iter():
+        if _local_name(data.tag) != "EncryptedData":
+            continue
+        method = next(
+            (el for el in data if _local_name(el.tag) == "EncryptionMethod"),
+            None,
+        )
         algorithm = method.get("Algorithm") if method is not None else None
         if algorithm not in _FONT_OBFUSCATION_ALGORITHMS:
             return True
@@ -615,8 +637,10 @@ class BookContent:
             # bundle-relative so Chapter.href resolves against self.path.
             bundle_href = self._to_bundle_relative(bare)
             # Never advertise an entry pointing outside the bundle —
-            # reading it would be refused anyway.
-            if _escapes_bundle(bundle_href):
+            # reading it would be refused anyway. An absolute href is
+            # checked before the OPF-dir prefix turns it into an
+            # in-bundle-looking "OEBPS//abs".
+            if bare.startswith("/") or _escapes_bundle(bundle_href):
                 return
 
             key = (bundle_href, fragment)
@@ -778,7 +802,8 @@ def _opf_dir_from_container(epub_root: pathlib.Path) -> pathlib.PurePosixPath:
     try:
         container = _safe_bundle_path(epub_root, "META-INF/container.xml")
         root = ET.fromstring(container.read_bytes())
-    except (AppleBooksError, OSError, ET.ParseError):
+    except (AppleBooksError, OSError, ET.ParseError, ValueError, LookupError):
+        # ValueError/LookupError: expat rejects some declared encodings.
         return pathlib.PurePosixPath()
     rootfile = root.find(f".//{{{_NS_CONTAINER}}}rootfile")
     full_path = rootfile.get("full-path") if rootfile is not None else None
@@ -806,7 +831,8 @@ def _parse_ncx_bytes(
     """
     try:
         ncx_root = ET.fromstring(ncx_bytes)
-    except ET.ParseError:
+    except (ET.ParseError, ValueError, LookupError):
+        # ValueError/LookupError: expat rejects some declared encodings.
         return []
 
     nav_map = ncx_root.find(f"{{{_NS_NCX}}}navMap")

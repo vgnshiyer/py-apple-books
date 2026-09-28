@@ -320,8 +320,8 @@ class PyAppleBooks:
         the book has no bookmark, the CFI lacks a bracket hint, or the
         hinted spine entry isn't a ToC chapter (only the current-reading
         surface cares about ToC-level resolution; generic content reads
-        go through :meth:`get_annotation_surrounding_text` which handles
-        sub-sections via :meth:`BookContent.get_chapter`).
+        go through :meth:`get_annotation_surrounding_text`, which reads
+        the whole spine file the CFI names, sub-sections included).
 
         :raises BookNotDownloadedError: if the book isn't available
             locally (same preconditions as :meth:`get_book_content`).
