@@ -216,6 +216,44 @@ class TestLegitBundle:
         (bundle / "OEBPS" / "Text" / "ch1.xhtml").symlink_to("real.xhtml")
         assert "Legit text of One." in BookContent(bundle).get_chapter("ch1")
 
+    def test_in_bundle_symlinked_directory_is_followed(self, lib):
+        bundle = _write_bundle(
+            _bundle_path(lib),
+            manifest=[_NAV_ITEM, _CH1_ITEM],
+            files={
+                "OEBPS/nav.xhtml": _nav([("Text/ch1.xhtml", "One")]),
+                "OEBPS/RealText/ch1.xhtml": _CHAPTER.format(title="One"),
+            },
+            spine=["ch1"],
+        )
+        (bundle / "OEBPS" / "Text").symlink_to("RealText")
+        assert "Legit text of One." in BookContent(bundle).get_chapter("ch1")
+
+    def test_directories_are_resolved_once_per_load(self, lib, monkeypatch):
+        images = [(f"img{i}", f"Images/{i}.png", "image/png", "") for i in range(50)]
+        bundle = _write_bundle(
+            _bundle_path(lib),
+            manifest=[_NAV_ITEM, _CH1_ITEM, *images],
+            files={
+                "OEBPS/nav.xhtml": _nav([("Text/ch1.xhtml", "One")]),
+                "OEBPS/Text/ch1.xhtml": _CHAPTER.format(title="One"),
+                **{f"OEBPS/Images/{i}.png": "png" for i in range(50)},
+            },
+            spine=["ch1"],
+        )
+        calls = []
+        real_resolve = pathlib.Path.resolve
+        monkeypatch.setattr(
+            pathlib.Path,
+            "resolve",
+            lambda self, *a, **k: calls.append(self) or real_resolve(self, *a, **k),
+        )
+        reader = _ContainedEpubReader(str(bundle), {"ignore_ncx": False})
+        reader.load()
+        # The bundle root plus one per directory (META-INF, OEBPS,
+        # OEBPS/Text, OEBPS/Images), not one per file.
+        assert len(calls) <= 6
+
     def test_ncx_dot_prefixed_file_name_is_not_mangled(self, lib):
         # Regression for lstrip("./"), which turned ".ch1.xhtml" into
         # "ch1.xhtml".
@@ -290,6 +328,74 @@ class TestManifestEscapes:
         (bundle / "OEBPS" / "appx.txt").symlink_to(lib / "outside" / "canary.txt")
         with pytest.raises(UnsafeEpubEntryError, match="outside the book bundle"):
             BookContent(bundle).list_chapters()
+
+    def test_symlinked_directory_to_outside_fails_to_load(self, lib):
+        bundle = _write_bundle(
+            _bundle_path(lib),
+            manifest=[
+                _NAV_ITEM,
+                _CH1_ITEM,
+                ("appx", "Extra/canary.txt", "text/plain", ""),
+            ],
+            files={
+                "OEBPS/nav.xhtml": _nav([("Text/ch1.xhtml", "One")]),
+                "OEBPS/Text/ch1.xhtml": _CHAPTER.format(title="One"),
+            },
+            spine=["ch1"],
+        )
+        (bundle / "OEBPS" / "Extra").symlink_to(lib / "outside")
+        with pytest.raises(UnsafeEpubEntryError, match="outside the book bundle"):
+            BookContent(bundle).list_chapters()
+
+    @pytest.mark.parametrize("via", ["file", "directory"])
+    def test_symlink_loop_dotdot_escape_is_refused(self, lib, via):
+        # Before Python 3.13, non-strict resolve() stops at a symlink
+        # loop and returns the rest unresolved: "loop/../out" came back
+        # as ".../OEBPS/out" with "out" still a live link to outside.
+        href = "appx.txt" if via == "file" else "Extra/canary.txt"
+        bundle = _write_bundle(
+            _bundle_path(lib),
+            manifest=[_NAV_ITEM, _CH1_ITEM, ("appx", href, "text/plain", "")],
+            files={
+                "OEBPS/nav.xhtml": _nav([("Text/ch1.xhtml", "One"), (href, "Notes")]),
+                "OEBPS/Text/ch1.xhtml": _CHAPTER.format(title="One"),
+            },
+            spine=["ch1"],
+        )
+        oebps = bundle / "OEBPS"
+        (oebps / "loop").symlink_to("loop")
+        if via == "file":
+            (oebps / "out").symlink_to(lib / "outside" / "canary.txt")
+            (oebps / "appx.txt").symlink_to("loop/../out")
+        else:
+            (oebps / "out").symlink_to(lib / "outside")
+            (oebps / "Extra").symlink_to("loop/../out")
+        content = BookContent(bundle)
+        with pytest.raises(UnsafeEpubEntryError) as exc:
+            content.list_chapters()
+        assert CANARY not in str(exc.value)
+        with pytest.raises(UnsafeEpubEntryError):
+            content.get_chapter("appx")
+
+    def test_directory_swapped_mid_load_is_not_trusted(self, lib):
+        bundle = _write_bundle(
+            _bundle_path(lib),
+            manifest=[_NAV_ITEM, _CH1_ITEM],
+            files={
+                "OEBPS/nav.xhtml": _nav([("Text/ch1.xhtml", "One")]),
+                "OEBPS/Text/ch1.xhtml": _CHAPTER.format(title="One"),
+                "OEBPS/Images/1.png": "png",
+            },
+            spine=["ch1"],
+        )
+        (lib / "outside" / "2.png").write_text(CANARY)
+        reader = _ContainedEpubReader(str(bundle), {"ignore_ncx": False})
+        assert reader.read_file("OEBPS/Images/1.png") == b"png"
+        images = bundle / "OEBPS" / "Images"
+        images.rename(images.with_name("Images.real"))
+        images.symlink_to(lib / "outside")
+        with pytest.raises(UnsafeEpubEntryError, match="outside the book bundle"):
+            reader.read_file("OEBPS/Images/2.png")
 
     @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX FIFOs")
     def test_fifo_entry_fails_fast(self, lib):

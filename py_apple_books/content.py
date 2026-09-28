@@ -25,6 +25,7 @@ aren't regular files (FIFOs, device nodes) are refused, since a crafted
 book could otherwise expose unrelated local files or block forever.
 """
 
+import errno
 import pathlib
 import posixpath
 import stat
@@ -34,7 +35,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from ebooklib import epub
 
@@ -134,6 +135,33 @@ def is_downloaded(path: PathLike) -> bool:
 _MAX_ENTRY_BYTES = 256 * 1024 * 1024
 
 
+def _resolve_strictly(path: pathlib.Path, rel: str) -> pathlib.Path:
+    """``path.resolve(strict=True)``, refusing symlink loops and bad names.
+
+    Non-strict resolution isn't safe for containment: before Python
+    3.13 it gives up at a symlink loop and returns the rest of the path
+    unresolved, so ``loop/../link`` comes back looking like an in-bundle
+    path while ``link`` still points outside. A missing entry still
+    raises :class:`FileNotFoundError`, like any other unreadable one.
+
+    :param rel: The entry name, for the error message.
+    :raises UnsafeEpubEntryError: on a symlink loop or a NUL byte.
+    """
+    try:
+        return path.resolve(strict=True)
+    except OSError as e:
+        if e.errno != errno.ELOOP:
+            raise
+    except (RuntimeError, ValueError):
+        # RuntimeError: a symlink loop, as Python < 3.13 reports it.
+        # ValueError: a NUL byte in the name (a ToC href containing
+        # "%00").
+        pass
+    raise UnsafeEpubEntryError(
+        f"EPUB entry {rel!r} can't be resolved inside the book bundle."
+    )
+
+
 def _safe_bundle_path(root: pathlib.Path, rel: str) -> pathlib.Path:
     """Resolve a bundle-relative entry name, refusing anything unsafe.
 
@@ -150,15 +178,23 @@ def _safe_bundle_path(root: pathlib.Path, rel: str) -> pathlib.Path:
     :raises OSError: if the entry can't be stat'ed (e.g.
         :class:`FileNotFoundError` when it doesn't exist).
     """
+    root = _resolve_strictly(root, rel)
+    candidate = root / posixpath.normpath(rel)
     try:
-        root = root.resolve()
-        path = (root / posixpath.normpath(rel)).resolve()
-    except (OSError, RuntimeError, ValueError):
-        # RuntimeError: symlink loop. ValueError: a NUL byte in the
-        # name (a ToC href containing "%00").
-        raise UnsafeEpubEntryError(
-            f"EPUB entry {rel!r} can't be resolved inside the book bundle."
-        ) from None
+        path = _resolve_strictly(candidate, rel)
+    except (FileNotFoundError, NotADirectoryError):
+        # Nothing exists to read. Still report a name that points
+        # outside the bundle as an escape, not a missing file, so a
+        # crafted book can't probe which outside paths exist.
+        try:
+            escapes = not candidate.resolve().is_relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            escapes = False
+        if escapes:
+            raise UnsafeEpubEntryError(
+                f"EPUB entry {rel!r} points outside the book bundle."
+            ) from None
+        raise
     if not path.is_relative_to(root):
         raise UnsafeEpubEntryError(
             f"EPUB entry {rel!r} points outside the book bundle."
@@ -195,11 +231,67 @@ class _ContainedEpubReader(epub.EpubReader):
     up by name and can't leave the archive.
     """
 
+    def __init__(self, epub_file_name, options=None):
+        super().__init__(epub_file_name, options)
+        self._root: Optional[pathlib.Path] = None
+        # Bundle-relative directory -> (resolved path, st_dev, st_ino),
+        # already checked to lie inside the bundle.
+        self._resolved_dirs: Dict[str, Tuple[pathlib.Path, int, int]] = {}
+
+    def _entry_path(self, name: str) -> pathlib.Path:
+        """:func:`_safe_bundle_path`, amortised over one book load.
+
+        ebooklib reads every manifest item (a thousand, for image-heavy
+        books), and resolving each full path from scratch dominated load
+        time. Each directory is resolved and containment-checked once,
+        and pinned by device and inode so a directory swapped mid-load
+        isn't trusted; an entry then costs a ``stat`` of its directory
+        and an ``lstat`` of itself. Anything else — symlinked entries,
+        odd names, directories outside the bundle or changed since —
+        takes the full check, so outcomes match it exactly.
+        """
+        if self._root is None:
+            self._root = _resolve_strictly(pathlib.Path(self.file_name), name)
+        rel = posixpath.normpath(name)
+        parent, base = posixpath.split(rel)
+        if base in ("", ".", ".."):
+            return _safe_bundle_path(self._root, name)
+        try:
+            cached = self._resolved_dirs.get(parent)
+            if cached is None:
+                directory = (self._root / parent).resolve(strict=True)
+                if not directory.is_relative_to(self._root):
+                    return _safe_bundle_path(self._root, name)
+                dir_st = directory.stat()
+                cached = (directory, dir_st.st_dev, dir_st.st_ino)
+                self._resolved_dirs[parent] = cached
+            else:
+                dir_st = cached[0].stat()
+                if (dir_st.st_dev, dir_st.st_ino) != cached[1:]:
+                    del self._resolved_dirs[parent]
+                    return _safe_bundle_path(self._root, name)
+            path = cached[0] / base
+            st = path.lstat()
+        except (OSError, RuntimeError, ValueError):
+            return _safe_bundle_path(self._root, name)
+        if stat.S_ISLNK(st.st_mode):
+            return _safe_bundle_path(self._root, name)
+        if not stat.S_ISREG(st.st_mode):
+            raise UnsafeEpubEntryError(
+                f"EPUB entry {name!r} is not a regular file."
+            )
+        if st.st_size > _MAX_ENTRY_BYTES:
+            raise UnsafeEpubEntryError(
+                f"EPUB entry {name!r} is larger than "
+                f"{_MAX_ENTRY_BYTES // (1024 * 1024)} MiB."
+            )
+        return path
+
     def read_file(self, name):
         if isinstance(self.zf, zipfile.ZipFile):
             return super().read_file(name)
         try:
-            path = _safe_bundle_path(pathlib.Path(self.file_name), name)
+            path = self._entry_path(name)
             return path.read_bytes()
         except OSError as e:
             # Name the entry, not the absolute path — messages reach
