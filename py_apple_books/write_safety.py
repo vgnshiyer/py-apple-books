@@ -5,7 +5,8 @@ Feature-agnostic safety utilities shared by any write path (today:
 
 * :func:`books_is_running` / :func:`ensure_books_not_running` — Books
   caches library rows in memory and uses Core Data optimistic locking,
-  so edits made while the app runs can be overwritten or ignored.
+  so edits made while the app runs can be overwritten or ignored. Fails
+  closed: if it can't tell whether Books is running, writes refuse.
 * :func:`backup_library` — timestamped, WAL-inclusive backup via the
   SQLite backup API. A bare file copy of a live WAL database misses
   un-checkpointed data and can itself be corrupt; the backup API is the
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import sqlite3
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +48,11 @@ BACKUP_KEEP = 10
 #: otherwise rotate away the one backup that predates the whole batch.
 BACKUP_MIN_INTERVAL = 300.0
 
+#: Leftover ``.part`` files are only pruned once older than this many
+#: seconds. A younger one may be another process's backup still in
+#: progress; deleting it would make that process's write abort.
+BACKUP_PART_STALE_AFTER = 600.0
+
 
 def books_is_running() -> bool:
     """True if the Apple Books app itself is currently running.
@@ -55,13 +62,42 @@ def books_is_running() -> bool:
     would mean never writing at all — transient lock contention with
     the daemons is handled by the write transaction's busy timeout
     instead.
+
+    Fails closed, raising :class:`WriteError` when it can't tell: off
+    macOS (a Docker/Linux process can't see the host's Books.app, so a
+    process check there would silently pass) or when ``pgrep`` is
+    missing, hangs, or errors. Deliberately not
+    :class:`BooksAppRunningError` — "quit Books" would be wrong advice.
     """
-    result = subprocess.run(["pgrep", "-x", "Books"], capture_output=True)
+    if sys.platform != "darwin":
+        raise WriteError(
+            "Collection writes are only supported when running directly "
+            "on macOS (not in Docker/Linux), because Apple Books can't be "
+            "verified closed."
+        )
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", "Books"], capture_output=True, timeout=5
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise WriteError(
+            f"Could not verify Apple Books is closed; refusing to write. ({e})"
+        )
+    # pgrep: 0 = matched, 1 = no match, 2+ = usage/internal error.
+    if result.returncode not in (0, 1):
+        raise WriteError(
+            "Could not verify Apple Books is closed; refusing to write. "
+            f"(pgrep exited with status {result.returncode})"
+        )
     return result.returncode == 0
 
 
 def ensure_books_not_running() -> None:
-    """Raise :class:`BooksAppRunningError` if Books is open."""
+    """Raise :class:`BooksAppRunningError` if Books is open.
+
+    Propagates :class:`WriteError` from :func:`books_is_running` when
+    that can't be determined.
+    """
     if books_is_running():
         raise BooksAppRunningError(
             "Apple Books is running. Quit the Books app (Cmd-Q) before "
@@ -121,9 +157,16 @@ def backup_library(
         src.close()
 
     # Prune: completed backups beyond the retention count, plus any
-    # stray .part files a crashed run may have left behind.
+    # stray .part files a crashed run may have left behind. Only stale
+    # ones — a fresh .part may be another process's backup in flight —
+    # and files can vanish underneath us as that process finishes.
+    now = time.time()
     for stray in backup_dir.glob(f"{db_path.stem}-*.sqlite.part"):
-        stray.unlink(missing_ok=True)
+        try:
+            if now - stray.stat().st_mtime > BACKUP_PART_STALE_AFTER:
+                stray.unlink()
+        except FileNotFoundError:
+            pass
     backups = sorted(backup_dir.glob(f"{db_path.stem}-*.sqlite"))
     for old in backups[:-keep]:
         old.unlink(missing_ok=True)
