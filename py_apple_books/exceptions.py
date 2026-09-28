@@ -14,8 +14,9 @@ class BookNotDownloadedError(AppleBooksError):
 
 class DRMProtectedError(AppleBooksError):
     """Raised when a book is DRM-protected and its content cannot be read.
-    Typically an Apple Books Store purchase; occasionally an imported EPUB
-    with ``META-INF/encryption.xml``.
+    Typically an Apple Books Store purchase (FairPlay); occasionally an
+    imported EPUB with Adobe DRM or a ``META-INF/encryption.xml`` that
+    encrypts more than its fonts.
     """
 
 

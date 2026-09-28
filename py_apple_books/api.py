@@ -234,14 +234,18 @@ class PyAppleBooks:
 
         1. The book's file is recorded in the library (``ZPATH`` is set).
         2. The file is locally downloaded, not an iCloud placeholder.
-        3. The file is not DRM-protected (no ``META-INF/encryption.xml``).
+        3. The file is not DRM-protected: no FairPlay ``sinf.xml``, no
+           Adobe ``rights.xml``, and no ``META-INF/encryption.xml`` that
+           encrypts more than fonts (see
+           :attr:`BookContent.is_drm_protected`).
 
         :raises BookNotDownloadedError: if the book has no local file
             (``path`` is None) or exists only as an iCloud placeholder. The
             fix in both cases is to open the book in Apple Books to trigger
             a download.
-        :raises DRMProtectedError: if the book is FairPlay-protected — a
-            non-sample Apple Books Store purchase. Its chapters are
+        :raises DRMProtectedError: if the book is DRM-protected — usually
+            a FairPlay-protected, non-sample Apple Books Store purchase;
+            occasionally an encrypted imported EPUB. Its chapters are
             readable only through the Apple Books reader.
         """
         book = self.get_book_by_id(book_id)
@@ -263,10 +267,18 @@ class PyAppleBooks:
             )
 
         if content.is_drm_protected:
+            # Only sinf.xml proves a FairPlay Store purchase; anything
+            # else is an imported EPUB carrying its own DRM.
+            if content._drm_evidence() == "sinf.xml":
+                raise DRMProtectedError(
+                    f"'{book.title}' is a DRM-protected Apple Books Store "
+                    f"purchase (FairPlay). Its text content cannot be read "
+                    f"directly; only imported EPUBs and PDFs are readable."
+                )
             raise DRMProtectedError(
-                f"'{book.title}' is a DRM-protected Apple Books Store "
-                f"purchase (FairPlay). Its text content cannot be read "
-                f"directly; only imported EPUBs and PDFs are readable."
+                f"'{book.title}' is an encrypted EPUB (DRM). Its text "
+                f"content cannot be read directly; only DRM-free EPUBs "
+                f"are readable."
             )
 
         return content

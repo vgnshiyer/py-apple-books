@@ -8,7 +8,9 @@ blocks are allocated until something reads the file.
 
 The placeholder check and DRM gates deliberately use only metadata
 operations (``stat``, ``du``, filesystem existence) so a "can I read this
-book?" check never causes an unexpected download.
+book?" check never causes an unexpected download. The one exception is
+``META-INF/encryption.xml``, which the DRM gate has to parse — and only
+when that file is already on local disk.
 
 For the actual EPUB parsing and HTML-to-text extraction, this module uses
 :mod:`ebooklib` and :mod:`bs4` — well-tested third-party libraries that
@@ -206,6 +208,46 @@ class _ContainedEpubReader(epub.EpubReader):
 
 
 # ---------------------------------------------------------------------------
+# DRM detection
+# ---------------------------------------------------------------------------
+
+
+_NS_XMLENC = "http://www.w3.org/2001/04/xmlenc#"
+
+# OCF font obfuscation algorithms. DRM-free publisher EPUBs (InDesign
+# exports, for one) list their embedded fonts in encryption.xml under
+# these; the text itself stays plain.
+_FONT_OBFUSCATION_ALGORITHMS = {
+    "http://www.idpf.org/2008/embedding",  # IDPF
+    "http://ns.adobe.com/pdf/enc#RC",  # Adobe
+}
+
+
+def _encryption_xml_hides_content(bundle: pathlib.Path) -> bool:
+    """True if a bundle's ``META-INF/encryption.xml`` encrypts anything
+    beyond font obfuscation.
+
+    Fails closed: an unreadable or malformed file, an ``EncryptedData``
+    without an algorithm, or a file that's still an iCloud placeholder
+    (reading it would trigger a download) all count as encrypted.
+    """
+    try:
+        enc = _safe_bundle_path(bundle, "META-INF/encryption.xml")
+        st = enc.stat()
+        if st.st_blocks == 0 and st.st_size > 0:
+            return True
+        root = ET.fromstring(enc.read_bytes())
+    except (AppleBooksError, OSError, ET.ParseError):
+        return True
+    for data in root.iter(f"{{{_NS_XMLENC}}}EncryptedData"):
+        method = data.find(f"{{{_NS_XMLENC}}}EncryptionMethod")
+        algorithm = method.get("Algorithm") if method is not None else None
+        if algorithm not in _FONT_OBFUSCATION_ALGORITHMS:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Dataclasses (public API)
 # ---------------------------------------------------------------------------
 
@@ -289,14 +331,34 @@ class BookContent:
     def is_drm_protected(self) -> bool:
         """True if the book is DRM-protected and its content cannot be read.
 
-        For EPUB bundles, DRM is indicated by ``META-INF/encryption.xml``
-        (Apple Books Store purchases also add ``sinf.xml`` with FairPlay
-        license data and ``signatures.xml``). Imported EPUBs never have
-        these files. Only EPUBs are checked today.
+        For EPUB bundles, DRM is indicated by any of:
+
+        * ``META-INF/sinf.xml`` — FairPlay license data (Apple Books
+          Store purchases);
+        * ``META-INF/rights.xml`` — Adobe ADEPT;
+        * ``META-INF/encryption.xml`` encrypting anything other than
+          fonts. Font obfuscation alone (common in DRM-free publisher
+          EPUBs) leaves the text readable and doesn't count; a
+          malformed file does.
+
+        Only EPUBs are checked today.
         """
         if not self.is_epub:
             return False
-        return (self.path / "META-INF" / "encryption.xml").exists()
+        return self._drm_evidence() is not None
+
+    def _drm_evidence(self) -> Optional[str]:
+        """Name of the ``META-INF`` file that marks this bundle as
+        DRM-protected (``"sinf.xml"``, ``"rights.xml"`` or
+        ``"encryption.xml"``), or None. See :attr:`is_drm_protected`."""
+        meta_inf = self.path / "META-INF"
+        for name in ("sinf.xml", "rights.xml"):
+            if (meta_inf / name).exists():
+                return name
+        encryption = meta_inf / "encryption.xml"
+        if encryption.exists() and _encryption_xml_hides_content(self.path):
+            return "encryption.xml"
+        return None
 
     # -- chapter listing ----------------------------------------------------
 
