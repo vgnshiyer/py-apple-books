@@ -30,7 +30,9 @@ class Book(Model):
     description: str
     genre: str
     content_type: str
-    page_count: int
+    # None when unknown: Apple leaves ZPAGECOUNT at a placeholder 0 or 1
+    # for most imported books; only counts above 1 are real.
+    page_count: Optional[int]
 
     # File information
     path: pathlib.Path
@@ -82,6 +84,7 @@ class Book(Model):
         self.reading_progress = float(self.reading_progress) * 100 if self.reading_progress else None
         if self.author and _UNKNOWN_AUTHOR_PLACEHOLDER.fullmatch(self.author):
             self.author = None
+        self.page_count = self.page_count if self.page_count and self.page_count > 1 else None
 
     def __str__(self):
         return f"ID: {self.id}\nTitle: {self.title}\nAuthor: {self.author or 'Unknown Author'}\nDescription: {self.description}"

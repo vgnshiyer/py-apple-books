@@ -127,3 +127,20 @@ class TestUnknownAuthor:
 
     def test_str_renders_real_author(self, no_relations):
         assert "\nAuthor: Jane Austen\n" in str(Book.from_db(_book_row(author="Jane Austen")))
+
+
+# ---------------------------------------------------------------------------
+# Book.page_count: ZPAGECOUNT placeholders
+# ---------------------------------------------------------------------------
+
+
+class TestPageCount:
+    @pytest.mark.parametrize("raw", [None, 0, 1])
+    def test_placeholder_counts_become_none(self, no_relations, raw):
+        """Regression: Apple leaves ZPAGECOUNT at 0 or 1 for most
+        imported books, so callers printed "Pages: 1"."""
+        assert Book.from_db(_book_row(page_count=raw)).page_count is None
+
+    @pytest.mark.parametrize("raw", [2, 336])
+    def test_real_counts_kept(self, no_relations, raw):
+        assert Book.from_db(_book_row(page_count=raw)).page_count == raw
