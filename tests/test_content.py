@@ -1,6 +1,6 @@
 """Tests for py_apple_books.content.
 
-Split into three layers:
+Split into four layers:
 
 * **Pure-function tests** for helpers that don't touch the filesystem or
   ebooklib (NCX parsing, text extraction, whitespace normalization).
@@ -9,23 +9,32 @@ Split into three layers:
   iCloud-synced files.
 * **BookContent tests** using the generated EPUB fixtures from
   ``conftest.py``.
+* **Facade tests** for the content-backed :class:`PyAppleBooks` methods
+  (DRM error wording, annotation context), with the database lookups
+  stubbed out.
+
+Bundle-containment (security) tests live in ``test_content_security.py``.
 """
 
 from __future__ import annotations
 
 import os
 import pathlib
+import re
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+from py_apple_books import PyAppleBooks
 from py_apple_books.content import (
     BookContent,
     Chapter,
     _parse_ncx_bytes,
     is_downloaded,
 )
-from py_apple_books.exceptions import AppleBooksError
+from py_apple_books.exceptions import AppleBooksError, DRMProtectedError
+from py_apple_books.models.location import Location
 from py_apple_books.utils import extract_chapter_text, normalize_whitespace
 
 
@@ -81,6 +90,12 @@ class TestParseNcxBytes:
 
     def test_malformed_xml_returns_empty(self):
         assert _parse_ncx_bytes(b"<not valid", pathlib.PurePosixPath("")) == []
+
+    @pytest.mark.parametrize("encoding", ["Shift_JIS", "bogus"])
+    def test_undecodable_declared_encoding_returns_empty(self, encoding):
+        # expat raises ValueError / LookupError here, not ParseError.
+        xml = _ncx("").replace(b"UTF-8", encoding.encode())
+        assert _parse_ncx_bytes(xml, pathlib.PurePosixPath("OEBPS")) == []
 
     def test_missing_navmap_returns_empty(self):
         xml = (
@@ -284,6 +299,52 @@ class TestExtractChapterText:
         )
         assert extract_chapter_text(html, None, set()) == ""
 
+    def test_fragment_scoping_drops_comments(self):
+        # Regression: the fragment path kept HTML comments (bs4 Comment
+        # subclasses NavigableString) while the whole-file path dropped
+        # them — leaking commented-out markup into 29 real chapters.
+        html = (
+            b"<html><body>"
+            b'<a id="A"/><p>Text <!-- editor note --> in A</p>'
+            b"<?pi instruction?>"
+            b'<a id="B"/><p>Text in B</p>'
+            b"</body></html>"
+        )
+        out = extract_chapter_text(html, "A", {"B"})
+        assert out == "Text in A"
+        assert "editor note" not in out
+        assert "instruction" not in out
+
+    def test_fragment_scoping_drops_ruby_annotations(self):
+        # Furigana in <rt>/<rp> are dropped by get_text() on the
+        # whole-file path; the fragment path must agree.
+        body = (
+            "<p><ruby>漢<rp>(</rp><rt>かん</rt><rp>)</rp></ruby>"
+            "<ruby>字<rp>(</rp><rt>じ</rt><rp>)</rp></ruby>を読む。</p>"
+        )
+        whole = extract_chapter_text(
+            f"<html><body>{body}</body></html>".encode(), None, set()
+        )
+        fragment = extract_chapter_text(
+            f'<html><body><a id="s"/>{body}</body></html>'.encode(), "s", set()
+        )
+        assert whole == fragment == "漢字を読む。"
+
+    def test_fragment_and_whole_file_paths_agree(self):
+        body = (
+            "<p>One <![CDATA[cdata]]> two</p><!-- hidden -->"
+            "<template><p>tpl</p></template><p>three</p>"
+        )
+        whole = extract_chapter_text(
+            f"<html><body>{body}</body></html>".encode(), None, set()
+        )
+        fragment = extract_chapter_text(
+            f'<html><body><a id="s"/>{body}</body></html>'.encode(), "s", set()
+        )
+        assert fragment == whole
+        assert "cdata" in whole
+        assert "hidden" not in whole and "tpl" not in whole
+
 
 # ---------------------------------------------------------------------------
 # is_downloaded
@@ -396,16 +457,184 @@ class TestBookContentProperties:
     def test_is_drm_protected_false_when_no_encryption_xml(self, simple_epub):
         assert BookContent(simple_epub.path).is_drm_protected is False
 
-    def test_is_drm_protected_true_when_encryption_xml_present(self, simple_epub):
-        meta_inf = simple_epub.path / "META-INF"
-        meta_inf.mkdir(exist_ok=True)
-        (meta_inf / "encryption.xml").write_text("<encryption/>")
+    def test_is_drm_protected_true_when_encryption_xml_encrypts_content(
+        self, simple_epub
+    ):
+        _write_encryption_xml(
+            simple_epub.path,
+            [("http://www.w3.org/2001/04/xmlenc#aes128-cbc", "EPUB/chap1.xhtml")],
+        )
         assert BookContent(simple_epub.path).is_drm_protected is True
+
+    def test_is_drm_protected_false_for_empty_encryption_xml(self, simple_epub):
+        # Well-formed but lists no encrypted resources: nothing is
+        # hidden, so the book stays readable. (Before 1.9.1 the mere
+        # presence of the file counted as DRM.)
+        meta_inf = simple_epub.path / "META-INF"
+        (meta_inf / "encryption.xml").write_text(
+            '<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"/>'
+        )
+        assert BookContent(simple_epub.path).is_drm_protected is False
+
+    @pytest.mark.parametrize(
+        "algorithm",
+        ["http://www.idpf.org/2008/embedding", "http://ns.adobe.com/pdf/enc#RC"],
+        ids=["idpf", "adobe"],
+    )
+    def test_is_drm_protected_false_for_font_obfuscation_only(
+        self, simple_epub, algorithm
+    ):
+        _write_encryption_xml(
+            simple_epub.path,
+            [(algorithm, "EPUB/fonts/a.otf"), (algorithm, "EPUB/fonts/b.TTF")],
+        )
+        content = BookContent(simple_epub.path)
+        assert content.is_drm_protected is False
+        # ...and the text really is readable.
+        assert "Body paragraph for Chapter 1" in content.get_chapter("1")
+
+    def test_is_drm_protected_true_when_any_entry_is_not_obfuscation(
+        self, simple_epub
+    ):
+        _write_encryption_xml(
+            simple_epub.path,
+            [
+                ("http://www.idpf.org/2008/embedding", "EPUB/fonts/a.otf"),
+                ("http://www.w3.org/2001/04/xmlenc#aes256-cbc", "EPUB/chap2.xhtml"),
+            ],
+        )
+        assert BookContent(simple_epub.path).is_drm_protected is True
+
+    def test_is_drm_protected_true_when_algorithm_missing(self, simple_epub):
+        _write_encryption_xml(simple_epub.path, [(None, "EPUB/chap1.xhtml")])
+        assert BookContent(simple_epub.path).is_drm_protected is True
+
+    def test_is_drm_protected_true_for_malformed_encryption_xml(self, simple_epub):
+        (simple_epub.path / "META-INF" / "encryption.xml").write_text(
+            "<encryption><EncryptedData"
+        )
+        assert BookContent(simple_epub.path).is_drm_protected is True
+
+    @pytest.mark.parametrize("encoding", ["Shift_JIS", "bogus"])
+    def test_is_drm_protected_true_for_undecodable_encryption_xml(
+        self, simple_epub, encoding
+    ):
+        # Font obfuscation only, but in an encoding expat refuses with
+        # ValueError / LookupError: fail closed rather than raise.
+        _write_encryption_xml(
+            simple_epub.path,
+            [("http://www.idpf.org/2008/embedding", "EPUB/f.otf")],
+            encoding=encoding,
+        )
+        assert BookContent(simple_epub.path).is_drm_protected is True
+
+    @pytest.mark.parametrize(
+        "root",
+        [
+            "<encryption>",
+            '<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container">',
+        ],
+        ids=["no-namespace", "container-namespace"],
+    )
+    def test_is_drm_protected_true_without_xmlenc_namespace(
+        self, simple_epub, root
+    ):
+        (simple_epub.path / "META-INF" / "encryption.xml").write_text(
+            root
+            + "<EncryptedData><EncryptionMethod "
+            'Algorithm="http://www.w3.org/2001/04/xmlenc#aes128-cbc"/>'
+            '<CipherData><CipherReference URI="EPUB/chap1.xhtml"/></CipherData>'
+            "</EncryptedData></encryption>"
+        )
+        assert BookContent(simple_epub.path).is_drm_protected is True
+
+    @pytest.mark.parametrize("name", ["sinf.xml", "rights.xml"])
+    def test_is_drm_protected_true_for_license_files(self, simple_epub, name):
+        (simple_epub.path / "META-INF" / name).write_text("<x/>")
+        content = BookContent(simple_epub.path)
+        assert content.is_drm_protected is True
+        assert content._drm_evidence() == name
 
     def test_is_drm_protected_false_for_pdf(self, tmp_path):
         f = tmp_path / "book.pdf"
         f.write_bytes(b"%PDF-1.4\n")
         assert BookContent(f).is_drm_protected is False
+
+
+def _write_encryption_xml(
+    bundle: pathlib.Path, entries, encoding: str = "utf-8"
+) -> None:
+    """Write ``META-INF/encryption.xml`` with one ``EncryptedData`` per
+    ``(algorithm, uri)`` entry; ``algorithm=None`` omits the
+    ``EncryptionMethod``. ``encoding`` only goes into the XML
+    declaration (the content is ASCII)."""
+    blocks = []
+    for algorithm, uri in entries:
+        method = (
+            f'<enc:EncryptionMethod Algorithm="{algorithm}"/>' if algorithm else ""
+        )
+        blocks.append(
+            f"<enc:EncryptedData>{method}<enc:CipherData>"
+            f'<enc:CipherReference URI="{uri}"/></enc:CipherData>'
+            f"</enc:EncryptedData>"
+        )
+    (bundle / "META-INF" / "encryption.xml").write_text(
+        f'<?xml version="1.0" encoding="{encoding}"?>\n'
+        '<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container" '
+        'xmlns:enc="http://www.w3.org/2001/04/xmlenc#">'
+        + "".join(blocks)
+        + "</encryption>"
+    )
+
+
+class TestGetBookContentDrmMessage:
+    """``PyAppleBooks.get_book_content`` words its DRM error from the
+    evidence: FairPlay only when ``sinf.xml`` proves a Store purchase."""
+
+    def _api_for(self, bundle):
+        api = PyAppleBooks()
+        api.get_book_by_id = lambda book_id: SimpleNamespace(
+            title="Some Book", path=str(bundle)
+        )
+        return api
+
+    def test_fairplay_message_needs_sinf(self, simple_epub):
+        (simple_epub.path / "META-INF" / "sinf.xml").write_text("<x/>")
+        with patch.object(BookContent, "is_downloaded", new=True):
+            with pytest.raises(DRMProtectedError, match=r"\(FairPlay\)"):
+                self._api_for(simple_epub.path).get_book_content(1)
+
+    def test_other_drm_is_an_encrypted_epub(self, simple_epub):
+        _write_encryption_xml(
+            simple_epub.path,
+            [("http://www.w3.org/2001/04/xmlenc#aes128-cbc", "EPUB/chap1.xhtml")],
+        )
+        with patch.object(BookContent, "is_downloaded", new=True):
+            with pytest.raises(DRMProtectedError) as exc:
+                self._api_for(simple_epub.path).get_book_content(1)
+        assert "encrypted EPUB (DRM)" in str(exc.value)
+        assert "FairPlay" not in str(exc.value)
+
+    @pytest.mark.parametrize("encoding", ["Shift_JIS", "bogus"])
+    def test_undecodable_encryption_xml_is_refused_not_raised(
+        self, simple_epub, encoding
+    ):
+        _write_encryption_xml(
+            simple_epub.path,
+            [("http://www.idpf.org/2008/embedding", "EPUB/f.otf")],
+            encoding=encoding,
+        )
+        with patch.object(BookContent, "is_downloaded", new=True):
+            with pytest.raises(DRMProtectedError, match="encrypted EPUB"):
+                self._api_for(simple_epub.path).get_book_content(1)
+
+    def test_font_obfuscated_book_is_returned(self, simple_epub):
+        _write_encryption_xml(
+            simple_epub.path, [("http://www.idpf.org/2008/embedding", "EPUB/f.otf")]
+        )
+        with patch.object(BookContent, "is_downloaded", new=True):
+            content = self._api_for(simple_epub.path).get_book_content(1)
+        assert content.list_chapters()
 
 
 class TestListChapters:
@@ -484,6 +713,92 @@ class TestGetChapter:
         for sid in spine_ids:
             text = content.get_chapter(sid)
             assert isinstance(text, str)
+
+
+# ---------------------------------------------------------------------------
+# PyAppleBooks.get_annotation_surrounding_text
+# ---------------------------------------------------------------------------
+
+
+_ANCHORED_CHAPTER = (
+    "<html><body>"
+    "<p>Opening paragraph of the file.</p>"
+    "<p>The reader highlighted this sentence\n    which wraps across lines.</p>"
+    "<p>Closing words of the chapter.</p>"
+    '<h2 id="next">Next Chapter Heading</h2>'
+    "</body></html>"
+)
+
+
+@pytest.fixture
+def anchored_epub(epub_factory):
+    """Calibre-split layout: chapter 1's only ToC entry points at an
+    anchor at the *end* of its file, so fragment-scoped
+    :meth:`BookContent.get_chapter` text starts after everything the
+    reader highlighted."""
+    built = epub_factory()
+    root = built.path / "EPUB"
+    (root / "chap1.xhtml").write_text(_ANCHORED_CHAPTER)
+    nav = root / "nav.xhtml"
+    nav.write_text(
+        nav.read_text().replace('href="chap1.xhtml"', 'href="chap1.xhtml#next"')
+    )
+    return built
+
+
+class TestAnnotationSurroundingText:
+    def _api(self, bundle, selected_text, representative_text=None):
+        content = BookContent(bundle)
+        item_id = content._load_book().get_item_with_href("chap1.xhtml").get_id()
+        annotation = SimpleNamespace(
+            location=Location(f"epubcfi(/6/4[{item_id}]!/4/4/1,:4,:30)"),
+            selected_text=selected_text,
+            representative_text=representative_text,
+            book=SimpleNamespace(id=1),
+        )
+        api = PyAppleBooks()
+        api.get_annotation_by_id = lambda annotation_id: annotation
+        api.get_book_content = lambda book_id: BookContent(bundle)
+        return api, content, item_id
+
+    def test_finds_highlight_before_fragment_anchor(self, anchored_epub):
+        # Stored selected_text keeps the EPUB's line breaks; extraction
+        # collapses them, so an exact find() would miss.
+        selected = "highlighted this sentence\n    which wraps across lines."
+        api, content, item_id = self._api(anchored_epub.path, selected)
+        assert content.get_chapter(item_id) == "Next Chapter Heading"
+
+        window = api.get_annotation_surrounding_text(1)
+        assert "highlighted this sentence which wraps across lines." in window
+        assert "Opening paragraph" in window
+        # MCP 0.8.1 wraps the highlight with the same token regex.
+        pattern = r"\s+".join(re.escape(t) for t in selected.split())
+        assert re.search(pattern, window)
+
+    def test_window_is_snapped_around_the_highlight(self, anchored_epub):
+        api, _, _ = self._api(anchored_epub.path, "Closing words")
+        window = api.get_annotation_surrounding_text(1, chars_before=10, chars_after=10)
+        assert window.startswith("…") and window.endswith("…")
+        assert "Closing words" in window
+        assert "Opening paragraph" not in window
+
+    def test_miss_returns_empty_not_chapter_opening(self, anchored_epub):
+        api, _, _ = self._api(anchored_epub.path, "words that are not in the book")
+        assert api.get_annotation_surrounding_text(1) == ""
+
+    def test_annotation_without_text_returns_empty(self, anchored_epub):
+        api, _, _ = self._api(anchored_epub.path, "", representative_text="  ")
+        assert api.get_annotation_surrounding_text(1) == ""
+
+    def test_falls_back_to_representative_text(self, anchored_epub):
+        api, _, _ = self._api(
+            anchored_epub.path, None, representative_text="Opening paragraph"
+        )
+        assert "Opening paragraph" in api.get_annotation_surrounding_text(1)
+
+    def test_regex_metacharacters_are_literal(self, anchored_epub):
+        api, _, _ = self._api(anchored_epub.path, "lines.) (Closing")
+        assert api.get_annotation_surrounding_text(1) == ""
 
 
 # ---------------------------------------------------------------------------

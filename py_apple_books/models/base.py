@@ -1,8 +1,24 @@
 from typing import Any
+import functools
 import pathlib
 import configparser
 from py_apple_books.models.manager import ModelManager
 from py_apple_books.models.relations import OneToMany, OneToOne, ManyToMany
+
+
+@functools.cache
+def _load_mappings() -> dict[str, dict[str, str]]:
+    """Parse mappings.ini once per process.
+
+    ``Model._get_mappings`` runs several times per row materialized, so
+    re-reading the file on every call dominated query time on large
+    libraries. Callers get copies via ``_get_mappings``; never mutate the
+    cached dicts directly.
+    """
+    mappings_path = pathlib.Path(__file__).parent / "mappings.ini"
+    config = configparser.ConfigParser()
+    config.read(mappings_path)
+    return {section: dict(config.items(section)) for section in config.sections()}
 
 
 class ModelBase(type):
@@ -74,12 +90,10 @@ class Model(metaclass=ModelBase):
 
     @classmethod
     def _get_mappings(cls, section: str, keys: list[str] | None = None) -> dict:
-        mappings_path = pathlib.Path(__file__).parent / "mappings.ini"
-        config = configparser.ConfigParser()
-        config.read(mappings_path)
+        mappings = _load_mappings()[section]
         if keys is None:
-            return dict(config.items(section))
-        return {key: config.get(section, key) for key in keys}
+            return dict(mappings)
+        return {key: mappings[key] for key in keys}
 
     @classmethod
     def from_db(cls, db_data: list[Any]) -> 'Model':

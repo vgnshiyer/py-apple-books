@@ -15,7 +15,7 @@ import re
 from datetime import datetime
 from typing import Optional, Set
 
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, CData, NavigableString, Tag
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +56,12 @@ def apple_timestamp_to_datetime(raw):
 
 # Contents of these elements is dropped entirely before extraction.
 _SKIP_TAGS = {"script", "style", "head"}
+
+# String node types that count as text — exactly the types bs4's own
+# ``get_text()`` keeps. Its other NavigableString subclasses (comments,
+# doctypes, processing instructions, ``<rt>``/``<rp>`` ruby annotations,
+# ``<template>`` contents) are left out on both extraction paths.
+_TEXT_STRING_TYPES = (NavigableString, CData)
 
 # Tags that should introduce a newline before/after their contents so
 # paragraph breaks survive ``get_text()``.
@@ -122,7 +128,7 @@ def _text_in_window(
                 continue
             if collecting and node.get("id") in stop_anchors:
                 break
-        elif collecting and isinstance(node, NavigableString):
+        elif collecting and type(node) in _TEXT_STRING_TYPES:
             parts.append(str(node))
     return normalize_whitespace("".join(parts))
 

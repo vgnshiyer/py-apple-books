@@ -1,4 +1,5 @@
 import pathlib
+import re
 from datetime import datetime
 from typing import Optional
 from py_apple_books import collection_writer
@@ -234,14 +235,18 @@ class PyAppleBooks:
 
         1. The book's file is recorded in the library (``ZPATH`` is set).
         2. The file is locally downloaded, not an iCloud placeholder.
-        3. The file is not DRM-protected (no ``META-INF/encryption.xml``).
+        3. The file is not DRM-protected: no FairPlay ``sinf.xml``, no
+           Adobe ``rights.xml``, and no ``META-INF/encryption.xml`` that
+           encrypts more than fonts (see
+           :attr:`BookContent.is_drm_protected`).
 
         :raises BookNotDownloadedError: if the book has no local file
             (``path`` is None) or exists only as an iCloud placeholder. The
             fix in both cases is to open the book in Apple Books to trigger
             a download.
-        :raises DRMProtectedError: if the book is FairPlay-protected — a
-            non-sample Apple Books Store purchase. Its chapters are
+        :raises DRMProtectedError: if the book is DRM-protected — usually
+            a FairPlay-protected, non-sample Apple Books Store purchase;
+            occasionally an encrypted imported EPUB. Its chapters are
             readable only through the Apple Books reader.
         """
         book = self.get_book_by_id(book_id)
@@ -263,10 +268,18 @@ class PyAppleBooks:
             )
 
         if content.is_drm_protected:
+            # Only sinf.xml proves a FairPlay Store purchase; anything
+            # else is an imported EPUB carrying its own DRM.
+            if content._drm_evidence() == "sinf.xml":
+                raise DRMProtectedError(
+                    f"'{book.title}' is a DRM-protected Apple Books Store "
+                    f"purchase (FairPlay). Its text content cannot be read "
+                    f"directly; only imported EPUBs and PDFs are readable."
+                )
             raise DRMProtectedError(
-                f"'{book.title}' is a DRM-protected Apple Books Store "
-                f"purchase (FairPlay). Its text content cannot be read "
-                f"directly; only imported EPUBs and PDFs are readable."
+                f"'{book.title}' is an encrypted EPUB (DRM). Its text "
+                f"content cannot be read directly; only DRM-free EPUBs "
+                f"are readable."
             )
 
         return content
@@ -307,8 +320,8 @@ class PyAppleBooks:
         the book has no bookmark, the CFI lacks a bracket hint, or the
         hinted spine entry isn't a ToC chapter (only the current-reading
         surface cares about ToC-level resolution; generic content reads
-        go through :meth:`get_annotation_surrounding_text` which handles
-        sub-sections via :meth:`BookContent.get_chapter`).
+        go through :meth:`get_annotation_surrounding_text`, which reads
+        the whole spine file the CFI names, sub-sections included).
 
         :raises BookNotDownloadedError: if the book isn't available
             locally (same preconditions as :meth:`get_book_content`).
@@ -332,13 +345,15 @@ class PyAppleBooks:
     ) -> str:
         """Return a text window around an annotation's highlight.
 
-        Pulls the annotation's CFI from its :class:`Location`, fetches
-        the chapter (or sub-section) text via
-        :meth:`BookContent.get_chapter`, finds the annotation's
-        selected text inside the chapter, and returns a snippet of
-        ``chars_before`` characters before and ``chars_after`` after,
-        snapped to whitespace so the window never starts or ends
-        mid-word.
+        Pulls the annotation's CFI from its :class:`Location`, extracts
+        the text of the whole spine file the CFI names (not the
+        fragment-scoped :meth:`BookContent.get_chapter` text, which can
+        start after the highlight), finds the annotation's selected text
+        in it — tolerating whitespace differences such as the line
+        breaks Apple Books keeps in ``selected_text`` — and returns a
+        snippet of ``chars_before`` characters before and
+        ``chars_after`` after, snapped to whitespace so the window never
+        starts or ends mid-word.
 
         Degrades gracefully (returns ``""``) in any of these cases:
 
@@ -348,7 +363,9 @@ class PyAppleBooks:
           never-downloaded);
         * the book is DRM-protected;
         * the spine entry isn't readable for any reason;
-        * the anchor text can't be located in the chapter.
+        * the annotation has no text, or its text can't be located in
+          the chapter. (The chapter opening is never returned in its
+          place.)
 
         :param annotation_id: Annotation id from any of the annotation
             facade methods (``list_annotations``, ``recent_annotations``,
@@ -370,28 +387,31 @@ class PyAppleBooks:
         if book is None:
             return ""
 
-        try:
-            content = self.get_book_content(book.id)
-            chapter_text = content.get_chapter(annotation.location.chapter_id)
-        except AppleBooksError:
-            return ""
-
         anchor = (
             (annotation.selected_text or "").strip()
             or (annotation.representative_text or "").strip()
-            or None
         )
-
-        if not chapter_text:
+        if not anchor:
             return ""
 
-        if anchor:
-            idx = chapter_text.find(anchor)
-            if idx >= 0:
-                return snap_window(
-                    chapter_text, idx, len(anchor), chars_before, chars_after
-                )
+        try:
+            content = self.get_book_content(book.id)
+            chapter_text = content._spine_item_text(
+                annotation.location.chapter_id
+            )
+        except AppleBooksError:
+            return ""
 
-        # Fallback: opening of the chapter if anchor isn't findable.
-        end = min(len(chapter_text), chars_before + chars_after)
-        return snap_window(chapter_text, 0, 0, 0, end)
+        # Extraction collapses whitespace, so match the anchor's words
+        # separated by any whitespace run rather than verbatim.
+        pattern = r"\s+".join(re.escape(word) for word in anchor.split())
+        match = re.search(pattern, chapter_text)
+        if match is None:
+            return ""
+        return snap_window(
+            chapter_text,
+            match.start(),
+            match.end() - match.start(),
+            chars_before,
+            chars_after,
+        )

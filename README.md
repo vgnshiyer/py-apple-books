@@ -13,6 +13,8 @@ PyAppleBooks is a Python API library to access your Apple Books data.
 pip install py_apple_books
 ```
 
+Requires Python 3.10+ on macOS.
+
 ## Available Functions
 
 ### Collections
@@ -31,7 +33,9 @@ is running, takes a WAL-inclusive timestamped backup (kept under
 `~/.py_apple_books/backups/`, restorable via `write_safety.restore_library`),
 validates the schema and aborts on drift, and runs in a single transaction that
 maintains Core Data's bookkeeping. Only user-created collections can be renamed
-or deleted; membership edits also work on "Want to Read".
+or deleted; membership edits also work on "Want to Read". Writes also refuse
+when Books.app's state can't be verified — off macOS (e.g. in Docker), or if
+`pgrep` fails — raising `WriteError`.
 
 ⚠️ With iCloud "Collections, bookmarks and highlights" sync enabled, direct
 writes may not propagate to other devices and can be reverted by a cloud
@@ -100,7 +104,7 @@ Read the full text of your non-DRM EPUBs. Powered by [ebooklib](https://pypi.org
 | `is_epub` | True if the path is an EPUB bundle directory |
 | `is_pdf` | True if the path is a single PDF file |
 | `is_downloaded` | True if locally materialized (not an iCloud placeholder) — does not trigger hydration |
-| `is_drm_protected` | True if the EPUB has `META-INF/encryption.xml` (Apple Books Store FairPlay-protected book) |
+| `is_drm_protected` | True if the EPUB carries FairPlay `META-INF/sinf.xml`, Adobe `rights.xml`, or an `encryption.xml` that encrypts more than fonts (font obfuscation alone doesn't count; an unparseable file does) |
 
 ### Exceptions
 
@@ -109,7 +113,8 @@ Content-access methods may raise:
 | Exception | When |
 |-----------|------|
 | `BookNotDownloadedError` | The book has no local file (never downloaded) **or** the file is an iCloud placeholder |
-| `DRMProtectedError` | The book is FairPlay-protected (Apple Books Store purchase) |
+| `DRMProtectedError` | The book is DRM-protected — usually an Apple Books Store purchase (FairPlay), occasionally an encrypted imported EPUB |
+| `UnsafeEpubEntryError` | A file in the EPUB bundle resolves outside it (absolute/`../` href, symlink), isn't a regular file, or is implausibly large; the book is refused |
 | `AppleBooksError` | Base class for all exceptions above, plus EPUB-parsing errors |
 
 ## Examples
@@ -126,7 +131,7 @@ api = PyAppleBooks()
 
 ```python
 for book in api.list_books():
-    print(f"{book.title} — {book.author}")
+    print(f"{book.title} — {book.author or 'Unknown Author'}")
 ```
 
 ### Get annotations
@@ -206,7 +211,9 @@ for collection in api.list_collections():
 ## How content access handles Apple Books' quirks
 
 - **iCloud placeholders** — books you've imported but haven't opened lately can live only in iCloud. `is_downloaded` detects this via `os.stat` (for files) or `du -sk` (for bundle directories) without triggering a download. `get_book_content` raises `BookNotDownloadedError` so you can prompt the user to open the book in Apple Books.
-- **DRM'd Store purchases** — FairPlay-encrypted EPUBs have `META-INF/encryption.xml` and their chapter bodies are opaque ciphertext. Detected up-front; callers get a clear `DRMProtectedError`.
+- **DRM'd Store purchases** — FairPlay-encrypted EPUBs carry `META-INF/sinf.xml` / an `encryption.xml` covering their content, and their chapter bodies are opaque ciphertext. Detected up-front from that evidence; callers get a clear `DRMProtectedError`. EPUBs whose `encryption.xml` only obfuscates fonts are readable.
+- **Untrusted book files** — imported EPUBs are stored as unzipped bundles, so every entry is read through a contained reader: anything resolving outside the bundle, non-regular files and oversized entries raise `UnsafeEpubEntryError` instead of exposing unrelated local files.
+- **Missing metadata** — Apple's unknown-author placeholder is returned as `author=None`, and the `ZPAGECOUNT` placeholder (0 or 1) as `page_count=None`.
 - **Non-standard EPUB layouts** — OPFs at unusual paths, NCX files not declared in `<spine toc=…>` (e.g. _The 4-Hour Workweek_), EPUB3 books with nav docs only (e.g. _On Numbers and Games_), URL-encoded href characters (`%21` → `!`), duplicate navPoint ids — all handled, with a stdlib NCX override for the ebooklib blind spots.
 - **Fragment-scoped chapters** — Project Gutenberg EPUBs often put multiple sections in one XHTML file, separated by anchors. `get_chapter_content` returns only the requested section, not the whole file.
 
