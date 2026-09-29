@@ -98,17 +98,21 @@ class Book(Model):
 
     # Relations
     #
-    # ``book.annotations`` returns only user-created annotations (highlights
-    # and notes). Apple Books stores its auto-tracked reading-position
-    # bookmark as an annotation with ``type = 3``; we filter that out here
-    # so callers asking "what did the user annotate?" get the expected set.
-    # For direct access to the bookmark, use
-    # :meth:`PyAppleBooks.get_current_reading_location`.
+    # ``book.annotations`` returns only live user-created annotations
+    # (highlights, notes and bookmarks). Apple Books stores its
+    # auto-tracked reading-position bookmark as an annotation with
+    # ``type = 3``, and keeps annotations deleted in Books
+    # (``is_deleted``) and type-0 tombstones for iCloud sync; we filter
+    # those out here so callers asking "what did the user annotate?" get
+    # the expected set. The same filter as the annotation queries in
+    # :class:`PyAppleBooks` (``api._LIVE_ANNOTATIONS``; a copy, since
+    # models can't import the facade). For direct access to the bookmark,
+    # use :meth:`PyAppleBooks.get_current_reading_location`.
     annotations = OneToMany(
         related_model=Annotation,
         related_name='book',
         foreign_key='asset_id',
-        extra_filters={'type__ne': 3},
+        extra_filters={'type__gt': 0, 'type__ne': 3, 'is_deleted__isnot': 1},
     )
 
     def __post_init__(self):
@@ -190,7 +194,8 @@ class Book(Model):
     def format_progress_summary(self) -> str:
         """Get a formatted summary of reading progress."""
         status = self.progress_status
-        last_read = "Never" if self.last_opened_date is None else self.last_opened_date.strftime("%Y-%m-%d")
+        last_read_date = self.last_read_date
+        last_read = "Never" if last_read_date is None else last_read_date.strftime("%Y-%m-%d")
         
         summary = f"Progress: {status}"
         if self.reading_progress and self.reading_progress > 0:

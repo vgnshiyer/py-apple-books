@@ -6,32 +6,113 @@ from py_apple_books import collection_writer
 from py_apple_books.content import BookContent, Chapter
 from py_apple_books.db.clause import Q
 from py_apple_books.exceptions import (
+    AnnotationNotFoundError,
     AppleBooksError,
     BookNotDownloadedError,
+    BookNotFoundError,
     CollectionNotFoundError,
     DBError,
     DRMProtectedError,
+    InvalidChoiceError,
+    NotInLibraryError,
 )
-from py_apple_books.models import Book, Collection, Annotation, AnnotationColor
-from py_apple_books.models.manager import ModelIterable
+from py_apple_books.models import (
+    Annotation,
+    AnnotationColor,
+    AnnotationType,
+    Book,
+    Collection,
+    ReadingStatus,
+)
+from py_apple_books.models.book import CONTENT_TYPE_SERIES_CONTAINER, SERIES_DATA_SOURCE
+from py_apple_books.models.manager import ModelIterable, normalize_limit, normalize_offset
 from py_apple_books.utils import APPLE_EPOCH_OFFSET, snap_window
 
 
 # Apple Books' ``ZANNOTATIONTYPE`` value for the automatic "current reading
-# position" bookmark. Distinct from highlights (1) and notes (2); one per
-# book, updated as the user reads, with empty selected_text/note and a
-# zero-width CFI range.
+# position" bookmark (see :class:`AnnotationType`: 0 is a deletion
+# tombstone, 1 a user bookmark, 2 a highlight, with or without a note);
+# one per book, updated as the user reads, with empty selected_text/note
+# and a zero-width CFI range.
 #
 # User-facing annotation queries (``list_annotations``, search, date-range,
 # color) silently exclude these rows — they aren't user-created annotations
 # and showing them as empty-text entries is confusing. For direct access to
 # the bookmark itself, use :meth:`PyAppleBooks.get_current_reading_location`.
-_ANNOTATION_TYPE_READING_BOOKMARK = 3
+_ANNOTATION_TYPE_READING_BOOKMARK = int(AnnotationType.READING_POSITION)
+
+# Scope of the user-facing annotation queries. Live: not soft-deleted
+# (ZANNOTATIONDELETED, NULL-safe), not a type-0 deletion tombstone and
+# not the reading-position row. ``include_deleted=True`` gives the
+# pre-1.10 set (everything but the reading-position row). Book.annotations
+# uses a copy of _LIVE_ANNOTATIONS (models can't import this module).
+_LIVE_ANNOTATIONS = {
+    "type__gt": int(AnnotationType.TOMBSTONE),
+    "type__ne": _ANNOTATION_TYPE_READING_BOOKMARK,
+    "is_deleted__isnot": 1,
+}
+_ALL_ANNOTATIONS = {"type__ne": _ANNOTATION_TYPE_READING_BOOKMARK}
+
+
+def _id_text(value) -> str:
+    """``value`` for an error message. An int too long for ``str()``
+    (``sys.get_int_max_str_digits()``) is a valid, if absurd, id."""
+    try:
+        return str(value)
+    except ValueError:
+        return "<an integer too long to print>"
+
+
+def _annotation_scope(include_deleted: bool) -> dict:
+    """Filter keywords for the user-facing annotation queries."""
+    return dict(_ALL_ANNOTATIONS if include_deleted else _LIVE_ANNOTATIONS)
+
+
+def _owned_books_filter() -> dict:
+    """Filter keywords for the books in the user's library.
+
+    Leaves out Apple Books Store series rows the user doesn't own: series
+    containers (``ZCONTENTTYPE`` 5), and Series-source volumes without
+    the redownload (ownership) flag. NULL-safe, so a row with no data
+    source or content type stays in. A predicate whose column the store
+    lacks is dropped, which shows those rows as 1.9.1 did: hiding a row
+    needs all the evidence. Same rule as :attr:`Book.is_store_series_item`.
+    """
+    scope = {}
+    if Book.manager.has_fields("content_type"):
+        scope["content_type__isnot"] = CONTENT_TYPE_SERIES_CONTAINER
+    if Book.manager.has_fields("data_source", "can_redownload"):
+        scope["where"] = Q(data_source__isnot=SERIES_DATA_SOURCE) | Q(can_redownload=1)
+    return scope
+
+
+def _book_scope(include_store_series: bool) -> dict:
+    """Filter keywords for a book list: all rows if ``include_store_series``,
+    else the owned ones."""
+    return {} if include_store_series else _owned_books_filter()
+
+
+# One reading-status rule, finished first: FINISHED is ZISFINISHED = 1
+# whatever the progress; IN_PROGRESS is not finished with
+# ZREADINGPROGRESS (a 0-1 fraction) above 0; UNSTARTED is not finished
+# with progress 0 or NULL. NULL-safe, so over the owned books the three
+# sets are disjoint and cover list_books(); Book.reading_status applies
+# the same rule to one book.
+_STATUS_FILTERS = {
+    ReadingStatus.FINISHED: {"is_finished": 1},
+    ReadingStatus.IN_PROGRESS: {"is_finished__isnot": 1, "reading_progress__gt": 0},
+    ReadingStatus.UNSTARTED: {"is_finished__isnot": 1, "reading_progress__not_gt": 0},
+}
 
 # Default order of the colour and annotation text searches: newest
 # first, so a ``limit`` keeps the most recent matches. Pass
 # ``order_by=None`` for storage order (the pre-1.10 default).
 _SEARCH_ORDER = "-creation_date"
+
+# get_recently_read_books orders by Book.last_read_date, newest first by
+# default. It isn't a column, so these two orders sort in Python; the
+# value says whether the order is descending.
+_RECENCY_ORDERS = {"-last_read_date": True, "last_read_date": False}
 
 
 class PyAppleBooks:
@@ -98,62 +179,111 @@ class PyAppleBooks:
         return collection_writer.remove_book_from_collection(collection_id, book_id, backup=backup)
 
     # -- book actions --
+    #
+    # The book lists and searches return the books in the user's library.
+    # Apple Books also keeps rows for Store series it knows about: series
+    # containers and volumes the user doesn't own. Those are left out
+    # unless ``include_store_series=True`` (the status and recency lists
+    # always leave them out). get_book_by_id and the relations resolve
+    # every row.
+
     def list_books(self, limit: int = None, order_by: str = None, *,
-                   offset: int = None) -> ModelIterable:
-        """List all books."""
-        return Book.manager.all(limit=limit, order_by=order_by, offset=offset)
+                   offset: int = None, include_store_series: bool = False) -> ModelIterable:
+        """List the books in the library (Store series items you don't own
+        are left out unless ``include_store_series``)."""
+        return Book.manager.filter(**_book_scope(include_store_series),
+                                   limit=limit, order_by=order_by, offset=offset)
 
     def get_book_by_id(self, book_id: str) -> Book:
-        """Get a book and its annotations."""
-        return Book.manager.filter(id=book_id)[0]
+        """Get a book and its annotations. Resolves every row, Store
+        series items included.
+
+        :raises BookNotFoundError: no book has that id. An
+            :class:`IndexError` subclass, so pre-1.10 handlers still work.
+        """
+        try:
+            return Book.manager.filter(id=book_id)[0]
+        except IndexError:
+            raise BookNotFoundError(f"No book with id {_id_text(book_id)}.") from None
 
     def get_book_by_title(self, title: str, *, limit: int = None, order_by: str = None,
-                          offset: int = None) -> ModelIterable:
+                          offset: int = None, include_store_series: bool = False) -> ModelIterable:
         """Get the books whose title contains ``title``, ignoring case,
-        accents and quote/dash style."""
-        return Book.manager.filter(title__search=title, limit=limit, order_by=order_by, offset=offset)
+        accents and quote/dash style (Store series items you don't own
+        are left out unless ``include_store_series``)."""
+        return Book.manager.filter(title__search=title, **_book_scope(include_store_series),
+                                   limit=limit, order_by=order_by, offset=offset)
 
     def get_books_by_genre(self, genre: str, limit: int = None, order_by: str = None, *,
-                           offset: int = None) -> ModelIterable:
+                           offset: int = None, include_store_series: bool = False) -> ModelIterable:
         """Get books whose genre contains the given string, ignoring case,
-        accents and quote/dash style."""
-        return Book.manager.filter(genre__search=genre, limit=limit, order_by=order_by, offset=offset)
+        accents and quote/dash style (Store series items you don't own
+        are left out unless ``include_store_series``)."""
+        return Book.manager.filter(genre__search=genre, **_book_scope(include_store_series),
+                                   limit=limit, order_by=order_by, offset=offset)
 
     # -- annotation actions --
     #
-    # All user-facing annotation queries filter out Apple Books' auto-tracked
-    # reading-position bookmarks (``type = 3``). These are system entries with
-    # empty text, not user-created highlights or notes — callers that want
-    # them specifically should use :meth:`get_current_reading_location`.
+    # The user-facing annotation queries return live user annotations
+    # (highlights, notes and bookmarks). They leave out Apple Books'
+    # auto-tracked reading-position rows (``type = 3``; see
+    # :meth:`get_current_reading_location`), highlights deleted in Books
+    # (``is_deleted``, kept for iCloud sync) and type-0 deletion
+    # tombstones. ``include_deleted=True`` brings the deleted rows and
+    # tombstones back, as before 1.10. get_annotation_by_id is unfiltered.
 
     def list_annotations(self, limit: int = None, order_by: str = None, *,
-                         offset: int = None) -> ModelIterable:
-        """List all user-created annotations (highlights and notes).
+                         offset: int = None, include_deleted: bool = False) -> ModelIterable:
+        """List all user-created annotations (highlights, notes and
+        bookmarks).
 
-        Excludes Apple Books' auto-tracked reading-position bookmarks.
+        Excludes Apple Books' auto-tracked reading-position bookmarks,
+        and deleted annotations unless ``include_deleted``.
         """
         return Annotation.manager.filter(
-            type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
+            **_annotation_scope(include_deleted),
             limit=limit,
             order_by=order_by,
             offset=offset,
         )
 
     def get_annotation_by_id(self, annotation_id: str) -> Annotation:
-        """Get an annotation by id (returns bookmarks too — use when the
-        caller has already obtained the id from a specific API)."""
-        return Annotation.manager.filter(id=annotation_id)[0]
+        """Get an annotation by id, whatever it is: unlike the list and
+        search methods this can return a deleted annotation
+        (``is_deleted``), a type-0 tombstone or a reading-position
+        bookmark. Use it when the caller already has the id from a
+        specific API.
+
+        :raises AnnotationNotFoundError: no annotation has that id. An
+            :class:`IndexError` subclass, so pre-1.10 handlers still work.
+        """
+        try:
+            return Annotation.manager.filter(id=annotation_id)[0]
+        except IndexError:
+            raise AnnotationNotFoundError(f"No annotation with id {_id_text(annotation_id)}.") from None
 
     def get_annotations_by_color(self, color: str, limit: int = None, order_by: str = _SEARCH_ORDER, *,
-                                 offset: int = None) -> ModelIterable:
-        """Get user highlights by color, newest first by default."""
-        style = AnnotationColor[color.upper()].value
+                                 offset: int = None, include_deleted: bool = False) -> ModelIterable:
+        """Get user highlights by color, newest first by default.
+
+        :raises InvalidChoiceError: ``color`` isn't one of green, blue,
+            yellow, pink or purple. A :class:`KeyError` subclass, as 1.9
+            raised a bare ``KeyError``.
+        """
+        try:
+            style = AnnotationColor[color.upper()].value
+        except KeyError:
+            valid = [c.name.lower() for c in AnnotationColor]
+            raise InvalidChoiceError(
+                f"Unknown highlight color {color!r}. Valid colors: {', '.join(valid)}.",
+                value=color, valid=valid,
+            ) from None
         # The color filter (style in 1..5) already excludes bookmarks
         # (style = 0); the explicit type filter is a belt-and-suspenders
         # guard against future style reuse.
         return Annotation.manager.filter(
             style=style,
-            type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
+            **_annotation_scope(include_deleted),
             limit=limit,
             order_by=order_by,
             offset=offset,
@@ -165,29 +295,30 @@ class PyAppleBooks:
 
     def search_annotation_by_highlighted_text(self, text: str, limit: int = None,
                                               order_by: str = _SEARCH_ORDER, *,
-                                              offset: int = None) -> ModelIterable:
+                                              offset: int = None,
+                                              include_deleted: bool = False) -> ModelIterable:
         """Search user annotations by highlighted text, newest first by default."""
         return Annotation.manager.filter(
             selected_text__search=text,
-            type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
+            **_annotation_scope(include_deleted),
             limit=limit,
             order_by=order_by,
             offset=offset,
         )
 
     def search_annotation_by_note(self, note: str, limit: int = None, order_by: str = _SEARCH_ORDER, *,
-                                  offset: int = None) -> ModelIterable:
+                                  offset: int = None, include_deleted: bool = False) -> ModelIterable:
         """Search user annotations by note, newest first by default."""
         return Annotation.manager.filter(
             note__search=note,
-            type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
+            **_annotation_scope(include_deleted),
             limit=limit,
             order_by=order_by,
             offset=offset,
         )
 
     def search_annotation_by_text(self, text: str, limit: int = None, order_by: str = _SEARCH_ORDER, *,
-                                  offset: int = None):
+                                  offset: int = None, include_deleted: bool = False):
         """Search user annotations whose highlighted text, surrounding
         text or note contains the given text, newest first by default.
 
@@ -195,7 +326,7 @@ class PyAppleBooks:
         """
         matches = Annotation.manager.filter(
             where=Q(selected_text__search=text) | Q(representative_text__search=text) | Q(note__search=text),
-            type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
+            **_annotation_scope(include_deleted),
             limit=limit,
             order_by=order_by,
             offset=offset,
@@ -206,7 +337,7 @@ class PyAppleBooks:
 
     def get_annotations_by_date_range(self, after: datetime = None, before: datetime = None,
                                        limit: int = None, order_by: str = None, *,
-                                       offset: int = None) -> ModelIterable:
+                                       offset: int = None, include_deleted: bool = False) -> ModelIterable:
         """Get user annotations within a date range.
 
         Args:
@@ -215,8 +346,9 @@ class PyAppleBooks:
             limit: Maximum number of results.
             order_by: Field to sort by (prefix with - for descending).
             offset: Number of results to skip.
+            include_deleted: Also return annotations deleted in Apple Books.
         """
-        kwargs = {"type__ne": _ANNOTATION_TYPE_READING_BOOKMARK}
+        kwargs = _annotation_scope(include_deleted)
         if after:
             kwargs["creation_date__gte"] = after.timestamp() - APPLE_EPOCH_OFFSET
         if before:
@@ -224,30 +356,65 @@ class PyAppleBooks:
         return Annotation.manager.filter(**kwargs, limit=limit, order_by=order_by, offset=offset)
 
     # -- reading progress actions --
+    #
+    # One rule, finished first (see _STATUS_FILTERS): a book marked
+    # finished is finished whatever its progress; otherwise it is in
+    # progress above 0% and unstarted at 0% or no progress. Over the books
+    # in the library the three lists don't overlap and together equal
+    # list_books(). Store series items you don't own are always left out.
+
     def get_books_in_progress(self, limit: int = None, order_by: str = None, *,
                               offset: int = None) -> ModelIterable:
-        """Get books that are currently being read (progress > 0% and < 100%)."""
-        return Book.manager.filter(reading_progress__gt=0, 
-                                  reading_progress__lt=100, 
-                                  limit=limit, 
-                                  order_by=order_by,
-                                  offset=offset)
+        """Get books being read: not marked finished, progress above 0%.
+        A finished book is never in progress, whatever its progress."""
+        return Book.manager.filter(**_owned_books_filter(), **_STATUS_FILTERS[ReadingStatus.IN_PROGRESS],
+                                   limit=limit, order_by=order_by, offset=offset)
 
     def get_finished_books(self, limit: int = None, order_by: str = None, *,
                            offset: int = None) -> ModelIterable:
-        """Get books that are marked as finished."""
-        return Book.manager.filter(is_finished=True, limit=limit, order_by=order_by, offset=offset)
+        """Get books marked as finished, whatever their progress (a
+        finished book is in neither of the other two lists)."""
+        return Book.manager.filter(**_owned_books_filter(), **_STATUS_FILTERS[ReadingStatus.FINISHED],
+                                   limit=limit, order_by=order_by, offset=offset)
 
     def get_unstarted_books(self, limit: int = None, order_by: str = None, *,
                             offset: int = None) -> ModelIterable:
-        """Get books that haven't been started (progress = 0% or None)."""
-        return Book.manager.filter(reading_progress__lte=0, limit=limit, order_by=order_by, offset=offset)
+        """Get books not started: not marked finished, and progress 0% or
+        none. A finished book is never unstarted, even at 0%."""
+        return Book.manager.filter(**_owned_books_filter(), **_STATUS_FILTERS[ReadingStatus.UNSTARTED],
+                                   limit=limit, order_by=order_by, offset=offset)
 
-    def get_recently_read_books(self, limit: int = 10, order_by: str = "-last_opened_date", *,
+    def get_recently_read_books(self, limit: int = 10, order_by: str = "-last_read_date", *,
                                 offset: int = None) -> ModelIterable:
-        """Get recently opened books, ordered by last opened date."""
-        return Book.manager.filter(last_opened_date__isnull=False, limit=limit, order_by=order_by,
-                                   offset=offset)
+        """Get recently read books, newest first.
+
+        The default order is :attr:`Book.last_read_date`, the later of the
+        last-opened and last-engaged dates (ZLASTOPENDATE alone goes stale
+        while a book stays open); ``'last_read_date'`` is oldest first.
+        Both sort in Python, ties by id, and apply ``offset`` and
+        ``limit`` after sorting. Any other ``order_by`` sorts in SQL:
+        ``'-last_opened_date'`` is the pre-1.10 default, and None is
+        storage order. Books never opened, and Store series items you
+        don't own, are left out.
+        """
+        if not isinstance(order_by, str) or order_by not in _RECENCY_ORDERS:
+            return Book.manager.filter(last_opened_date__isnull=False, **_owned_books_filter(),
+                                       limit=limit, order_by=order_by, offset=offset)
+        descending = _RECENCY_ORDERS[order_by]
+        limit = normalize_limit(limit)
+        start = normalize_offset(offset) or 0
+        base = Book.manager.filter(last_opened_date__isnull=False, **_owned_books_filter())
+        rows = base.run_query()
+        keys = list(Book._get_mappings("Book"))
+        i_open, i_engaged, i_id = (keys.index(k) for k in ("last_opened_date", "last_engaged_date", "id"))
+
+        def read_at(row) -> float:
+            # Raw Core Data seconds; NULL sorts as the oldest.
+            return max(float("-inf") if row[i] is None else float(row[i]) for i in (i_open, i_engaged))
+
+        rows = sorted(rows, key=lambda row: (-read_at(row) if descending else read_at(row), row[i_id]))
+        sliced = rows[start:] if limit is None else rows[start:start + limit]
+        return ModelIterable(lambda: sliced, Book)
 
     # -- content actions --
     def get_book_content(self, book_id: int) -> BookContent:
@@ -266,12 +433,35 @@ class PyAppleBooks:
             (``path`` is None) or exists only as an iCloud placeholder. The
             fix in both cases is to open the book in Apple Books to trigger
             a download.
+        :raises NotInLibraryError: (a :class:`BookNotDownloadedError`)
+            if the row is an Apple Books Store series item you don't own
+            (:attr:`Book.is_store_series_item`) and has no local file:
+            there is nothing to download.
         :raises DRMProtectedError: if the book is DRM-protected — usually
             a FairPlay-protected, non-sample Apple Books Store purchase;
             occasionally an encrypted imported EPUB. Its chapters are
             readable only through the Apple Books reader.
+        :raises IndexError: no book has that id. A bare ``IndexError``,
+            not an :class:`AppleBooksError`, for 1.x compatibility.
         """
-        book = self.get_book_by_id(book_id)
+        try:
+            book = self.get_book_by_id(book_id)
+        except BookNotFoundError as e:
+            # 1.x compatibility: this has always raised a bare IndexError
+            # for an unknown id, and apple-books-mcp <= 0.8.2 catches
+            # AppleBooksError before IndexError around it (its chapter
+            # tools), so a BookNotFoundError would report a missing book
+            # as unreadable. 2.0 raises BookNotFoundError.
+            raise IndexError(str(e)) from None
+
+        # getattr: callers (and tests) may stub get_book_by_id with a
+        # plain object. A row with a local file is always tried.
+        if getattr(book, "is_store_series_item", False) and not getattr(book, "path", None):
+            raise NotInLibraryError(
+                f"'{book.title}' is an Apple Books Store series item that "
+                f"isn't in your library (an unowned volume or a series "
+                f"container), so there is no book file to read."
+            )
 
         if not book.path:
             raise BookNotDownloadedError(
