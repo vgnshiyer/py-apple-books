@@ -9,8 +9,11 @@ import pytest
 
 from py_apple_books import PyAppleBooks
 from py_apple_books.api import StoreInfo
+from py_apple_books.db import LibraryDB, use_library
+from py_apple_books.db.client import ANNOTATION_RETRY
 from py_apple_books.exceptions import LibraryAccessDeniedError, LibraryNotFoundError
-from py_apple_books.models import Annotation
+from py_apple_books.models import Annotation, Book
+from py_apple_books.testing.fixture import SCHEMAS_DIR, build_store
 
 NOTHING_MISSING = {"Book": [], "Annotation": [], "Collection": []}
 
@@ -110,6 +113,29 @@ def test_errors_are_typed(tmp_path, lib):
             info_of(lib)
     finally:
         folder.chmod(0o755)
+
+
+def test_a_new_annotation_store_is_in_the_schema_at_once(lib):
+    """LibraryDB.has_annotations() drops the cached schema when it finds
+    the store, so the annotation columns are seen without waiting for
+    the schema recheck."""
+    shutil.rmtree(lib.annotation_path.parent)
+    db = LibraryDB(data_dir=lib.data_dir)
+    now = [1000.0]
+    db._clock = lambda: now[0]
+    api = PyAppleBooks()
+    with use_library(db):
+        assert api.store_info().annotation_path is None
+        build_store(SCHEMAS_DIR / lib.schema / "AEAnnotation.sql", lib.annotation_path)
+        now[0] += ANNOTATION_RETRY - 1
+        assert Book.manager.has_fields("title")  # the schema, checked now
+        now[0] += 1  # within SCHEMA_RECHECK of that check
+        assert db.has_annotations()
+        assert Annotation.manager.has_fields("note", "uuid")
+        info = api.store_info()
+    db.close()
+    assert info.annotation_path == lib.annotation_path
+    assert info.missing_columns == NOTHING_MISSING
 
 
 def test_store_info_reads_only(lib, sql_trace):

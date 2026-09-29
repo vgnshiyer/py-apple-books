@@ -485,8 +485,10 @@ class LibraryDB:
     again every :data:`ANNOTATION_RETRY` seconds.
 
     Thread-safe. A connection is used by one thread at a time. Close a
-    library you made when done with it (:meth:`close`, or ``with``):
-    dropping it closes its idle connections too, but only in the
+    library you create when done with it (:meth:`close`, or ``with``).
+    The models read from it keep it alive, and using their relations
+    after :meth:`close` opens its connections again. A library dropped
+    with its models closes its idle connections too, but only in the
     process that opened them.
 
     A forked child makes its own connections. Fork only while no other
@@ -636,7 +638,10 @@ class LibraryDB:
             if not settled:
                 expire = now + FALLBACK_TTL
                 self._paths_expire = expire if self._paths_expire is None else min(self._paths_expire, expire)
+            # New connections attach the store; the cached schema has no
+            # anno_db tables.
             self._generation += 1
+            self._schema = None
             return True
 
     def candidates(self, kind: str) -> List[Path]:
