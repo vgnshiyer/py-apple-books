@@ -118,6 +118,31 @@ def test_subclass_without_init_call_reads_the_default_library(library):
     assert [b.title for b in Mine().list_books()] == ["default book"]
 
 
+def test_subclass_methods_read_the_instance_library(other):
+    """A subclass's own public methods are wrapped as well: the models
+    they read directly come from the instance's library."""
+
+    class Mine(PyAppleBooks):
+        def my_titles(self):
+            return [b.title for b in Book.manager.all()]
+
+        def list_books(self, *args, **kwargs):
+            return list(super().list_books(*args, **kwargs))
+
+        def _helper(self):
+            return [b.title for b in Book.manager.all()]
+
+    mine = Mine(data_dir=other.fixture.data_dir)
+    try:
+        assert mine.my_titles() == ["other book"]
+        assert [b.title for b in mine.list_books()] == ["other book"]
+        assert Mine.my_titles.__wrapped__.__name__ == "my_titles"
+        assert not hasattr(Mine._helper, "__wrapped__")
+    finally:
+        mine.close()
+    assert Mine().my_titles() == ["default book"]
+
+
 # -- the library of an instance ---------------------------------------------
 
 
@@ -287,6 +312,8 @@ def test_recency_models_carry_the_instance_library(other):
     assert all(b.__dict__["_ab_db"] is other._db for b in recent)
     assert [a.selected_text for a in recent[1].annotations] == [f"other highlight {i}" for i in range(3)]
     assert recent.count() == len(recent) == 2
+    # run_query() (a 1.9.1 attribute) returns the rows, in order.
+    assert [Book.from_db(row).title for row in recent.run_query()] == ["other second", "other book"]
 
 
 def test_recency_count_by_groups_raw_values(api, recency_library):

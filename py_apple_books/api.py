@@ -132,13 +132,6 @@ _RECENCY_ORDERS = {"-last_read_date": True, "last_read_date": False}
 _MODELS = (Book, Annotation, Collection)
 
 
-def _read_at(book: Book) -> float:
-    """:attr:`Book.last_read_date` as a timestamp; a book with none
-    sorts as the oldest."""
-    when = book.last_read_date
-    return float("-inf") if when is None else when.timestamp()
-
-
 def _backup_dir_for(path) -> pathlib.Path:
     """The folder the pre-write backups of the library store ``path``
     go to when a :class:`PyAppleBooks` writes a library of its own: one
@@ -161,7 +154,8 @@ class LibraryStats:
     :meth:`PyAppleBooks.list_annotations` returns; ``orphan_annotations``
     are those whose book isn't in the store (``annotation.book`` is
     None). ``annotations_per_book`` holds ``(book id, title, count)``
-    for every book with annotations, most annotated first (ties by id).
+    for every book with annotations, most annotated first (ties by id);
+    the title is None for a book without one.
     """
 
     total_books: int
@@ -170,13 +164,13 @@ class LibraryStats:
     unstarted_books: int
     total_annotations: int
     orphan_annotations: int
-    annotations_per_book: Tuple[Tuple[int, str, int], ...] = ()
+    annotations_per_book: Tuple[Tuple[int, Optional[str], int], ...] = ()
 
 
 @dataclass(frozen=True)
 class StoreInfo:
     """Which Apple Books stores a :class:`PyAppleBooks` reads, from
-    :meth:`PyAppleBooks.store_info`."""
+    :meth:`PyAppleBooks.store_info`. Not hashable: it holds dicts."""
 
     #: The library store (books and collections).
     library_path: pathlib.Path
@@ -227,6 +221,8 @@ class PyAppleBooks:
     container. Collection writes go to the library store the instance
     reads, and back it up into a folder of its own
     (``store_info().backup_dir``). Construction does no I/O.
+
+    A subclass's public methods read the instance's library too.
     """
 
     # The library an instance reads; None: the shared default one (and,
@@ -239,6 +235,10 @@ class PyAppleBooks:
                 or query_timeout is not USE_DEFAULT):
             self._db = LibraryDB(data_dir, library_db=library_db, annotation_db=annotation_db,
                                  query_timeout=query_timeout)
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        _bind_library(cls)
 
     def close(self) -> None:
         """Close the idle connections of the library this instance reads
@@ -595,14 +595,21 @@ class PyAppleBooks:
         limit = normalize_limit(limit)
         start = normalize_offset(offset) or 0
         base = Book.manager.filter(last_opened_date__isnull=False, **_owned_books_filter())
-        # Each book with its raw row, which the result keeps as well: its
-        # count_by() groups raw values, as on the SQL-ordered results.
-        pairs = list(zip(base, base._fetch()))
-        pairs.sort(key=lambda pair: (-_read_at(pair[0]) if descending else _read_at(pair[0]), pair[0].id))
-        pairs = pairs[start:] if limit is None else pairs[start:start + limit]
-        result = ModelIterable._from_objects(Book, [book for book, _ in pairs], db=current_library())
-        result._rows = [row for _, row in pairs]
-        return result
+        rows = base.run_query()
+        keys = list(Book._get_mappings("Book"))
+        i_open, i_engaged, i_id = (keys.index(k) for k in ("last_opened_date", "last_engaged_date", "id"))
+
+        def read_at(row) -> float:
+            # Raw Core Data seconds; NULL sorts as the oldest.
+            return max(float("-inf") if row[i] is None else float(row[i]) for i in (i_open, i_engaged))
+
+        rows = sorted(rows, key=lambda row: (-read_at(row) if descending else read_at(row), row[i_id]))
+        sliced = rows[start:] if limit is None else rows[start:start + limit]
+        # The iterable holds the library current here (this instance's),
+        # which its books and their relations read; run_query() returns
+        # the rows and count_by() groups their raw values, as on the
+        # SQL-ordered results.
+        return ModelIterable(lambda: sliced, Book)
 
     # -- counts --
     #
