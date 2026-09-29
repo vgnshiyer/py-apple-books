@@ -7,13 +7,17 @@ Feature-agnostic safety utilities shared by any write path (today:
   caches library rows in memory and uses Core Data optimistic locking,
   so edits made while the app runs can be overwritten or ignored. Fails
   closed: if it can't tell whether Books is running, writes refuse.
-* :func:`backup_library` — timestamped, WAL-inclusive backup via the
-  SQLite backup API. A bare file copy of a live WAL database misses
-  un-checkpointed data and can itself be corrupt; the backup API is the
-  documented-safe route.
-* :func:`restore_library` — one-command restore of a backup over the
-  live database (with the WAL/SHM sidecars removed so SQLite doesn't
-  replay stale journal pages over the restored file).
+* :func:`backup_library` / :func:`list_backups` — timestamped,
+  WAL-inclusive backups via the SQLite backup API. A bare file copy of
+  a live WAL database misses un-checkpointed data and can itself be
+  corrupt; the backup API is the documented-safe route.
+* :func:`verify_backup` / :func:`restore_library` — restore a backup
+  over the live database *through SQLite* (the backup API in reverse,
+  never a file copy), after checking that the backup is intact, is a
+  backup of this store and was written by the same Core Data model,
+  and after snapshotting the current state so the restore itself can
+  be undone. A restore replaces the whole database, not just
+  collections.
 * :func:`validate_table_columns` — exact check (column names and
   declared types) for the tables the writer inserts into. Core Data
   never declares NOT NULL, so a new mandatory attribute only shows up
@@ -44,6 +48,7 @@ from py_apple_books.db.metadata import (  # noqa: F401  (re-exported)
     read_store_metadata,
 )
 from py_apple_books.exceptions import (
+    BackupValidationError,
     BooksAppRunningError,
     SchemaValidationError,
     WriteError,
@@ -67,6 +72,11 @@ BACKUP_MIN_INTERVAL = 300.0
 #: seconds. A younger one may be another process's backup still in
 #: progress; deleting it would make that process's write abort.
 BACKUP_PART_STALE_AFTER = 600.0
+
+#: Name suffix of the snapshot :func:`restore_library` takes before
+#: overwriting the library. Such a snapshot is never reused as a
+#: pre-write backup: it holds the state from *before* the restore.
+SNAPSHOT_SUFFIX = "-pre-restore"
 
 #: Environment variable choosing what the writer does about schema
 #: drift it can't vouch for: ``warn`` (the default: log an unknown Core
@@ -137,6 +147,86 @@ def ensure_books_not_running() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Backups
+# ---------------------------------------------------------------------------
+
+
+def _backup_dir(backup_dir: Optional[Path]) -> Path:
+    """``backup_dir``, else :data:`BACKUP_DIR` (read at call time)."""
+    return Path(backup_dir) if backup_dir else BACKUP_DIR
+
+
+def _backups_for(db_path: Path, backup_dir: Path) -> list[Path]:
+    """Completed backups of ``db_path`` in ``backup_dir``, oldest first
+    (the timestamped names sort chronologically)."""
+    return sorted(backup_dir.glob(f"{db_path.stem}-*.sqlite"))
+
+
+def _take_backup(db_path: Path, backup_dir: Path, *, suffix: str = "") -> Path:
+    """Write one fresh backup of ``db_path``; no reuse, no pruning.
+
+    The copy lands under a ``.part`` name and is renamed only on
+    success, so a failed backup can never masquerade as a valid one.
+    """
+    db_path = Path(db_path)
+    backup_dir = Path(backup_dir)
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise WriteError(f"Backup failed, aborting write: {e}") from e
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    dest = backup_dir / f"{db_path.stem}-{stamp}{suffix}.sqlite"
+    part = dest.with_name(dest.name + ".part")
+
+    try:
+        src = sqlite3.connect(read_only_uri(db_path), uri=True)
+    except sqlite3.Error as e:
+        raise WriteError(f"Backup failed, aborting write: {e}") from e
+    try:
+        dst = sqlite3.connect(part)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+        part.replace(dest)
+    except (sqlite3.Error, OSError) as e:
+        part.unlink(missing_ok=True)
+        raise WriteError(f"Backup failed, aborting write: {e}") from e
+    finally:
+        src.close()
+    return dest
+
+
+def _prune_backups(
+    db_path: Path, backup_dir: Path, keep: int, protect: Iterable[Path] = ()
+) -> None:
+    """Drop completed backups beyond the newest ``keep``, plus stray
+    ``.part`` files a crashed run may have left behind.
+
+    Only stale ``.part`` files: a fresh one may be another process's
+    backup in flight, and files can vanish underneath us as that
+    process finishes. A backup in ``protect`` is never removed.
+    """
+    db_path = Path(db_path)
+    backup_dir = Path(backup_dir)
+    now = time.time()
+    for stray in backup_dir.glob(f"{db_path.stem}-*.sqlite.part"):
+        try:
+            if now - stray.stat().st_mtime > BACKUP_PART_STALE_AFTER:
+                stray.unlink()
+        except FileNotFoundError:
+            pass
+    protected = {Path(p).resolve() for p in protect if p}
+    for old in _backups_for(db_path, backup_dir)[:-keep]:
+        if old.resolve() in protected:
+            continue
+        old.unlink(missing_ok=True)
+        # Opening a WAL-mode backup leaves -wal/-shm sidecars behind.
+        for sidecar in ("-wal", "-shm"):
+            old.with_name(old.name + sidecar).unlink(missing_ok=True)
+
+
 def backup_library(
     db_path: Path,
     backup_dir: Optional[Path] = None,
@@ -153,59 +243,144 @@ def backup_library(
 
     :param min_interval: If the newest existing backup is younger than
         this many seconds, reuse it instead of taking another. Zero
-        (the default) always takes a fresh backup.
+        (the default) always takes a fresh backup. A pre-restore
+        snapshot is never reused.
     """
     db_path = Path(db_path)
-    backup_dir = Path(backup_dir) if backup_dir else BACKUP_DIR
+    backup_dir = _backup_dir(backup_dir)
     backup_dir.mkdir(parents=True, exist_ok=True)
 
-    existing = sorted(backup_dir.glob(f"{db_path.stem}-*.sqlite"))
+    existing = _backups_for(db_path, backup_dir)
     if min_interval > 0 and existing:
         newest = existing[-1]
-        if time.time() - newest.stat().st_mtime < min_interval:
+        if (
+            not newest.stem.endswith(SNAPSHOT_SUFFIX)
+            and time.time() - newest.stat().st_mtime < min_interval
+        ):
             return newest
 
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    dest = backup_dir / f"{db_path.stem}-{stamp}.sqlite"
-    part = dest.with_name(dest.name + ".part")
-
-    try:
-        src = sqlite3.connect(read_only_uri(db_path), uri=True)
-    except sqlite3.Error as e:
-        raise WriteError(f"Backup failed, aborting write: {e}")
-    try:
-        dst = sqlite3.connect(part)
-        try:
-            src.backup(dst)
-        finally:
-            dst.close()
-        part.replace(dest)
-    except (sqlite3.Error, OSError) as e:
-        part.unlink(missing_ok=True)
-        raise WriteError(f"Backup failed, aborting write: {e}")
-    finally:
-        src.close()
-
-    # Prune: completed backups beyond the retention count, plus any
-    # stray .part files a crashed run may have left behind. Only stale
-    # ones — a fresh .part may be another process's backup in flight —
-    # and files can vanish underneath us as that process finishes.
-    now = time.time()
-    for stray in backup_dir.glob(f"{db_path.stem}-*.sqlite.part"):
-        try:
-            if now - stray.stat().st_mtime > BACKUP_PART_STALE_AFTER:
-                stray.unlink()
-        except FileNotFoundError:
-            pass
-    backups = sorted(backup_dir.glob(f"{db_path.stem}-*.sqlite"))
-    for old in backups[:-keep]:
-        old.unlink(missing_ok=True)
-
+    dest = _take_backup(db_path, backup_dir)
+    _prune_backups(db_path, backup_dir, keep)
     return dest
 
 
-def restore_library(backup_path: Path, db_path: Path) -> None:
+def list_backups(
+    db_path: Optional[Path] = None, backup_dir: Optional[Path] = None
+) -> list[Path]:
+    """Backups of the library database, newest first.
+
+    ``db_path`` defaults to the Books library; ``backup_dir`` to
+    :data:`BACKUP_DIR`. The first entry is the restore point for the
+    most recent write (writes within :data:`BACKUP_MIN_INTERVAL` of
+    each other share the backup taken before the first of them) or,
+    right after a restore, the snapshot that undoes it. Returns ``[]``
+    if the directory doesn't exist.
+    """
+    db_path = Path(db_path) if db_path else _default_library_path()
+    backup_dir = _backup_dir(backup_dir)
+    if not backup_dir.is_dir():
+        return []
+    return _backups_for(db_path, backup_dir)[::-1]
+
+
+def _default_library_path() -> Path:
+    # Imported lazily: collection_writer imports this module.
+    from py_apple_books.collection_writer import _default_db_path
+
+    return _default_db_path()
+
+
+# ---------------------------------------------------------------------------
+# Restore
+# ---------------------------------------------------------------------------
+
+
+def verify_backup(backup_path: Path, db_path: Path) -> None:
+    """Check that ``backup_path`` can safely replace ``db_path``.
+
+    Raises :class:`BackupValidationError` (see its ``reason``) unless
+    the backup opens as an SQLite database, passes ``PRAGMA
+    quick_check``, has Core Data metadata with the same store UUID as
+    the live library (a backup of *this* store, not the annotations
+    store or another Mac's library), and records the same Core Data
+    model hashes. The live library is only read.
+    """
+    backup_path = Path(backup_path)
+    db_path = Path(db_path)
+    error = BackupValidationError
+    name = backup_path.name
+
+    try:
+        src = sqlite3.connect(read_only_uri(backup_path), uri=True)
+    except sqlite3.Error as e:
+        raise error(f"Backup {name} can't be opened: {e}", error.NOT_A_DATABASE) from e
+    try:
+        try:
+            rows = src.execute("PRAGMA quick_check").fetchall()
+        except sqlite3.DatabaseError as e:
+            raise error(
+                f"{name} is not a readable SQLite database: {e}", error.NOT_A_DATABASE
+            ) from e
+        result = [row[0] for row in rows]
+        if result != ["ok"]:
+            raise error(
+                f"Backup {name} failed its integrity check ({'; '.join(map(str, result[:3]))}).",
+                error.INTEGRITY,
+            )
+        backup_meta = read_store_metadata(src)
+    finally:
+        src.close()
+    if backup_meta is None or not backup_meta.uuid:
+        raise error(
+            f"{name} is not a Core Data store (no usable Z_METADATA), so it "
+            "isn't a backup of the Books library.",
+            error.NOT_CORE_DATA,
+        )
+
+    live_meta = read_store_metadata(db_path)
+    if live_meta is None or not live_meta.uuid:
+        raise error(
+            f"Can't read the live library's store identity ({db_path.name}) to "
+            "check the backup against. If you are restoring over a damaged "
+            "library, call restore_library(..., force=True).",
+            error.LIVE_UNREADABLE,
+        )
+
+    if backup_meta.uuid != live_meta.uuid:
+        raise error(
+            f"{name} is a backup of a different store (store UUID "
+            f"{backup_meta.uuid}; the live library is {live_meta.uuid}), such "
+            "as the annotations store or another library.",
+            error.WRONG_STORE,
+        )
+
+    if backup_meta.model_hashes != live_meta.model_hashes:
+        changed = sorted(
+            entity
+            for entity in set(backup_meta.model_hashes) | set(live_meta.model_hashes)
+            if backup_meta.model_hashes.get(entity) != live_meta.model_hashes.get(entity)
+        )
+        raise error(
+            f"{name} was written by a different Apple Books data model "
+            f"(entities that differ: {', '.join(changed)}), probably before a "
+            "macOS or Books update. Restoring it could leave Books unable to "
+            "open the library. Pass force=True only if you know it is safe.",
+            error.MODEL_MISMATCH,
+        )
+
+
+def restore_library(
+    backup_path: Path,
+    db_path: Optional[Path] = None,
+    *,
+    force: bool = False,
+    snapshot: bool = True,
+    backup_dir: Optional[Path] = None,
+) -> Optional[Path]:
     """Restore a backup over the live library database.
+
+    The whole database is replaced: collections, and also every book
+    added and all reading progress recorded since the backup was taken.
 
     Restores *through SQLite* — the backup API in reverse — rather
     than copying files. A filesystem copy plus sidecar deletion is
@@ -216,30 +391,83 @@ def restore_library(backup_path: Path, db_path: Path) -> None:
     takes proper locks, resets the WAL consistently, and other
     connections simply see the restored content on their next read.
 
-    Still refuses while Books.app itself is running, since it caches
-    rows in memory far above the SQLite layer.
+    Before overwriting anything it refuses while Books.app is running
+    (Books caches rows in memory far above the SQLite layer), runs
+    :func:`verify_backup` unless ``force``, and snapshots the current
+    library, so the restore itself can be undone by restoring the
+    returned snapshot.
+
+    :param db_path: The library database to overwrite; defaults to the
+        Books library.
+    :param force: Skip :func:`verify_backup`, e.g. to restore over a
+        damaged library or across a Books data-model change.
+    :param snapshot: Snapshot the current library first. Turn it off
+        only when the live file can't be read at all.
+    :param backup_dir: Where the snapshot goes; defaults to
+        :data:`BACKUP_DIR`.
+    :return: The snapshot's path, or None with ``snapshot=False``.
+    :raises BackupValidationError: a pre-restore check failed; nothing
+        was changed.
+    :raises BooksAppRunningError: Books is running; nothing was changed.
+    :raises WriteError: the backup is missing, the snapshot failed
+        (nothing was changed), or the restore itself failed.
     """
     backup_path = Path(backup_path)
-    db_path = Path(db_path)
+    db_path = Path(db_path) if db_path else _default_library_path()
     if not backup_path.exists():
         raise WriteError(f"Backup file not found: {backup_path}")
+    if db_path.exists() and os.path.samefile(backup_path, db_path):
+        raise BackupValidationError(
+            f"{backup_path} is the live library itself, not a backup of it.",
+            BackupValidationError.SAME_FILE,
+        )
 
     ensure_books_not_running()
+
+    if not force:
+        verify_backup(backup_path, db_path)
+
+    backup_dir = _backup_dir(backup_dir)
+    snap = None
+    if snapshot:
+        try:
+            snap = _take_backup(db_path, backup_dir, suffix=SNAPSHOT_SUFFIX)
+        except WriteError as e:
+            raise WriteError(
+                f"Pre-restore snapshot failed, nothing restored: {e.__cause__ or e}"
+            ) from e
+    undo = f" (pre-restore snapshot: {snap})" if snap else ""
 
     try:
         src = sqlite3.connect(read_only_uri(backup_path), uri=True)
     except sqlite3.Error as e:
-        raise WriteError(f"Restore failed: {e}")
+        raise WriteError(f"Restore failed: {e}{undo}") from e
     try:
         dst = sqlite3.connect(db_path, timeout=5.0)
         try:
             src.backup(dst)
+            result = [row[0] for row in dst.execute("PRAGMA quick_check").fetchall()]
         finally:
             dst.close()
     except sqlite3.Error as e:
-        raise WriteError(f"Restore failed: {e}")
+        raise WriteError(f"Restore failed: {e}{undo}") from e
     finally:
         src.close()
+    if result != ["ok"]:
+        message = (
+            "The restored library failed its integrity check "
+            f"({'; '.join(map(str, result[:3]))})."
+        )
+        if snap:
+            message += f" Restore the pre-restore snapshot {snap} to go back."
+        raise WriteError(message)
+
+    # The restore has happened; a failed cleanup mustn't report otherwise.
+    try:
+        _prune_backups(db_path, backup_dir, BACKUP_KEEP, protect=(backup_path, snap))
+    except OSError as e:
+        logger.warning("Restored, but pruning old backups in %s failed: %s", backup_dir, e)
+    return snap
 
 
 # ---------------------------------------------------------------------------
