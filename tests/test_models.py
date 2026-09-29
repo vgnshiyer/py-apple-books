@@ -1,19 +1,22 @@
 """Tests for the ORM model layer (py_apple_books.models).
 
-Rows are built in memory and fed through ``Model.from_db`` with
-relation loading stubbed out, so nothing here executes a query against
-the Apple Books databases.
+Rows are built in memory and fed through ``Model.from_db``, which loads
+no relation; the ``no_relations`` fixture fails any query or schema read,
+so nothing here touches the Apple Books databases.
 """
 
 import configparser
+import copy
 import datetime as dt
 import pathlib
+import pickle
 
 import pytest
 
+from py_apple_books.db import LibraryDB
 from py_apple_books.models import base
 from py_apple_books.models.annotation import Annotation
-from py_apple_books.models.base import _load_mappings
+from py_apple_books.models.base import _field_names, _load_mappings
 from py_apple_books.models.book import Book
 from py_apple_books.models.location import Location
 from py_apple_books.utils import apple_timestamp_to_datetime
@@ -37,9 +40,13 @@ def _annotation_row(**values) -> list:
 
 @pytest.fixture
 def no_relations(monkeypatch):
-    """Skip relation loading in ``from_db`` (it would query the DB)."""
-    for model in (Book, Annotation):
-        monkeypatch.setattr(model.manager, "handle_relations", lambda obj: None)
+    """Fail the test on any read: ``from_db`` loads no relation (since
+    1.10; relations load on first access)."""
+    def refuse(*args, **kwargs):
+        raise AssertionError("from_db ran a query")
+
+    for name in ("execute", "schema"):
+        monkeypatch.setattr(LibraryDB, name, refuse)
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +60,7 @@ class TestMappings:
         ``_get_mappings`` call — ~13 parses per annotation row, which
         was ~99% of the time spent listing a large library."""
         _load_mappings.cache_clear()
+        _field_names.cache_clear()
         reads = []
         original_read = configparser.ConfigParser.read
 
@@ -225,3 +233,32 @@ class TestNewFields:
                                 Location("epubcfi(/6/4!/4/2/1:0)"), None)
         assert (annotation.uuid, annotation.position) == (None, None)
         assert annotation.deep_link == "ibooks://assetid/ASSET#epubcfi(/6/4!/4/2/1:0)"
+
+
+# ---------------------------------------------------------------------------
+# from_db: no relation loading, the source library, copies
+# ---------------------------------------------------------------------------
+
+
+class TestFromDb:
+    def test_loads_no_relation(self, no_relations):
+        book = Book.from_db(_book_row())
+        annotation = Annotation.from_db(_annotation_row())
+        assert book.__dict__["_ab_db"] is None and annotation.__dict__["_ab_db"] is None
+        for obj, relations in ((book, ("annotations", "collections")), (annotation, ("book",))):
+            assert not set(relations) & set(obj.__dict__)
+
+    def test_records_the_library(self, no_relations):
+        db = LibraryDB(data_dir="/nonexistent")
+        assert Book.from_db(_book_row(), db=db).__dict__["_ab_db"] is db
+
+    def test_extra_row_values_are_ignored(self, no_relations):
+        row = _book_row(title="T") + ["extra", 1]
+        assert Book.from_db(row).title == "T"
+
+    def test_state_leaves_out_the_library(self, no_relations):
+        book = Book.from_db(_book_row(), db=LibraryDB(data_dir="/nonexistent"))
+        book.__dict__["_ab_siblings"] = [book]
+        assert not [k for k in book.__getstate__() if k.startswith("_ab_")]
+        for clone in (pickle.loads(pickle.dumps(book)), copy.deepcopy(book)):
+            assert clone == book and "_ab_db" not in clone.__dict__

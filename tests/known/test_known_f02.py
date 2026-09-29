@@ -1,11 +1,6 @@
-"""F02: relations load eagerly, one query per row (stream 4.1 removes the marker)."""
-
-import pytest
-
-F02 = "F02: relations load eagerly per row (N+1); stream 4.1 (orm) removes this marker"
+"""F02: relations loaded eagerly, one query per row (fixed by stream 4.1, orm)."""
 
 
-@pytest.mark.xfail(strict=True, reason=F02)
 def test_listing_annotations_with_books_is_a_few_statements(api, library, sql_trace):
     library.populate(books=5, annotations_per_book=20)
     annotations = list(api.list_annotations(limit=100))
