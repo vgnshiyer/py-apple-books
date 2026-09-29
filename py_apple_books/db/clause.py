@@ -27,7 +27,8 @@ LIKE_ESCAPE = '\\'
 
 def escape_like(s: str) -> str:
     """Escape ``s`` for a LIKE pattern with ``ESCAPE '\\'``, so ``%``,
-    ``_`` and backslash match themselves."""
+    ``_`` and backslash match themselves (for a ``LIKE`` clause of your
+    own; ``__contains`` doesn't use patterns)."""
     return (s.replace(LIKE_ESCAPE, LIKE_ESCAPE * 2)
              .replace('%', LIKE_ESCAPE + '%')
              .replace('_', LIKE_ESCAPE + '_'))
@@ -104,10 +105,22 @@ class Where(Clause):
         if op in ('IS', 'IS NOT') and (value is None or value == 'NULL'):
             return f"{field} {op} NULL", []
         if op == 'CONTAINS':
-            return f"{field} LIKE ? ESCAPE '{LIKE_ESCAPE}'", [f"%{escape_like(str(value))}%"]
+            # Literal substring, case-insensitive for ASCII letters only,
+            # like LIKE. instr() compares whole values; LIKE stops reading
+            # both sides at a NUL character.
+            return f"instr(upper({field}), upper(?)) > 0", [str(value)]
         if op == 'SEARCH':
+            raw = str(value)
+            needle = fold_for_match(raw)
+            if raw and not needle:
+                # Only characters folding drops (combining accents,
+                # zero-width characters, soft hyphen): nothing to find.
+                # An empty needle still matches every non-NULL row.
+                return "0", []
             # abk_fold is registered on every read connection (db.client).
-            return f"instr(abk_fold({field}), ?) > 0", [fold_for_match(str(value))]
+            # It gets the column's bytes, so a row that isn't valid UTF-8
+            # folds with U+FFFD instead of failing the whole query.
+            return f"instr(abk_fold(CAST({field} AS BLOB)), ?) > 0", [needle]
         return f"{field} {op} ?", [value]
 
     def __str__(self):

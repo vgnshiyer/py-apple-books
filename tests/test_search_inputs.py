@@ -17,6 +17,13 @@ RECURSIVE_CTE = ("0' OR (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 F
                  "SELECT count(*) FROM c) OR '")
 NEEDLES = ["'", "don't", "O'Brien", "%", "_", "\\", "’", "1' OR '1'='1", "x' OR 1=1 --",
            UNION, RECURSIVE_CTE]
+# Only characters folding drops (zero-width space, combining acute, soft
+# hyphen + BOM): they match nothing, not every row.
+FOLDS_TO_NOTHING = [chr(0x200B), chr(0x301), chr(0xAD) + chr(0xFEFF)]
+METHODS = [
+    "get_book_by_title", "get_books_by_genre", "get_collection_by_title",
+    "search_annotation_by_highlighted_text", "search_annotation_by_note", "search_annotation_by_text",
+]
 
 
 @pytest.fixture
@@ -29,6 +36,7 @@ def seeded(library):
         library.add_book("Don’t Look Back", genre="Kid’s Books"),
         library.add_book("x' OR 1=1 -- the book", genre=None),
         library.add_book("Plain Title", genre="Fiction"),
+        library.add_book("Zero" + chr(0x200B) + "Width Cafe" + chr(0x301), genre="Soft" + chr(0xAD) + "ware"),
     ]
     first, second = books[0], books[1]
     library.add_collection("Kid's Shelf")
@@ -54,6 +62,8 @@ def corpus(library, store, sql):
 
 def oracle(rows: dict, needle: str) -> set:
     folded = fold_for_match(needle)
+    if needle and not folded:
+        return set()
     return {pk for pk, fields in rows.items()
             if any(f is not None and folded in fold_for_match(f) for f in fields)}
 
@@ -82,14 +92,23 @@ def cases(api, library, seeded):
     }
 
 
-@pytest.mark.parametrize("needle", NEEDLES)
-@pytest.mark.parametrize("method", [
-    "get_book_by_title", "get_books_by_genre", "get_collection_by_title",
-    "search_annotation_by_highlighted_text", "search_annotation_by_note", "search_annotation_by_text",
-])
+@pytest.mark.parametrize("needle", NEEDLES + FOLDS_TO_NOTHING)
+@pytest.mark.parametrize("method", METHODS)
 def test_search_matches_the_fold_oracle(cases, method, needle):
     search, rows = cases[method]
     assert ids(search(needle)) == oracle(rows, needle)
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_needle_that_folds_to_nothing_matches_nothing(cases, method):
+    """Not every row, as instr(x, '') would; '' still matches every row
+    whose field is set, as 1.9.1's LIKE '%%' did."""
+    search, rows = cases[method]
+    for needle in FOLDS_TO_NOTHING:
+        assert ids(search(needle)) == set(), ascii(needle)
+    everything = {pk for pk, fields in rows.items() if any(f is not None for f in fields)}
+    assert len(everything) > 1
+    assert ids(search("")) == everything
 
 
 def test_the_oracle_is_not_trivial(cases):
@@ -101,6 +120,8 @@ def test_the_oracle_is_not_trivial(cases):
     assert len(oracle(titles[1], "%")) == 1
     assert len(oracle(titles[1], "_")) == 1
     assert len(oracle(cases["get_collection_by_title"][1], "'")) == 1
+    assert all(oracle(titles[1], needle) == set() for needle in FOLDS_TO_NOTHING)
+    assert len(oracle(titles[1], "cafe")) == 1
 
 
 @pytest.mark.parametrize("payload", NEEDLES + ["0' OR ZDELETEDFLAG=1 OR '", "1 OR 1=1"])
@@ -142,8 +163,8 @@ def test_text_search_is_one_query(api, seeded, sql_trace):
     searches = [(sql, params) for sql, params in sql_trace if "abk_fold" in sql]
     assert len(searches) == 1
     sql, params = searches[0]
-    assert ("WHERE ZANNOTATIONTYPE != ? AND (instr(abk_fold(ZANNOTATIONSELECTEDTEXT), ?) > 0 "
-            "OR instr(abk_fold(ZANNOTATIONREPRESENTATIVETEXT), ?) > 0 "
-            "OR instr(abk_fold(ZANNOTATIONNOTE), ?) > 0) "
+    assert ("WHERE ZANNOTATIONTYPE != ? AND (instr(abk_fold(CAST(ZANNOTATIONSELECTEDTEXT AS BLOB)), ?) > 0 "
+            "OR instr(abk_fold(CAST(ZANNOTATIONREPRESENTATIVETEXT AS BLOB)), ?) > 0 "
+            "OR instr(abk_fold(CAST(ZANNOTATIONNOTE AS BLOB)), ?) > 0) "
             "ORDER BY ZANNOTATIONCREATIONDATE DESC, Z_PK ASC LIMIT ?") in sql
     assert tuple(params) == (3, "don't", "don't", "don't", 2)

@@ -35,10 +35,11 @@ def _read_only_uri(db_file: Path) -> str:
 def _register_functions(conn: sqlite3.Connection) -> None:
     """Register the SQL functions read queries use.
 
-    ``abk_fold(text)`` is :func:`py_apple_books.text.fold_for_match`,
-    for the ``__search`` lookup. Name, argument count and function are
-    passed positionally: the keyword forms are deprecated since
-    Python 3.13.
+    ``abk_fold(value)`` is :func:`py_apple_books.text.fold_for_match`,
+    for the ``__search`` lookup, which passes the column as a BLOB (it
+    is decoded as UTF-8, invalid bytes becoming U+FFFD). Name, argument
+    count and function are passed positionally: the keyword forms are
+    deprecated since Python 3.13.
     """
     try:
         conn.create_function('abk_fold', 1, fold_for_match, deterministic=True)

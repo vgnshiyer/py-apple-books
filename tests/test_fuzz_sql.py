@@ -6,7 +6,9 @@ text, SQL payloads and lone surrogates are wrapped in the sentinel
 ``zqx…xqz``. Every search facade must return exactly the rows a Python
 oracle picks (``fold_for_match`` containment within the method's
 scope), no executed SQL may contain the sentinel, and odd ids, limits,
-offsets and field names may only raise the documented errors.
+offsets and field names may only raise the documented errors. The
+ORM's ``__contains`` lookup is checked the same way, with NUL
+characters in needles and values.
 
 300 iterations per test by default; set APPLE_BOOKS_FUZZ_ITERATIONS to
 change it.
@@ -14,6 +16,8 @@ change it.
 
 import os
 import random
+import sqlite3
+import string
 import warnings
 
 import pytest
@@ -118,8 +122,21 @@ def corpus(library):
 
 def oracle(rows: dict, needle_: str) -> set:
     folded = fold_for_match(needle_)
+    if needle_ and not folded:
+        return set()  # only characters folding drops
     return {pk for pk, fields in rows.items()
             if any(f is not None and folded in fold_for_match(f) for f in fields)}
+
+
+ASCII_UPPER = str.maketrans(string.ascii_lowercase, string.ascii_uppercase)
+
+
+def contains_oracle(rows: dict, needle_: str) -> set:
+    """``__contains``: a literal substring, case-insensitive for ASCII
+    letters only (SQLite's upper() and LIKE without ICU)."""
+    target = needle_.translate(ASCII_UPPER)
+    return {pk for pk, fields in rows.items()
+            if any(f is not None and target in f.translate(ASCII_UPPER) for f in fields)}
 
 
 def test_search_facades_match_the_oracle(api, corpus, sql_trace):
@@ -134,6 +151,33 @@ def test_search_facades_match_the_oracle(api, corpus, sql_trace):
             hits += bool(expected)
         leaked = [sql for sql, _ in sql_trace if OPEN in sql]
         assert not leaked, ascii(text)
+        sql_trace.clear()
+    assert hits, "no needle matched anything: the oracle is trivial"
+
+
+@pytest.mark.skipif(sqlite3.connect(":memory:").execute("SELECT upper(?)", (chr(0xE9),)).fetchone()[0]
+                    != chr(0xE9), reason="SQLite built with ICU: upper() is not ASCII-only")
+def test_contains_lookup_matches_the_oracle(library, corpus, sql_trace):
+    rng = random.Random(SEED + 5)
+    extra = [fragment(rng, surrogates=False) + chr(0) + fragment(rng, surrogates=False) for _ in range(4)]
+    for frag in extra:
+        library.add_book(f"lead {wrap(frag)} tail", genre=wrap(chr(0) + frag))
+    rows = {row[0]: row[1:] for row in library.execute("library", "SELECT Z_PK, ZTITLE, ZGENRE FROM ZBKLIBRARYASSET")}
+    scopes = {field: {pk: (values[i],) for pk, values in rows.items()} for i, field in enumerate(("title", "genre"))}
+    frags = corpus["frags"] + extra
+    hits = 0
+    for _ in range(ITERATIONS):
+        text = needle(rng, frags)
+        if rng.random() < 0.3:
+            at = rng.randint(0, len(text))
+            text = text[:at] + chr(0) + text[at:]
+        field = rng.choice(list(scopes))
+        expected = contains_oracle(scopes[field], text)
+        got = {book.id for book in Book.manager.filter(**{f"{field}__contains": text})}
+        assert got == expected, (field, ascii(text))
+        assert {book.id for book in Book.manager.filter(**{f"{field}__not_contains": text})} == set(rows) - expected
+        hits += bool(expected)
+        assert not [sql for sql, _ in sql_trace if OPEN in sql], ascii(text)
         sql_trace.clear()
     assert hits, "no needle matched anything: the oracle is trivial"
 

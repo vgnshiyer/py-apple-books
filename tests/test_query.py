@@ -1,7 +1,7 @@
 """Tests for the db.query / db.clause layer.
 
 These test the SQL-building primitives in isolation (only the NULL-safety
-test runs SQL, on an in-memory database). Since 1.10,
+and CONTAINS tests run SQL, on in-memory databases). Since 1.10,
 :meth:`~py_apple_books.db.clause.Where.to_sql` and
 :meth:`~py_apple_books.db.query.Query.compile` compose every
 ``Annotation.manager.filter(...)`` call, so a bug here cascades through
@@ -161,15 +161,43 @@ class TestWhereToSql:
         assert Where("col", 1, "IS").to_sql() == ("col IS ?", [1])
         assert Where("col", 1, "IS NOT").to_sql() == ("col IS NOT ?", [1])
 
-    def test_contains_escapes_like_wildcards(self):
-        assert escape_like("50%_a\\b") == "50\\%\\_a\\\\b"
+    def test_contains_is_a_literal_substring(self):
+        """instr(), not LIKE: no wildcards to escape, and NUL compares
+        like any other character (LIKE stops reading at it)."""
         assert Where("col", "50%_a\\b'", "CONTAINS").to_sql() == (
-            "col LIKE ? ESCAPE '\\'", ["%50\\%\\_a\\\\b'%"])
+            "instr(upper(col), upper(?)) > 0", ["50%_a\\b'"])
+        assert Where("col", 7, "CONTAINS").to_sql() == ("instr(upper(col), upper(?)) > 0", ["7"])
+        assert escape_like("50%_a\\b") == "50\\%\\_a\\\\b"
+
+    def test_contains_against_sqlite(self):
+        """Case-insensitive for ASCII letters only, as LIKE is; '' matches
+        every non-NULL value, as LIKE '%%' does."""
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)")
+        con.executemany("INSERT INTO t (x) VALUES (?)", [
+            ("100% Snake_Case",), ("1000 snakescase",), ("abc\x00xyz",), ("\u00c9mile",), (None,)])
+        run = lambda clause: {r[0] for r in con.execute(*Query.compile("t", ["id"], [clause]))}
+        contains = lambda value: run(Where("x", value, "CONTAINS"))
+        assert contains("0%") == {1} and contains("e_c") == {1} and contains("\\") == set()
+        assert contains("SNAKE") == {1, 2}
+        assert contains("\x00") == {3} and contains("xyz") == {3} and contains("abc\x00q") == set()
+        assert contains("\u00c9MILE") == {4}
+        assert contains("") == {1, 2, 3, 4}
+        assert run(Not(Where("x", "snake", "CONTAINS"))) == {3, 4, 5}
 
     def test_search_folds_the_needle(self):
         assert Where("col", "Don’t  PANIC", "SEARCH").to_sql() == (
-            "instr(abk_fold(col), ?) > 0", [fold_for_match("Don’t  PANIC")])
+            "instr(abk_fold(CAST(col AS BLOB)), ?) > 0", [fold_for_match("Don’t  PANIC")])
         assert Where("col", "Don’t", "SEARCH").to_sql()[1] == ["don't"]
+
+    def test_search_needle_that_folds_to_nothing(self):
+        """Folding drops combining accents, zero-width characters and the
+        soft hyphen; a needle made only of them matches nothing, while ''
+        still matches every non-NULL value (1.9.1's LIKE '%%')."""
+        for needle in (chr(0x200B), chr(0x301), chr(0xAD) + chr(0xFEFF)):
+            assert Where("col", needle, "SEARCH").to_sql() == ("0", [])
+            assert Not(Where("col", needle, "SEARCH")).to_sql() == ("(0) IS NOT 1", [])
+        assert Where("col", "", "SEARCH").to_sql() == ("instr(abk_fold(CAST(col AS BLOB)), ?) > 0", [""])
 
     def test_columns(self):
         assert Where("a", 1).columns() == {"a"}
@@ -229,7 +257,9 @@ class TestLookups:
         assert to_sql("reading_progress__not_gt", 0) == ("(ZREADINGPROGRESS > ?) IS NOT 1", [0])
         assert to_sql("id__not_in", [1, 2]) == ("(Z_PK IN (?, ?)) IS NOT 1", [1, 2])
         assert to_sql("id__notin", [1, 2]) == ("Z_PK NOT IN (?, ?)", [1, 2])
-        assert to_sql("title__not_search", "x") == ("(instr(abk_fold(ZTITLE), ?) > 0) IS NOT 1", ["x"])
+        assert to_sql("title__not_search", "x") == (
+            "(instr(abk_fold(CAST(ZTITLE AS BLOB)), ?) > 0) IS NOT 1", ["x"])
+        assert to_sql("title__not_contains", "x") == ("(instr(upper(ZTITLE), upper(?)) > 0) IS NOT 1", ["x"])
         assert to_sql("path__isnull", True) == ("ZPATH IS NULL", [])
         assert to_sql("path__isnull", False) == ("ZPATH IS NOT NULL", [])
         assert to_sql("title", "a") == to_sql("title__exact", "a") == ("ZTITLE = ?", ["a"])

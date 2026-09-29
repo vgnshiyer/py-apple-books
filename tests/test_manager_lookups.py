@@ -69,15 +69,38 @@ class TestLookups:
 
     def test_contains_is_literal(self, library):
         wild = library.add_book("100% snake_case")["id"]
-        library.add_book("1000 snakescase")
+        other = library.add_book("1000 snakescase")["id"]
         assert ids(Book.manager.filter(title__contains="0%")) == {wild}
         assert ids(Book.manager.filter(title__contains="e_c")) == {wild}
+        assert ids(Book.manager.filter(title__contains="SNAKE")) == {wild, other}
+
+    def test_contains_with_nul(self, library):
+        """NUL is an ordinary character on both sides (LIKE stops reading at
+        it, so '\\x00' matched every row and 'abc\\x00q' meant 'abc')."""
+        nul = library.add_book("abc\x00xyz")["id"]
+        plain = library.add_book("abc plain")["id"]
+        assert ids(Book.manager.filter(title__contains="\x00")) == {nul}
+        assert ids(Book.manager.filter(title__contains="abc\x00q")) == set()
+        assert ids(Book.manager.filter(title__contains="xyz")) == {nul}
+        assert ids(Book.manager.filter(title__contains="abc")) == {nul, plain}
+        assert ids(Book.manager.filter(title__not_contains="\x00")) == {plain}
 
     def test_search_folds_both_sides(self, library):
         book = library.add_book("Gödel’s  Proof")["id"]
         for needle in ("godel's proof", "GÖDEL", "’s p", "s" + chr(0xA0) + "proof"):
             assert ids(Book.manager.filter(title__search=needle)) == {book}, needle
         assert list(Book.manager.filter(title__search="%")) == []
+
+    def test_search_survives_a_row_that_is_not_utf8(self, api, library):
+        """abk_fold gets the column's bytes, so a row with invalid UTF-8
+        doesn't fail searches that don't return it."""
+        good = library.add_book("Alpha")["id"]
+        bad = library.add_book("Bad")["id"]
+        library.execute("library", "UPDATE ZBKLIBRARYASSET SET ZTITLE = CAST(x'42616420ff' AS TEXT) "
+                                   "WHERE Z_PK = ?", (bad,))
+        assert ids(api.get_book_by_title("alpha")) == {good}
+        assert ids(Book.manager.filter(title__search="ALPHA", genre__isnull=True)) == {good}
+        assert ids(Book.manager.filter(title__contains="alpha")) == {good}
 
     def test_where_is_anded_with_the_keywords(self, books):
         either = Q(genre="History") | Q(genre="Fiction")
