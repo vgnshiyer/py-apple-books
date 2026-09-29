@@ -131,6 +131,34 @@ def test_count_by(db, sql_trace):
         Book.manager.all().count_by("nope")
 
 
+@pytest.mark.parametrize("field", ["last_opened_date", "reading_progress", "author", "genre"])
+def test_count_by_keys_are_raw_values_on_every_path(db, field):
+    """The recency orders return a pre-1.10 callable iterable; its
+    ``count_by`` groups the raw rows as the SQL does, not model values."""
+    api = PyAppleBooks()
+    in_python = api.get_recently_read_books(limit=None)
+    in_sql = api.get_recently_read_books(limit=None, order_by="-last_opened_date")
+    assert in_python.count_by(field) == in_sql.count_by(field)
+    list(in_python)
+    assert in_python.count_by(field) == in_sql.count_by(field)
+
+
+def test_counts_leave_out_the_order(db, sql_trace):
+    """A count doesn't depend on the order, so its SQL has none; its
+    columns are still checked."""
+    assert Book.manager.all(order_by="-title").count() == 11
+    assert Book.manager.all(order_by="title", offset=9).exists()
+    assert not Book.manager.all(offset=11).exists()
+    assert Book.manager.all(order_by="title", offset=3, limit=5).count() == 5
+    assert Book.manager.all(order_by="title").count_by("genre") == Counter(
+        b.genre for b in Book.manager.all())
+    assert not any("ORDER BY" in sql for sql, _ in sql_trace[:-1])
+    # With a limit or offset, the order picks the rows that are grouped.
+    limited = Book.manager.all(order_by="-title", limit=4)
+    assert limited.count_by("title") == Counter(b.title for b in Book.manager.all(order_by="-title", limit=4))
+    assert "ORDER BY ZTITLE DESC" in sql_trace[-2][0]
+
+
 def test_manager_count(db, sql_trace):
     assert Book.manager.count() == len(list(Book.manager.all())) == 11
     assert Book.manager.count(genre="Fiction") == 3

@@ -6,9 +6,11 @@ Statements are counted at ``LibraryDB.execute`` (``sql_trace``).
 
 import asyncio
 import copy
+import gc
 import pickle
 import sqlite3
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -248,10 +250,10 @@ class TestLibraryOfTheModel:
     @pytest.fixture
     def other(self, make_library, library):
         """A data_dir library, while the default one holds different rows."""
-        default_book = library.add_book("Default Book")
+        default_book = library.add_book("Default Book", last_opened=700000000.0)
         library.add_annotation(default_book, "default highlight")
         lib = make_library()
-        row = lib.add_book("Other Book")
+        row = lib.add_book("Other Book", last_opened=700000000.0)
         for i in range(3):
             lib.add_annotation(row, f"other highlight {i}")
         shelf = lib.add_collection("Other Shelf")
@@ -271,6 +273,45 @@ class TestLibraryOfTheModel:
         assert [b.title for b in collection.books] == ["Other Book"]
         assert [c.title for c in book.collections] == ["Other Shelf"]
         assert [b.title for b in Book.manager.all()] == ["Default Book"]
+
+    @pytest.mark.parametrize("order_by", ["-last_read_date", "last_read_date", "-last_opened_date", None])
+    def test_recently_read_books(self, other, order_by):
+        """The recency orders sort in Python and return a pre-1.10
+        callable iterable: its models read their library too."""
+        with use_library(other):
+            [book] = PyAppleBooks().get_recently_read_books(order_by=order_by)
+        assert book.__dict__["_ab_db"] is other
+        assert [a.selected_text for a in book.annotations] == [f"other highlight {i}" for i in range(3)]
+        assert [c.title for c in book.collections] == ["Other Shelf"]
+
+    def test_callable_iterable_with_a_pre_110_from_db(self, other, monkeypatch):
+        original = Book.from_db
+        monkeypatch.setattr(Book, "from_db", classmethod(lambda cls, row: original(row)))
+        with use_library(other):
+            rows = Book.manager.all().run_query()
+            [book] = ModelIterable(lambda: rows, Book)
+        assert book.__dict__["_ab_db"] is other
+        assert [a.selected_text for a in book.annotations] == [f"other highlight {i}" for i in range(3)]
+
+    def test_an_unclosed_library_is_freed_with_its_results(self, make_library):
+        """Book and collection results hold no reference cycle, so a
+        dropped LibraryDB (and its idle connections) goes as soon as its
+        models do, without the cyclic garbage collector."""
+        lib = make_library()
+        for i in range(3):
+            lib.add_book(f"Book {i}")
+            lib.add_collection(f"Shelf {i}")
+        db = LibraryDB(data_dir=lib.data_dir)
+        library = weakref.ref(db)
+        gc.disable()
+        try:
+            with use_library(db):
+                books, collections = list(Book.manager.all()), list(Collection.manager.all())
+            assert books[0].__dict__["_ab_db"] is db and len(collections) == 3
+            del db, books, collections
+            assert library() is None
+        finally:
+            gc.enable()
 
     def test_from_worker_threads(self, other):
         with use_library(other):

@@ -347,6 +347,61 @@ class TestLiveDrift:
             assert not Book.manager.has_fields("rating")
             assert [b.rating for b in Book.manager.all()] == [None]
 
+    def test_a_column_added_back_is_seen_at_once(self, lib_db):
+        """A cached schema that lacks a column doesn't fail a query on
+        it: the schema is read again before raising."""
+        lib = lib_db.fixture
+        lib.add_book("Book")
+        lib.execute("library", "ALTER TABLE ZBKLIBRARYASSET RENAME COLUMN ZRATING TO ZRATING_GONE")
+        lib_db._clock = lambda: 1000.0  # the cached schema never expires by age
+        with use_library(lib_db):
+            assert not Book.manager.has_fields("rating")
+            lib.execute("library", "ALTER TABLE ZBKLIBRARYASSET RENAME COLUMN ZRATING_GONE TO ZRATING")
+            assert [b.rating for b in Book.manager.filter(rating=0)] == [0]
+            assert Book.manager.has_fields("rating")
+
+    def test_an_annotation_store_found_later_is_read_at_once(self, make_library, monkeypatch):
+        """The annotation store appears after the schema was cached
+        without it: the first annotation query reads it."""
+        from py_apple_books.db import client
+
+        monkeypatch.setattr(client, "ANNOTATION_RETRY", 0.0)
+        lib = make_library()
+        book = lib.add_book("Book")
+        lib.add_annotation(book, "a highlight")
+        aside = lib.annotation_path.with_name("aside")
+        lib.annotation_path.rename(aside)
+        db = LibraryDB(data_dir=lib.data_dir)
+        db._clock = lambda: 1000.0
+        with use_library(db):
+            assert [b.title for b in Book.manager.all()] == ["Book"]
+            assert not db.has_annotations()
+            aside.rename(lib.annotation_path)
+            assert [a.selected_text for a in Annotation.manager.all()] == ["a highlight"]
+        db.close()
+
+    @pytest.mark.parametrize("replacement", ["no asset table", "0-byte"])
+    def test_a_replaced_store_raises_a_typed_error_at_once(self, lib_db, replacement):
+        """The store replaced by a non-Books file after its schema was
+        cached: 'no such table' reads the schema again, so the first
+        query already raises LibraryNotFoundError, not DBQueryError."""
+        lib = lib_db.fixture
+        lib.add_book("Book")
+        clock = [1000.0]
+        lib_db._clock = lambda: clock[0]
+        with use_library(lib_db):
+            assert len(Book.manager.all()) == 1
+            new = lib.library_path.with_name("new")
+            if replacement == "0-byte":
+                new.touch()
+            else:
+                sqlite3.connect(new).execute("CREATE TABLE t (x)").connection.close()
+            new.replace(lib.library_path)
+            clock[0] += 1  # past the file identity recheck, not the schema's
+            for _ in range(2):
+                with pytest.raises(LibraryNotFoundError):
+                    list(Book.manager.all())
+
 
 class TestMissingStoresAndTables:
     def test_no_annotation_store(self, make_library):

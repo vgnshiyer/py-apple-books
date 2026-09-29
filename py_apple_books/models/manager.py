@@ -6,6 +6,7 @@ from py_apple_books.db import Query
 from py_apple_books.db.client import ANNOTATION_SCHEMA, ANNOTATIONS_NOT_FOUND, current_library, use_library
 from py_apple_books.db.clause import Clause, Not, Q, Subquery, Where, WhereGroup
 from py_apple_books.db.query import CompiledQuery
+from py_apple_books.models.relations import _to_one_names
 from py_apple_books.exceptions import (
     AnnotationStoreNotFoundError,
     DBQueryError,
@@ -22,6 +23,7 @@ from dataclasses import dataclass, replace
 from functools import lru_cache, partial
 import numbers
 import operator
+import re
 import sys
 import warnings
 
@@ -44,6 +46,14 @@ REQUIRED_FIELDS: Dict[str, Tuple[str, ...]] = {
 }
 
 _INT64_MAX = 2**63 - 1
+
+# A statement error that means the cached schema is out of date.
+_STALE_SCHEMA = re.compile(r'no such (column|table)')
+
+# A plain column name, which the compiler checks against the schema. A
+# raw ``where=`` clause may name an expression instead (``lower(ZTITLE)``),
+# which is left to SQLite.
+_COLUMN_NAME = re.compile(r'\w+')
 
 # Filter lookups: ``field__<suffix>=value`` -> Where operator. ``isnull``
 # is special (truthy -> IS NULL, falsy -> IS NOT NULL), and
@@ -216,13 +226,16 @@ class _Spec:
         offset = min((self.offset or 0) + start, _INT64_MAX)
         return replace(self, limit=limit, offset=offset)
 
-    def compile(self, db: 'LibraryDB', fields: Optional[List[str]] = None) -> CompiledQuery:
+    def compile(self, db: 'LibraryDB', fields: Optional[List[str]] = None,
+                ordered: bool = True) -> CompiledQuery:
         """The SELECT for ``db``'s schema.
 
         Selects every mapped column the store has (or those of ``only``
         and the required fields) in mapping order, with a bare ``NULL``
         in place of the rest, so rows line up with the model's fields.
         ``fields`` replaces the column list (``['1']`` for a count).
+        ``ordered=False`` leaves out the ORDER BY, for a count, which
+        doesn't depend on it; its columns are still checked.
 
         :raises AnnotationStoreNotFoundError: an annotation query without
             an annotation store.
@@ -260,10 +273,10 @@ class _Spec:
                 _check_subquery(schema, sub)
         by_column = {column.upper(): field for field, column in mapping.items()}
         for column in sorted(used):
-            if column.upper() not in have:
+            if column.upper() not in have and _COLUMN_NAME.fullmatch(column):
                 raise _missing_column(mgr.model_name, by_column.get(column.upper()), table, column)
         return Query.compile(table, list(fields) if fields is not None else select, list(self.where),
-                             order, self.limit, self.offset, self.use_or)
+                             order if ordered else None, self.limit, self.offset, self.use_or)
 
 
 class ModelIterable(Generic[M]):
@@ -277,12 +290,15 @@ class ModelIterable(Generic[M]):
     On an unevaluated iterable, ``count()``, ``exists()``, ``first()``
     and a slice ``[a:b]`` (bounds >= 0, no step) each run one query of
     their own (``COUNT(*)``, ``LIMIT``/``OFFSET``) and leave it
-    unevaluated. A slice returns a list. An unordered slice or
-    ``first()`` is ordered by primary key, so consecutive slices page
-    through the rows without gaps or repeats.
+    unevaluated. A slice returns a list. An unordered slice is ordered
+    by primary key, so consecutive slices page through the rows without
+    gaps or repeats; once evaluated, slices and indexes follow the
+    order of the rows read. Unordered, ``first()`` is the lowest
+    primary key either way.
 
     ``ModelIterable(callable, model_class)``, the pre-1.10 form, wraps a
-    function that returns raw rows.
+    function that returns raw rows; its models' relations read the
+    library current when it was created.
     """
 
     def __init__(self, callable: Optional[Callable[[], list]] = None, model_class=None, *,
@@ -290,6 +306,10 @@ class ModelIterable(Generic[M]):
         self._callable = callable
         self.model_class = model_class
         self._spec = spec
+        if db is None and callable is not None:
+            # The rows come from the caller's library (the facade reads
+            # them before wrapping them), which their relations then read.
+            db = current_library()
         # The library the query reads (None: the current one when it runs).
         self._db = db
         self._rows: Optional[list] = None
@@ -300,18 +320,27 @@ class ModelIterable(Generic[M]):
     def _execute(self, build: Callable[['LibraryDB'], CompiledQuery]) -> list:
         """Compile ``build(db)`` and run it through the manager's compiler.
 
-        A 'no such column' failure means the store changed after its
-        schema was cached (an ``ALTER TABLE``): the schema is read again
-        and the query compiled and run once more.
+        Queries compile against the cached schema, which may predate a
+        change to the store (a table or column added or dropped, a store
+        replaced or an annotation store found). So when compiling fails
+        on a missing table or column, or the statement fails with 'no
+        such table' or 'no such column', the schema is read again and the
+        query compiled (and run) once more.
         """
         db = self._db if self._db is not None else current_library()
         compiler = self._spec.manager.compiler
         with use_library(db):
-            query = build(db)
+            try:
+                query = build(db)
+            except (LibraryNotFoundError, UnsupportedSchemaError) as e:
+                if isinstance(e, AnnotationStoreNotFoundError):
+                    raise
+                db.invalidate_schema()
+                query = build(db)
             try:
                 return compiler.execute(query.sql, query.params)
             except DBQueryError as e:
-                if 'no such column' not in str(e):
+                if not _STALE_SCHEMA.search(str(e)):
                     raise
                 db.invalidate_schema()
                 query = build(db)
@@ -333,10 +362,20 @@ class ModelIterable(Generic[M]):
 
     def _materialize(self) -> list:
         if self._objs is None:
+            rows = self._fetch()
             from_db = self.model_class.from_db
-            if self._db is not None:
-                from_db = partial(from_db, db=self._db)
-            self._objs = _link([from_db(row) for row in self._fetch()])
+            if self._spec is not None:
+                objs = [from_db(row, db=self._db) for row in rows]
+            else:
+                # A pre-1.10 callable: from_db may be an override without
+                # db=, so the library is recorded afterwards.
+                objs = [from_db(row) for row in rows]
+                if self._db is not None:
+                    for obj in objs:
+                        state = getattr(obj, '__dict__', None)
+                        if state is not None and state.get('_ab_db') is None:
+                            state['_ab_db'] = self._db
+            self._objs = _link(objs)
         return self._objs
 
     @classmethod
@@ -391,39 +430,55 @@ class ModelIterable(Generic[M]):
         if self._objs is not None or self._rows is not None or self._spec is None:
             return len(self)
         spec = self._spec
-        return self._execute(lambda db: Query.count(spec.compile(db, fields=['1'])))[0][0]
+        return self._execute(lambda db: Query.count(spec.compile(db, fields=['1'], ordered=False)))[0][0]
 
     def exists(self) -> bool:
         """Whether there is any row (a ``LIMIT 1`` query unless evaluated)."""
         if self._objs is not None or self._rows is not None or self._spec is None:
             return bool(self)
         spec = self._spec.sliced(0, 1)
-        return bool(self._execute(lambda db: spec.compile(db, fields=['1'])))
+        return bool(self._execute(lambda db: spec.compile(db, fields=['1'], ordered=False)))
 
     def first(self) -> Optional[M]:
-        """The first model, or None. Unevaluated, without ``order_by``,
-        that is the one with the lowest primary key."""
+        """The first model, or None. Without ``order_by``, that is the one
+        with the lowest primary key, evaluated or not."""
+        if self._spec is not None and not self._spec.order and (
+                self._objs is not None or self._rows is not None):
+            objs = self._materialize()
+            return min(objs, key=operator.attrgetter('id')) if objs else None
         page = self[0:1]
         return page[0] if page else None
 
     def count_by(self, field: str) -> dict:
         """``{value: number of rows}`` for a model field, grouped in SQL
         (raw column values, e.g. Core Data seconds for dates). A column
-        the store lacks counts as None."""
+        the store lacks counts as None.
+
+        An iterable over a pre-1.10 callable groups its raw rows the same
+        way; one built from models (``_from_objects``) counts their
+        attribute values.
+        """
         if self._spec is None:
-            self.model_class.manager._get_db_field(field)  # unknown field raises
+            mgr = self.model_class.manager
+            mgr._get_db_field(field)  # an unknown field raises
+            if self._rows is None and self._objs is not None:
+                values = [getattr(obj, field) for obj in self._objs]
+            else:
+                i = list(self.model_class._get_mappings(mgr.model_name)).index(field)
+                values = [row[i] if i < len(row) else None for row in self._fetch()]
             counts: dict = {}
-            for obj in self._materialize():
-                value = getattr(obj, field)
+            for value in values:
                 counts[value] = counts.get(value, 0) + 1
             return counts
         spec = self._spec
         mgr = spec.manager
         column = mgr._get_db_field(field)
+        # The order only matters for which rows a limit or offset keeps.
+        ordered = spec.limit is not None or bool(spec.offset)
 
         def build(db):
             present = column.upper() in _upper(db.schema().get(mgr.table_name) or frozenset())
-            inner = spec.compile(db, fields=[f"{column if present else 'NULL'} AS _k"])
+            inner = spec.compile(db, fields=[f"{column if present else 'NULL'} AS _k"], ordered=ordered)
             return CompiledQuery(f"SELECT _k, COUNT(*) FROM ({inner.sql}) GROUP BY _k", inner.params)
 
         return {key: n for key, n in self._execute(build)}
@@ -431,8 +486,10 @@ class ModelIterable(Generic[M]):
 
 def _link(objs: list) -> list:
     """Give each model of a multi-row result the whole list, so a
-    to-one relation (``Annotation.book``) loads for all of them at once."""
-    if len(objs) > 1 and hasattr(objs[0], '__dict__'):
+    to-one relation (``Annotation.book``) loads for all of them at once.
+    Models without one (books, collections) don't get it: it would only
+    keep the result, and its library, alive."""
+    if len(objs) > 1 and hasattr(objs[0], '__dict__') and _to_one_names(type(objs[0])):
         for obj in objs:
             obj.__dict__['_ab_siblings'] = objs
     return objs

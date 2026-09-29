@@ -9,6 +9,7 @@ under ``use_library``; statements are counted at ``LibraryDB.execute``.
 import pytest
 
 from py_apple_books.db import AppleBooksDBClient, LibraryDB, QueryCompiler, use_library
+from py_apple_books.db.clause import Where
 from py_apple_books.exceptions import LibraryNotFoundError, UnknownFieldError
 from py_apple_books.models import Annotation, Book, Collection
 from py_apple_books.models.manager import ModelIterable
@@ -179,6 +180,24 @@ class TestFirstAndExists:
         assert books.first().genre == "Fiction" and books.exists() and books.count() == 5
         assert len(sql_trace) == 1
 
+    def test_first_is_the_same_before_and_after_evaluation(self, db, monkeypatch):
+        """Unordered, ``first()`` is the lowest primary key even when the
+        cached rows came back in another order (an index scan)."""
+        class Reversing(QueryCompiler):
+            def execute(self, query, params=()):
+                rows = super().execute(query, params)
+                return rows if "ORDER BY" in query else rows[::-1]
+
+        monkeypatch.setattr(Book.manager, "compiler", Reversing(AppleBooksDBClient()))
+        lowest = db.fixture.books[0]["id"]
+        books = Book.manager.all()
+        assert books.first().id == lowest
+        assert books[0].id != lowest and books.first().id == lowest
+        titled = Book.manager.all(order_by="title")
+        list(titled)
+        assert titled.first().title == "Book 0"
+        assert ModelIterable._from_objects(Book, reversed(list(titled))).first().title == "Book 9"
+
 
 class TestOnly:
     @pytest.mark.parametrize("only", [["title"], ["ZTITLE"], ["title", "ztitle"], "title"])
@@ -200,6 +219,26 @@ class TestOnly:
         with pytest.raises(UnknownFieldError) as exc:
             Book.manager.all(only=only)
         assert isinstance(exc.value, KeyError) and "title" in exc.value.valid
+
+
+def test_raw_where_expressions_are_left_to_sqlite(db):
+    """Only plain column names are checked against the schema."""
+    [book] = Book.manager.filter(where=Where("lower(ZTITLE)", "book 3"))
+    assert book.title == "Book 3"
+
+
+def test_only_models_with_a_to_one_relation_keep_their_result(db):
+    """The sibling list is for batching ``Annotation.book``; books and
+    collections don't hold on to their result (and its library)."""
+    lib = db.fixture
+    for i in range(2):
+        lib.add_collection(f"Shelf {i}")
+        lib.add_annotation(lib.books[i], f"highlight {i}")
+    for model in (Book, Collection):
+        assert all("_ab_siblings" not in obj.__dict__ for obj in model.manager.all())
+    annotations = list(Annotation.manager.all())
+    siblings = annotations[0].__dict__["_ab_siblings"]
+    assert siblings == annotations and all(a.__dict__["_ab_siblings"] is siblings for a in annotations)
 
 
 class TestLegacyConstructor:

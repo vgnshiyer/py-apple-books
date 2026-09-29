@@ -4,7 +4,7 @@ import pathlib
 import configparser
 from py_apple_books.models.manager import ModelIterable, ModelManager
 from py_apple_books.models.relations import (
-    ManyToMany, OneToMany, OneToOne, ReverseManyToMany, ReverseToOne,
+    _TO_ONE_NAMES, ManyToMany, OneToMany, OneToOne, ReverseManyToMany, ReverseToOne,
 )
 
 
@@ -90,6 +90,8 @@ class ModelBase(type):
                 related_model.relations.append(backward_relation)
                 setattr(related_model, value.related_name, ReverseManyToMany(value, cls))
 
+        # A new class can add a to-one relation to an existing one.
+        _TO_ONE_NAMES.clear()
         return cls
 
 
