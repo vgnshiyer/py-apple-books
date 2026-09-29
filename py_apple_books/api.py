@@ -1,10 +1,22 @@
+import functools
+import inspect
 import pathlib
 import re
+import sqlite3
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 from py_apple_books import collection_writer
 from py_apple_books.content import BookContent, Chapter
 from py_apple_books.db.clause import Q
+from py_apple_books.db.client import (
+    USE_DEFAULT,
+    LibraryDB,
+    current_library,
+    default_library,
+    query_deadline as _query_deadline,
+    use_library,
+)
 from py_apple_books.exceptions import (
     AnnotationNotFoundError,
     AppleBooksError,
@@ -114,9 +126,155 @@ _SEARCH_ORDER = "-creation_date"
 # value says whether the order is descending.
 _RECENCY_ORDERS = {"-last_read_date": True, "last_read_date": False}
 
+# The models store_info() checks the mapped columns of.
+_MODELS = (Book, Annotation, Collection)
+
+
+def _read_at(book: Book) -> float:
+    """:attr:`Book.last_read_date` as a timestamp; a book with none
+    sorts as the oldest."""
+    when = book.last_read_date
+    return float("-inf") if when is None else when.timestamp()
+
+
+@dataclass(frozen=True)
+class LibraryStats:
+    """Counts over the library, from :meth:`PyAppleBooks.get_library_stats`.
+
+    The book counts cover the books :meth:`PyAppleBooks.list_books`
+    returns; the three status counts partition ``total_books`` as the
+    three status lists do. The annotation counts cover the annotations
+    :meth:`PyAppleBooks.list_annotations` returns; ``orphan_annotations``
+    are those whose book isn't in the store (``annotation.book`` is
+    None). ``annotations_per_book`` holds ``(book id, title, count)``
+    for every book with annotations, most annotated first (ties by id).
+    """
+
+    total_books: int
+    finished_books: int
+    in_progress_books: int
+    unstarted_books: int
+    total_annotations: int
+    orphan_annotations: int
+    annotations_per_book: Tuple[Tuple[int, str, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class StoreInfo:
+    """Which Apple Books stores a :class:`PyAppleBooks` reads, from
+    :meth:`PyAppleBooks.store_info`."""
+
+    #: The library store (books and collections).
+    library_path: pathlib.Path
+    #: The annotation store; None when there is none.
+    annotation_path: Optional[pathlib.Path]
+    #: Every ``*.sqlite`` file in the folders the stores are looked up in,
+    #: as ``{'library': [...], 'annotations': [...]}``.
+    candidates: Dict[str, List[pathlib.Path]]
+    #: ``{model name: [fields]}``: the mapped fields whose column the store
+    #: lacks (read as None). Every field of a model whose table is missing.
+    missing_columns: Dict[str, List[str]]
+    #: The version of the SQLite library in use.
+    sqlite_version: str
+    #: Seconds a query may run, or None for no limit.
+    query_timeout: Optional[float]
+
 
 class PyAppleBooks:
-    """Facade class for accessing Apple Books data."""
+    """Facade class for accessing Apple Books data.
+
+    ``PyAppleBooks()`` reads the current user's library: the stores
+    ``APPLE_BOOKS_LIBRARY_DB``, ``APPLE_BOOKS_ANNOTATION_DB`` and
+    ``APPLE_BOOKS_DATA_DIR`` name, else those in the Apple Books
+    container. It shares one pool of connections with every other
+    argument-less instance.
+
+    :param data_dir: the Apple Books Documents folder to read (holding
+        ``BKLibrary/`` and ``AEAnnotation/``).
+    :param library_db: the library store file.
+    :param annotation_db: the annotation store file.
+    :param query_timeout: seconds a query may run before it is stopped
+        with :class:`QueryTimeoutError`; None or 0 for no limit. The
+        default reads ``APPLE_BOOKS_QUERY_TIMEOUT`` (else 30 s).
+
+    Given any argument, the instance has a library of its own
+    (:class:`~py_apple_books.db.LibraryDB`); :meth:`close` it when done.
+    Its results, and their relations, keep reading that library after
+    the call returns. Given a store (``data_dir``, ``library_db`` or
+    ``annotation_db``), it ignores the location variables; a store not
+    given as a file is found in ``data_dir``, else in the Apple Books
+    container. Collection writes go to the library store the instance
+    reads. Construction does no I/O.
+    """
+
+    # The library an instance reads; None: the shared default one (and,
+    # inside a use_library() block, that block's library).
+    _db: Optional[LibraryDB] = None
+
+    def __init__(self, data_dir=None, *, library_db=None, annotation_db=None,
+                 query_timeout=USE_DEFAULT):
+        if (data_dir is not None or library_db is not None or annotation_db is not None
+                or query_timeout is not USE_DEFAULT):
+            self._db = LibraryDB(data_dir, library_db=library_db, annotation_db=annotation_db,
+                                 query_timeout=query_timeout)
+
+    def close(self) -> None:
+        """Close the idle connections of the library this instance reads
+        (the shared default one for ``PyAppleBooks()``). It stays usable:
+        the next call connects again."""
+        (self._db or default_library()).close()
+
+    def query_deadline(self, seconds: Optional[float]):
+        """A context manager that stops every query in its block still
+        running ``seconds`` from now, with :class:`QueryTimeoutError`
+        (see :func:`py_apple_books.db.query_deadline`). None changes
+        nothing."""
+        return _query_deadline(seconds)
+
+    def store_info(self) -> StoreInfo:
+        """Which stores this instance reads, the other store files next
+        to them, and the mapped columns this Apple Books version lacks.
+
+        Reads only (the stores' schema).
+
+        :raises LibraryNotFoundError: no library store.
+        :raises LibraryAccessDeniedError: macOS refused access.
+        """
+        db = current_library()
+        has_annotations = db.has_annotations()
+        paths = db.paths()
+        schema = db.schema()
+        missing = {}
+        for model in _MODELS:
+            have = {column.upper() for column in schema.get(model.manager.table_name, ())}
+            missing[model.__name__] = [field for field, column in model._get_mappings(model.__name__).items()
+                                       if column.upper() not in have]
+        return StoreInfo(
+            library_path=paths.library,
+            annotation_path=paths.annotations if has_annotations else None,
+            candidates={kind: db.candidates(kind) for kind in ("library", "annotations")},
+            missing_columns=missing,
+            sqlite_version=sqlite3.sqlite_version,
+            query_timeout=db.query_timeout,
+        )
+
+    def _write_path(self) -> Optional[pathlib.Path]:
+        """The library store the collection writes go to: the one this
+        instance reads, resolved strictly (no guessing between stores).
+        None for the default library, which the writer resolves itself
+        (``collection_writer._default_db_path``)."""
+        db = self._db if self._db is not None else current_library()
+        if db is default_library():
+            return None
+        return db.library_path(strict=True)
+
+    def _write_kwargs(self, **kwargs) -> dict:
+        """``kwargs`` for a collection_writer call, plus ``db_path`` if
+        this instance's library isn't the default one."""
+        path = self._write_path()
+        if path is not None:
+            kwargs["db_path"] = path
+        return kwargs
 
     # -- collection actions --
     #
@@ -155,28 +313,34 @@ class PyAppleBooks:
     # default, validates the schema, and runs in a single transaction.
     # See py_apple_books.collection_writer for the invariants
     # maintained and the iCloud-sync caveat.
+    #
+    # They write the library store the instance reads. If that can't be
+    # told for sure (several candidate stores and no canonical one), they
+    # raise AmbiguousStoreError rather than guess.
 
     def create_collection(self, title: str, details: str = None, backup: bool = True) -> Collection:
         """Create a user collection and return it."""
-        new_id = collection_writer.create_collection(title, details, backup=backup)
+        new_id = collection_writer.create_collection(title, details, **self._write_kwargs(backup=backup))
         return self.get_collection_by_id(new_id)
 
     def rename_collection(self, collection_id, new_title: str, backup: bool = True) -> Collection:
         """Rename a user-created collection and return it refreshed."""
-        collection_writer.rename_collection(collection_id, new_title, backup=backup)
+        collection_writer.rename_collection(collection_id, new_title, **self._write_kwargs(backup=backup))
         return self.get_collection_by_id(collection_id)
 
     def delete_collection(self, collection_id, backup: bool = True) -> None:
         """Delete a user-created collection (soft-delete; books are untouched)."""
-        collection_writer.delete_collection(collection_id, backup=backup)
+        collection_writer.delete_collection(collection_id, **self._write_kwargs(backup=backup))
 
     def add_book_to_collection(self, collection_id, book_id, backup: bool = True) -> bool:
         """Add a book to a collection. Returns False if it was already there."""
-        return collection_writer.add_book_to_collection(collection_id, book_id, backup=backup)
+        return collection_writer.add_book_to_collection(collection_id, book_id,
+                                                        **self._write_kwargs(backup=backup))
 
     def remove_book_from_collection(self, collection_id, book_id, backup: bool = True) -> bool:
         """Remove a book from a collection. Returns False if it wasn't in it."""
-        return collection_writer.remove_book_from_collection(collection_id, book_id, backup=backup)
+        return collection_writer.remove_book_from_collection(collection_id, book_id,
+                                                             **self._write_kwargs(backup=backup))
 
     # -- book actions --
     #
@@ -404,17 +568,63 @@ class PyAppleBooks:
         limit = normalize_limit(limit)
         start = normalize_offset(offset) or 0
         base = Book.manager.filter(last_opened_date__isnull=False, **_owned_books_filter())
-        rows = base.run_query()
-        keys = list(Book._get_mappings("Book"))
-        i_open, i_engaged, i_id = (keys.index(k) for k in ("last_opened_date", "last_engaged_date", "id"))
+        # Each book with its raw row, which the result keeps as well: its
+        # count_by() groups raw values, as on the SQL-ordered results.
+        pairs = list(zip(base, base._fetch()))
+        pairs.sort(key=lambda pair: (-_read_at(pair[0]) if descending else _read_at(pair[0]), pair[0].id))
+        pairs = pairs[start:] if limit is None else pairs[start:start + limit]
+        result = ModelIterable._from_objects(Book, [book for book, _ in pairs], db=current_library())
+        result._rows = [row for _, row in pairs]
+        return result
 
-        def read_at(row) -> float:
-            # Raw Core Data seconds; NULL sorts as the oldest.
-            return max(float("-inf") if row[i] is None else float(row[i]) for i in (i_open, i_engaged))
+    # -- counts --
+    #
+    # Counted in SQL with the predicates of the lists they count, so a
+    # count always equals the length of its list.
 
-        rows = sorted(rows, key=lambda row: (-read_at(row) if descending else read_at(row), row[i_id]))
-        sliced = rows[start:] if limit is None else rows[start:start + limit]
-        return ModelIterable(lambda: sliced, Book)
+    def count_books_by_status(self) -> Dict[ReadingStatus, int]:
+        """The number of books in each reading status: the lengths of
+        :meth:`get_finished_books`, :meth:`get_books_in_progress` and
+        :meth:`get_unstarted_books`, which add up to :meth:`list_books`.
+        Keys are :class:`ReadingStatus` members, which also match their
+        string values (``counts['finished']``)."""
+        return {status: Book.manager.count(**_owned_books_filter(), **filters)
+                for status, filters in _STATUS_FILTERS.items()}
+
+    def count_annotations(self, book_id=None) -> int:
+        """The number of annotations :meth:`list_annotations` returns, or
+        with ``book_id`` that book's (``len(book.annotations)``).
+
+        :raises BookNotFoundError: no book has that id. An
+            :class:`IndexError` subclass.
+        """
+        if book_id is None:
+            return Annotation.manager.count(**_LIVE_ANNOTATIONS)
+        return self.get_book_by_id(book_id).annotations.count()
+
+    def get_library_stats(self) -> LibraryStats:
+        """Book and annotation counts for the whole library, in five
+        statements (see :class:`LibraryStats`)."""
+        counts = self.count_books_by_status()
+        per_asset = Annotation.manager.filter(**_LIVE_ANNOTATIONS).count_by("asset_id")
+        # Every book row, as annotation.book finds them: Store series
+        # items included, and the lowest id for an asset id two rows share.
+        books: Dict[str, Book] = {}
+        for book in Book.manager.all(only=["id", "asset_id", "title"], order_by="id"):
+            if book.asset_id is not None:
+                books.setdefault(book.asset_id, book)
+        per_book = sorted(((books[asset].id, books[asset].title, n)
+                           for asset, n in per_asset.items() if asset in books),
+                          key=lambda entry: (-entry[2], entry[0]))
+        return LibraryStats(
+            total_books=sum(counts.values()),
+            finished_books=counts[ReadingStatus.FINISHED],
+            in_progress_books=counts[ReadingStatus.IN_PROGRESS],
+            unstarted_books=counts[ReadingStatus.UNSTARTED],
+            total_annotations=sum(per_asset.values()),
+            orphan_annotations=sum(n for asset, n in per_asset.items() if asset not in books),
+            annotations_per_book=tuple(per_book),
+        )
 
     # -- content actions --
     def get_book_content(self, book_id: int) -> BookContent:
@@ -631,3 +841,25 @@ class PyAppleBooks:
             chars_before,
             chars_after,
         )
+
+
+def _in_library(method):
+    """``method``, run with its instance's library as the current one."""
+    @functools.wraps(method)
+    def call(self, *args, **kwargs):
+        with use_library(self._db):
+            return method(self, *args, **kwargs)
+    return call
+
+
+def _bind_library(cls) -> None:
+    """Make every public method of ``cls`` read its instance's library
+    (:func:`use_library`; the current one for ``PyAppleBooks()``). Results
+    keep reading it after the call: models and iterables hold the library
+    they were read from."""
+    for name, attr in list(vars(cls).items()):
+        if not name.startswith("_") and inspect.isfunction(attr):
+            setattr(cls, name, _in_library(attr))
+
+
+_bind_library(PyAppleBooks)

@@ -1,8 +1,8 @@
 import logging
 
-from .api import PyAppleBooks
+from .api import PyAppleBooks, LibraryStats
 
-__all__ = ['PyAppleBooks']
+__all__ = ['PyAppleBooks', 'LibraryStats']
 
 __version__ = '1.9.1'
 

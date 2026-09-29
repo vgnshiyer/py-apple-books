@@ -141,7 +141,12 @@ def _cd_now() -> float:
 
 
 def _default_db_path() -> Path:
-    return find_sqlite_file(AppleBooksDBClient.book_lib_db[1])
+    """The default library's store file (:func:`default_library`, which
+    honours ``APPLE_BOOKS_LIBRARY_DB`` and then ``APPLE_BOOKS_DATA_DIR``),
+    found strictly: several candidate stores raise
+    :class:`AmbiguousStoreError` instead of a guess."""
+    from py_apple_books.db.client import default_library
+    return default_library().library_path(strict=True)
 
 
 class WriteSession:
@@ -150,8 +155,9 @@ class WriteSession:
     Context manager: guards run on ``__enter__``, the transaction
     commits on clean exit and rolls back on any exception.
 
-    :param db_path: Override the library database path (tests point
-        this at a fixture copy; production leaves it None).
+    :param db_path: The library database to write. None means the
+        default library's (``PyAppleBooks()``); a ``PyAppleBooks`` with
+        a library of its own passes that library's store.
     :param backup: Take a pre-write backup. On by default; only tests
         should turn this off.
     :param backup_dir: Override the backup directory.
