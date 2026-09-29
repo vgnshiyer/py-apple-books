@@ -4,24 +4,96 @@ on:
   release:
     types: [published]
 
+permissions: {}
+
 jobs:
-  deploy:
-    runs-on: ubuntu-latest
+  build:
+    # Everything that runs third-party code happens here, without the
+    # OIDC token. The publish job only uploads what this job built.
+    runs-on: macos-latest
+    permissions:
+      contents: read # checkout
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+      # Same interpreter as the CI dist leg that uploads its dist/.
+      PYTHON: "3.10"
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: '3.x'
-      - run: python -m pip install --upgrade pip
-
-      - name: Install dependencies
-        run: pip install setuptools wheel twine
-
-      - name: Build package
-        run: python setup.py sdist bdist_wheel
-
-      - name: Publish package
-        run: twine upload dist/*
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          # Release builds never restore a cache a PR run could have written.
+          enable-cache: false
+      - name: Check the release tag matches __version__
         env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 - <<'EOF'
+          import os, re, sys
+          with open('py_apple_books/__init__.py') as f:
+              match = re.search(
+                  r"^__version__ = ['\"]([^'\"]+)['\"]", f.read(), re.M
+              )
+          if match is None:
+              sys.exit('::error::No __version__ in py_apple_books/__init__.py.')
+          version = match.group(1)
+          tag = os.environ['RELEASE_TAG']
+          if tag != f'v{version}':
+              sys.exit(
+                  f'::error::Release tag {tag!r} does not match '
+                  f'__version__ {version!r}; expected v{version}.'
+              )
+          print(f'Release tag {tag} matches __version__ {version}.')
+          EOF
+      - name: Build
+        run: uv build -p "$PYTHON"
+      - name: Check metadata
+        run: uvx twine check --strict dist/*
+      - name: Check contents against the 1.9.1 wheel
+        run: |
+          uvx pip download --no-deps --only-binary :all: py-apple-books==1.9.1 -d base/
+          uv run --no-project -p "$PYTHON" python scripts/check_dist.py --baseline-wheel base/py_apple_books-1.9.1-py3-none-any.whl
+      - name: Run tests against the installed wheel
+        run: |
+          venv="$RUNNER_TEMP/venv"
+          uv venv -p "$PYTHON" "$venv"
+          uv pip install -p "$venv" dist/*.whl --group dev
+          export HOME="$RUNNER_TEMP/home"
+          d="$HOME/Library/Containers/com.apple.iBooksX/Data/Documents"
+          mkdir -p "$d/BKLibrary" "$d/AEAnnotation"
+          touch "$d/BKLibrary/BKLibrary-stub.sqlite" "$d/AEAnnotation/AEAnnotation-stub.sqlite"
+          mkdir "$RUNNER_TEMP/wheel-tests"
+          cp -R tests pyproject.toml "$RUNNER_TEMP/wheel-tests/"
+          cd "$RUNNER_TEMP/wheel-tests"
+          "$venv/bin/python" -c 'import importlib.metadata as md, py_apple_books as p; assert "site-packages" in p.__file__, p.__file__; assert md.version("py-apple-books") == p.__version__, (md.version("py-apple-books"), p.__version__)'
+          "$venv/bin/python" -m pytest -q
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/py-apple-books/
+    permissions:
+      id-token: write # Trusted Publishing and PEP 740 attestations
+    steps:
+      # download-artifact v8 reads upload-artifact v7's (zipped) artifacts;
+      # these are the current majors of each.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          # While the PYPI_API_TOKEN secret exists, the upload uses it. Once
+          # the owner registers this workflow (environment pypi) as a PyPI
+          # Trusted Publisher and deletes the secret, this expands to '' and
+          # the same step authenticates with OIDC and uploads PEP 740
+          # attestations.
+          password: ${{ secrets.PYPI_API_TOKEN }} # zizmor: ignore[use-trusted-publishing]
