@@ -9,6 +9,21 @@ updates:
     directory: "/" # Location of package manifests
     schedule:
       interval: "weekly"
+    # Let a new release age a week before proposing it, so a compromised
+    # upload is usually yanked before it reaches a PR.
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "[Dependabot]"
     open-pull-requests-limit: 10
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "[Dependabot]"
+    groups:
+      github-actions:
+        patterns: ["*"]
