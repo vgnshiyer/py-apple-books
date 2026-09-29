@@ -1,2 +1,3 @@
-# search_annotations {"text": "don't"} isError=True
-Error executing tool search_annotations: Error executing query: near "t": syntax error
+# search_annotations {"text": "don't"} isError=False
+Synthetic Book (Test Author):
+  [9] Don't panic, it's 100% fine. — Chapter 2 (ch=chap2)

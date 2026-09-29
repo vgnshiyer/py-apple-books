@@ -2,6 +2,8 @@ import sqlite3
 from pathlib import Path
 from urllib.parse import quote
 from py_apple_books.db.exceptions import DBError, DBConnectionError, DBQueryError
+from py_apple_books.db.query import adapt_params
+from py_apple_books.text import fold_for_match
 
 
 def find_sqlite_file(directory: Path) -> Path:
@@ -30,6 +32,21 @@ def _read_only_uri(db_file: Path) -> str:
     return f"file:{quote(str(db_file))}?mode=ro"
 
 
+def _register_functions(conn: sqlite3.Connection) -> None:
+    """Register the SQL functions read queries use.
+
+    ``abk_fold(text)`` is :func:`py_apple_books.text.fold_for_match`,
+    for the ``__search`` lookup. Name, argument count and function are
+    passed positionally: the keyword forms are deprecated since
+    Python 3.13.
+    """
+    try:
+        conn.create_function('abk_fold', 1, fold_for_match, deterministic=True)
+    except sqlite3.NotSupportedError:
+        # SQLite older than 3.8.3 has no deterministic flag.
+        conn.create_function('abk_fold', 1, fold_for_match)
+
+
 class DBClient:
     def _get_sqlite_file(self, path: Path) -> Path:
         return find_sqlite_file(path)
@@ -41,9 +58,12 @@ class DBClient:
             # statements below, so the attached databases inherit
             # read-only mode.
             conn = sqlite3.connect(_read_only_uri(self._get_sqlite_file(first_path)), uri=True)
+            _register_functions(conn)
             cursor = conn.cursor()
             for db_name, path in paths[1:]:
-                cursor.execute(f"ATTACH DATABASE '{_read_only_uri(self._get_sqlite_file(path))}' AS {db_name}")
+                # The URI is bound; db_name is a class constant.
+                cursor.execute("ATTACH DATABASE ? AS " + db_name,
+                               (_read_only_uri(self._get_sqlite_file(path)),))
             self.conn = conn
             return cursor
         except DBConnectionError:
@@ -78,11 +98,14 @@ class AppleBooksDBClient(DBClient):
     def __init__(self):
         self.cursor = self._get_cursor(paths=[self.book_lib_db, self.anno_db])
 
-    def execute(self, query: str) -> list:
+    def execute(self, query: str, params=()) -> list:
+        """Run ``query`` with ``params`` bound (see
+        :func:`~py_apple_books.db.query.adapt_params`) and return all rows."""
         try:
-            self.cursor.execute(query)
+            self.cursor.execute(query, adapt_params(params or ()))
             return self.cursor.fetchall()
         except sqlite3.Error as e:
-            raise DBQueryError(f"Error executing query: {e}")
+            raise DBQueryError(f"Error executing query: {e}") from e
         except Exception as e:
-            raise DBError(f"Unexpected error while executing query: {e}")
+            # A DBQueryError is also the DBError raised here before 1.10.
+            raise DBQueryError(f"Unexpected error while executing query: {e}") from e

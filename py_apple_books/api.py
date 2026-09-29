@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Optional
 from py_apple_books import collection_writer
 from py_apple_books.content import BookContent, Chapter
+from py_apple_books.db.clause import Q
 from py_apple_books.exceptions import (
     AppleBooksError,
     BookNotDownloadedError,
@@ -36,9 +37,10 @@ class PyAppleBooks:
     # Deleted collections are soft-deleted tombstones (ZDELETEDFLAG=1)
     # kept for iCloud sync — user-facing reads exclude them.
 
-    def list_collections(self, limit: int = None, order_by: str = None) -> ModelIterable:
+    def list_collections(self, limit: int = None, order_by: str = None, *,
+                         offset: int = None) -> ModelIterable:
         """List all collections (excluding deleted ones)."""
-        return Collection.manager.filter(is_deleted=0, limit=limit, order_by=order_by)
+        return Collection.manager.filter(is_deleted=0, limit=limit, order_by=order_by, offset=offset)
 
     def get_collection_by_id(self, collection_id: str) -> Collection:
         """Get a collection and its books.
@@ -52,9 +54,11 @@ class PyAppleBooks:
         except IndexError:
             raise CollectionNotFoundError(f"No collection with id {collection_id}.")
 
-    def get_collection_by_title(self, title: str) -> ModelIterable:
+    def get_collection_by_title(self, title: str, *, limit: int = None, order_by: str = None,
+                                offset: int = None) -> ModelIterable:
         """Get a collection and its books."""
-        return Collection.manager.filter(title__contains=title, is_deleted=0)
+        return Collection.manager.filter(title__contains=title, is_deleted=0,
+                                         limit=limit, order_by=order_by, offset=offset)
 
     # -- collection write actions --
     #
@@ -88,21 +92,24 @@ class PyAppleBooks:
         return collection_writer.remove_book_from_collection(collection_id, book_id, backup=backup)
 
     # -- book actions --
-    def list_books(self, limit: int = None, order_by: str = None) -> ModelIterable:
+    def list_books(self, limit: int = None, order_by: str = None, *,
+                   offset: int = None) -> ModelIterable:
         """List all books."""
-        return Book.manager.all(limit=limit, order_by=order_by)
+        return Book.manager.all(limit=limit, order_by=order_by, offset=offset)
 
     def get_book_by_id(self, book_id: str) -> Book:
         """Get a book and its annotations."""
         return Book.manager.filter(id=book_id)[0]
 
-    def get_book_by_title(self, title: str) -> ModelIterable:
+    def get_book_by_title(self, title: str, *, limit: int = None, order_by: str = None,
+                          offset: int = None) -> ModelIterable:
         """Get a book by title."""
-        return Book.manager.filter(title__contains=title)
+        return Book.manager.filter(title__contains=title, limit=limit, order_by=order_by, offset=offset)
 
-    def get_books_by_genre(self, genre: str, limit: int = None, order_by: str = None) -> ModelIterable:
+    def get_books_by_genre(self, genre: str, limit: int = None, order_by: str = None, *,
+                           offset: int = None) -> ModelIterable:
         """Get books whose genre contains the given string (case-sensitive)."""
-        return Book.manager.filter(genre__contains=genre, limit=limit, order_by=order_by)
+        return Book.manager.filter(genre__contains=genre, limit=limit, order_by=order_by, offset=offset)
 
     # -- annotation actions --
     #
@@ -111,7 +118,8 @@ class PyAppleBooks:
     # empty text, not user-created highlights or notes — callers that want
     # them specifically should use :meth:`get_current_reading_location`.
 
-    def list_annotations(self, limit: int = None, order_by: str = None) -> ModelIterable:
+    def list_annotations(self, limit: int = None, order_by: str = None, *,
+                         offset: int = None) -> ModelIterable:
         """List all user-created annotations (highlights and notes).
 
         Excludes Apple Books' auto-tracked reading-position bookmarks.
@@ -120,6 +128,7 @@ class PyAppleBooks:
             type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
             limit=limit,
             order_by=order_by,
+            offset=offset,
         )
 
     def get_annotation_by_id(self, annotation_id: str) -> Annotation:
@@ -127,7 +136,8 @@ class PyAppleBooks:
         caller has already obtained the id from a specific API)."""
         return Annotation.manager.filter(id=annotation_id)[0]
 
-    def get_annotations_by_color(self, color: str, limit: int = None, order_by: str = None) -> ModelIterable:
+    def get_annotations_by_color(self, color: str, limit: int = None, order_by: str = None, *,
+                                 offset: int = None) -> ModelIterable:
         """Get user highlights by color."""
         style = AnnotationColor[color.upper()].value
         # The color filter (style in 1..5) already excludes bookmarks
@@ -138,57 +148,53 @@ class PyAppleBooks:
             type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
             limit=limit,
             order_by=order_by,
+            offset=offset,
         )
 
-    def search_annotation_by_highlighted_text(self, text: str,
-                                              limit: int = None, order_by: str = None) -> ModelIterable:
+    def search_annotation_by_highlighted_text(self, text: str, limit: int = None,
+                                              order_by: str = None, *,
+                                              offset: int = None) -> ModelIterable:
         """Search user annotations by highlighted text."""
         return Annotation.manager.filter(
             selected_text__contains=text,
             type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
             limit=limit,
             order_by=order_by,
+            offset=offset,
         )
 
-    def search_annotation_by_note(self, note: str, limit: int = None, order_by: str = None) -> ModelIterable:
+    def search_annotation_by_note(self, note: str, limit: int = None, order_by: str = None, *,
+                                  offset: int = None) -> ModelIterable:
         """Search user annotations by note."""
         return Annotation.manager.filter(
             note__contains=note,
             type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
             limit=limit,
             order_by=order_by,
+            offset=offset,
         )
 
-    def search_annotation_by_text(self, text: str, limit: int = None, order_by: str = None):
-        """Search user annotations by any text that contains the given text.
+    def search_annotation_by_text(self, text: str, limit: int = None, order_by: str = None, *,
+                                  offset: int = None):
+        """Search user annotations whose highlighted text, surrounding
+        text or note contains the given text.
 
-        The OR across ``selected_text`` / ``representative_text`` / ``note``
-        can't cleanly combine with an AND on ``type`` in the current
-        manager (``use_or`` applies to every WHERE clause uniformly),
-        so we over-fetch from the manager and strip bookmarks in
-        Python. The over-fetch factor compensates for the filter loss
-        when the caller supplies a limit.
-
-        Returns a list (not a :class:`ModelIterable`) to reflect the
-        post-processing step.
+        Returns a list (not a :class:`ModelIterable`), as before 1.10.
         """
-        fetch_limit = (limit * 2) if limit else None
-        raw = list(Annotation.manager.filter(
-            selected_text__contains=text,
-            representative_text__contains=text,
-            note__contains=text,
-            use_or=True,
-            limit=fetch_limit,
+        matches = Annotation.manager.filter(
+            where=Q(selected_text__contains=text) | Q(representative_text__contains=text) | Q(note__contains=text),
+            type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
+            limit=limit,
             order_by=order_by,
-        ))
-        filtered = [
-            a for a in raw
-            if getattr(a, "type", None) != _ANNOTATION_TYPE_READING_BOOKMARK
-        ]
-        return filtered[:limit] if limit else filtered
+            offset=offset,
+        )
+        # iter() first: list() on the ModelIterable itself would also call
+        # its __len__, which runs the query a second time.
+        return list(iter(matches))
 
     def get_annotations_by_date_range(self, after: datetime = None, before: datetime = None,
-                                       limit: int = None, order_by: str = None) -> ModelIterable:
+                                       limit: int = None, order_by: str = None, *,
+                                       offset: int = None) -> ModelIterable:
         """Get user annotations within a date range.
 
         Args:
@@ -196,37 +202,40 @@ class PyAppleBooks:
             before: Only include annotations created before this datetime.
             limit: Maximum number of results.
             order_by: Field to sort by (prefix with - for descending).
+            offset: Number of results to skip.
         """
         kwargs = {"type__ne": _ANNOTATION_TYPE_READING_BOOKMARK}
         if after:
             kwargs["creation_date__gte"] = after.timestamp() - APPLE_EPOCH_OFFSET
         if before:
             kwargs["creation_date__lte"] = before.timestamp() - APPLE_EPOCH_OFFSET
-        if limit:
-            kwargs["limit"] = limit
-        if order_by:
-            kwargs["order_by"] = order_by
-        return Annotation.manager.filter(**kwargs)
+        return Annotation.manager.filter(**kwargs, limit=limit, order_by=order_by, offset=offset)
 
     # -- reading progress actions --
-    def get_books_in_progress(self, limit: int = None, order_by: str = None) -> ModelIterable:
+    def get_books_in_progress(self, limit: int = None, order_by: str = None, *,
+                              offset: int = None) -> ModelIterable:
         """Get books that are currently being read (progress > 0% and < 100%)."""
         return Book.manager.filter(reading_progress__gt=0, 
                                   reading_progress__lt=100, 
                                   limit=limit, 
-                                  order_by=order_by)
+                                  order_by=order_by,
+                                  offset=offset)
 
-    def get_finished_books(self, limit: int = None, order_by: str = None) -> ModelIterable:
+    def get_finished_books(self, limit: int = None, order_by: str = None, *,
+                           offset: int = None) -> ModelIterable:
         """Get books that are marked as finished."""
-        return Book.manager.filter(is_finished=True, limit=limit, order_by=order_by)
+        return Book.manager.filter(is_finished=True, limit=limit, order_by=order_by, offset=offset)
 
-    def get_unstarted_books(self, limit: int = None, order_by: str = None) -> ModelIterable:
+    def get_unstarted_books(self, limit: int = None, order_by: str = None, *,
+                            offset: int = None) -> ModelIterable:
         """Get books that haven't been started (progress = 0% or None)."""
-        return Book.manager.filter(reading_progress__lte=0, limit=limit, order_by=order_by)
+        return Book.manager.filter(reading_progress__lte=0, limit=limit, order_by=order_by, offset=offset)
 
-    def get_recently_read_books(self, limit: int = 10, order_by: str = "-last_opened_date") -> ModelIterable:
+    def get_recently_read_books(self, limit: int = 10, order_by: str = "-last_opened_date", *,
+                                offset: int = None) -> ModelIterable:
         """Get recently opened books, ordered by last opened date."""
-        return Book.manager.filter(last_opened_date__isnull=False, limit=limit, order_by=order_by)
+        return Book.manager.filter(last_opened_date__isnull=False, limit=limit, order_by=order_by,
+                                   offset=offset)
 
     # -- content actions --
     def get_book_content(self, book_id: int) -> BookContent:

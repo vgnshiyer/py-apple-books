@@ -1,2 +1,8 @@
-# list_all_books {"limit": 99999999999999999999} isError=True
-Error executing tool list_all_books: Error executing query: datatype mismatch
+# list_all_books {"limit": 99999999999999999999} isError=False
+[1] Synthetic Book by Test Author
+[2] Don't Panic by Second Author
+[3] Finished At Zero by Test Author
+[4] Unopened Book by Test Author
+[5] Series Stack by Test Author
+[6] Owned Series Volume by Test Author
+[7] Locked Store Book by Store Author
