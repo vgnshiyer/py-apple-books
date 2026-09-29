@@ -8,6 +8,7 @@ from py_apple_books.exceptions import (
     AppleBooksError,
     BookNotDownloadedError,
     CollectionNotFoundError,
+    DBError,
     DRMProtectedError,
 )
 from py_apple_books.models import Book, Collection, Annotation, AnnotationColor
@@ -399,6 +400,10 @@ class PyAppleBooks:
             chapter_text = content._spine_item_text(
                 annotation.location.chapter_id
             )
+        except DBError:
+            # An AppleBooksError since 1.10, but a database failure isn't
+            # an unreadable book: let it propagate, as it did before.
+            raise
         except AppleBooksError:
             return ""
 
