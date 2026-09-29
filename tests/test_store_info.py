@@ -7,7 +7,7 @@ import sqlite3
 
 import pytest
 
-from py_apple_books import PyAppleBooks
+from py_apple_books import PyAppleBooks, write_safety
 from py_apple_books.api import StoreInfo
 from py_apple_books.db import LibraryDB, use_library
 from py_apple_books.db.client import ANNOTATION_RETRY
@@ -41,6 +41,7 @@ def test_normal_library(lib, monkeypatch):
         missing_columns=NOTHING_MISSING,
         sqlite_version=sqlite3.sqlite_version,
         query_timeout=30.0,
+        backup_dir=info.backup_dir,
     )
     assert info_of(lib, query_timeout=None).query_timeout is None
     assert info_of(lib, query_timeout=2).query_timeout == 2.0
@@ -52,6 +53,25 @@ def test_default_instance(library):
     info = PyAppleBooks().store_info()
     assert (info.library_path, info.annotation_path) == (library.library_path, library.annotation_path)
     assert info.missing_columns == NOTHING_MISSING
+    assert info.backup_dir == write_safety.BACKUP_DIR
+
+
+def test_backup_dir_is_one_per_store(make_library, monkeypatch, tmp_path):
+    """An instance's writes back up into a folder of their own per store,
+    under BACKUP_DIR (read when asked), whatever the store is called."""
+    monkeypatch.setattr(write_safety, "BACKUP_DIR", tmp_path / "backups")
+    one, two = make_library(), make_library()
+    first = info_of(one).backup_dir
+    assert first.parent == tmp_path / "backups" / "libraries"
+    assert info_of(one).backup_dir == first
+    assert info_of(one, query_timeout=5).backup_dir == first
+    api = PyAppleBooks(library_db=one.library_path, annotation_db=one.annotation_path)
+    try:
+        assert api.store_info().backup_dir == first
+    finally:
+        api.close()
+    assert info_of(two).backup_dir not in (first, write_safety.BACKUP_DIR)
+    assert one.library_path.name == two.library_path.name
 
 
 def test_missing_annotation_store(lib):

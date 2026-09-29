@@ -36,14 +36,16 @@ reverted by a cloud re-sync. Callers should surface that caveat.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 import uuid
 from pathlib import Path
 from typing import Optional
 
-from py_apple_books.db.client import AppleBooksDBClient, find_sqlite_file
+from py_apple_books.db.client import AppleBooksDBClient, _store, find_sqlite_file
 from py_apple_books.exceptions import (
+    AmbiguousStoreError,
     BookNotFoundError,
     CollectionNotFoundError,
     LibraryBusyError,
@@ -140,13 +142,50 @@ def _cd_now() -> float:
     return time.time() - APPLE_EPOCH_OFFSET
 
 
+def _store_for_writes(db) -> Path:
+    """The library store file the writes to ``db`` (a
+    :class:`~py_apple_books.db.LibraryDB`) go to.
+
+    Found strictly (:meth:`LibraryDB.library_path`), and only if it is
+    the file ``db``'s reads use. A store found in a folder, not given as
+    a file, must be the canonical one or, if there is no canonical file,
+    a single store with Apple's generation-stamped name: a canonical file
+    that fails validation for a moment (busy, say) doesn't send the write
+    to a copy, a ``.old`` file or a backup next to it. Otherwise
+    :class:`AmbiguousStoreError`, before anything is opened for writing.
+    """
+    path = db.library_path(strict=True)
+    store = _store("library")
+    folder = f"{store.subdir}/"
+    if db._source("library")[0] is None and path.name != store.canonical:
+        if os.path.lexists(path.parent / store.canonical):
+            raise AmbiguousStoreError(
+                f"The Apple Books library store {store.canonical} in {folder} can't be read "
+                f"right now (busy or damaged), so the write won't go to {path.name} instead. "
+                "Nothing was changed; try again in a moment.")
+        if not store.generation.fullmatch(path.name):
+            raise AmbiguousStoreError(
+                f"The only library store in {folder} is {path.name}, which isn't named like "
+                "the store Apple Books uses (a copy or a backup?); refusing to write to it.")
+    read = db.paths().library
+    try:
+        same = os.path.samefile(path, read)
+    except OSError:
+        same = False
+    if not same:
+        raise AmbiguousStoreError(
+            f"The library store found for this write ({path.name}) isn't the file being read "
+            f"({read.name}): the store's location changed while in use. Nothing was changed.")
+    return path
+
+
 def _default_db_path() -> Path:
     """The default library's store file (:func:`default_library`, which
     honours ``APPLE_BOOKS_LIBRARY_DB`` and then ``APPLE_BOOKS_DATA_DIR``),
-    found strictly: several candidate stores raise
-    :class:`AmbiguousStoreError` instead of a guess."""
+    found strictly (see :func:`_store_for_writes`): several candidate
+    stores raise :class:`AmbiguousStoreError` instead of a guess."""
     from py_apple_books.db.client import default_library
-    return default_library().library_path(strict=True)
+    return _store_for_writes(default_library())
 
 
 class WriteSession:

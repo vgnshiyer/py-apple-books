@@ -1,12 +1,14 @@
 import functools
+import hashlib
 import inspect
+import os
 import pathlib
 import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
-from py_apple_books import collection_writer
+from py_apple_books import collection_writer, write_safety
 from py_apple_books.content import BookContent, Chapter
 from py_apple_books.db.clause import Q
 from py_apple_books.db.client import (
@@ -137,6 +139,18 @@ def _read_at(book: Book) -> float:
     return float("-inf") if when is None else when.timestamp()
 
 
+def _backup_dir_for(path) -> pathlib.Path:
+    """The folder the pre-write backups of the library store ``path``
+    go to when a :class:`PyAppleBooks` writes a library of its own: one
+    per store under :data:`write_safety.BACKUP_DIR`. Backups are told
+    apart by file name, which every copy of a library shares, so a
+    folder of their own keeps one library's backups from being reused
+    or pruned as another's. ``PyAppleBooks()`` backs up into
+    ``BACKUP_DIR`` itself, as before."""
+    key = hashlib.sha256(os.fsencode(pathlib.Path(path).resolve())).hexdigest()[:16]
+    return write_safety.BACKUP_DIR / "libraries" / key
+
+
 @dataclass(frozen=True)
 class LibraryStats:
     """Counts over the library, from :meth:`PyAppleBooks.get_library_stats`.
@@ -178,6 +192,13 @@ class StoreInfo:
     sqlite_version: str
     #: Seconds a query may run, or None for no limit.
     query_timeout: Optional[float]
+    #: Where collection writes back the library store up to: pass it as
+    #: ``backup_dir`` to :func:`~py_apple_books.write_safety.list_backups`
+    #: and :func:`~py_apple_books.write_safety.restore_library` (with
+    #: ``db_path=library_path``). ``write_safety.BACKUP_DIR`` for
+    #: ``PyAppleBooks()``; a folder of its own, under it, for each store
+    #: an instance given a library of its own writes.
+    backup_dir: pathlib.Path
 
 
 class PyAppleBooks:
@@ -204,7 +225,8 @@ class PyAppleBooks:
     ``annotation_db``), it ignores the location variables; a store not
     given as a file is found in ``data_dir``, else in the Apple Books
     container. Collection writes go to the library store the instance
-    reads. Construction does no I/O.
+    reads, and back it up into a folder of its own
+    (``store_info().backup_dir``). Construction does no I/O.
     """
 
     # The library an instance reads; None: the shared default one (and,
@@ -233,7 +255,8 @@ class PyAppleBooks:
 
     def store_info(self) -> StoreInfo:
         """Which stores this instance reads, the other store files next
-        to them, and the mapped columns this Apple Books version lacks.
+        to them, the mapped columns this Apple Books version lacks, and
+        where collection writes back the library up to.
 
         Reads only (the stores' schema).
 
@@ -256,24 +279,29 @@ class PyAppleBooks:
             missing_columns=missing,
             sqlite_version=sqlite3.sqlite_version,
             query_timeout=db.query_timeout,
+            backup_dir=(write_safety.BACKUP_DIR if db is default_library()
+                        else _backup_dir_for(paths.library)),
         )
 
     def _write_path(self) -> Optional[pathlib.Path]:
         """The library store the collection writes go to: the one this
-        instance reads, resolved strictly (no guessing between stores).
-        None for the default library, which the writer resolves itself
+        instance reads, resolved strictly (no guessing between stores;
+        see ``collection_writer._store_for_writes``). None for the default
+        library, which the writer resolves itself, the same way
         (``collection_writer._default_db_path``)."""
         db = self._db if self._db is not None else current_library()
         if db is default_library():
             return None
-        return db.library_path(strict=True)
+        return collection_writer._store_for_writes(db)
 
     def _write_kwargs(self, **kwargs) -> dict:
-        """``kwargs`` for a collection_writer call, plus ``db_path`` if
-        this instance's library isn't the default one."""
+        """``kwargs`` for a collection_writer call, plus, if this
+        instance's library isn't the default one, its store (``db_path``)
+        and that store's backup folder (``backup_dir``)."""
         path = self._write_path()
         if path is not None:
             kwargs["db_path"] = path
+            kwargs["backup_dir"] = _backup_dir_for(path)
         return kwargs
 
     # -- collection actions --
@@ -315,8 +343,9 @@ class PyAppleBooks:
     # maintained and the iCloud-sync caveat.
     #
     # They write the library store the instance reads. If that can't be
-    # told for sure (several candidate stores and no canonical one), they
-    # raise AmbiguousStoreError rather than guess.
+    # told for sure (several candidate stores and no canonical one, a
+    # canonical one that can't be read, only a copy, or a store other than
+    # the one being read), they raise AmbiguousStoreError rather than guess.
 
     def create_collection(self, title: str, details: str = None, backup: bool = True) -> Collection:
         """Create a user collection and return it."""

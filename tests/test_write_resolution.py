@@ -4,8 +4,10 @@ Writes go to the store the reads resolve, found strictly: the default
 library (``PyAppleBooks()``, ``collection_writer._default_db_path``)
 honours ``APPLE_BOOKS_LIBRARY_DB`` and then ``APPLE_BOOKS_DATA_DIR``; a
 ``PyAppleBooks`` given a store writes that store whatever the
-environment says. Several candidate stores and no canonical one raise
-``AmbiguousStoreError`` instead of a guess.
+environment says. Several candidate stores and no canonical one, a
+canonical one that fails validation, a lone copy, or a store other than
+the one being read raise ``AmbiguousStoreError`` instead of a guess.
+An instance's writes back up into a folder of their own per store.
 
 Synthetic libraries only; the Books.app check is switched off.
 """
@@ -14,11 +16,12 @@ import hashlib
 import os
 import shutil
 import sqlite3
+from pathlib import Path
 
 import pytest
 
 from py_apple_books import PyAppleBooks, collection_writer, write_safety
-from py_apple_books.db import use_library
+from py_apple_books.db import client, use_library
 from py_apple_books.exceptions import AmbiguousStoreError, DBConnectionError, WriteError
 
 LOCATION_VARS = ("APPLE_BOOKS_DATA_DIR", "APPLE_BOOKS_LIBRARY_DB", "APPLE_BOOKS_ANNOTATION_DB")
@@ -53,6 +56,14 @@ def titles(lib) -> list:
 
 def digest(path) -> str:
     return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+def backup_titles(path) -> list:
+    conn = sqlite3.connect(path)
+    try:
+        return [t for (t,) in conn.execute("SELECT ZTITLE FROM ZBKCOLLECTION ORDER BY Z_PK")]
+    finally:
+        conn.close()
 
 
 def two_generations(lib):
@@ -163,6 +174,8 @@ def test_write_path_is_the_instance_store(decoyed):
         assert files._write_path() == mine.library_path
         assert PyAppleBooks()._write_path() is None
         assert PyAppleBooks(query_timeout=5)._write_path() == decoy.library_path
+        assert api._write_kwargs(backup=True) == {
+            "backup": True, "db_path": mine.library_path, "backup_dir": api.store_info().backup_dir}
     finally:
         api.close()
         files.close()
@@ -193,15 +206,55 @@ def test_backup_is_of_the_instance_store(decoyed, tmp_path):
     api = PyAppleBooks(data_dir=mine.data_dir)
     try:
         api.create_collection("Backed Up")
+        backup_dir = api.store_info().backup_dir
     finally:
         api.close()
+    assert backup_dir.parent == tmp_path / "backups" / "libraries"
     # Both stores have the canonical name; the backup's rows tell them apart.
-    [backup] = write_safety.list_backups(mine.library_path, tmp_path / "backups")
-    conn = sqlite3.connect(backup)
+    [backup] = write_safety.list_backups(mine.library_path, backup_dir)
+    assert backup_titles(backup) == ["mine shelf"]
+    # None where the default library's backups go.
+    assert write_safety.list_backups(mine.library_path, tmp_path / "backups") == []
+
+
+@pytest.mark.parametrize("instance_first", [True, False])
+def test_default_and_instance_backups_stay_apart(make_library, clean_env, instance_first):
+    """Two writes within BACKUP_MIN_INTERVAL, one to the default library and
+    one to an instance's store of the same name: each store's restore point
+    is a backup of that store, not a reuse of the other's."""
+    home, mine = make(make_library, "home"), make(make_library, "mine")
+    clean_env.setenv("HOME", str(home.root))
+    default, api = PyAppleBooks(), PyAppleBooks(data_dir=mine.data_dir)
     try:
-        assert conn.execute("SELECT ZTITLE FROM ZBKCOLLECTION").fetchall() == [("mine shelf",)]
+        writes = [lambda: api.create_collection("mine write"),
+                  lambda: default.create_collection("home write")]
+        for write in writes if instance_first else writes[::-1]:
+            write()
+        backup_dir = api.store_info().backup_dir
     finally:
-        conn.close()
+        api.close()
+    [home_backup] = write_safety.list_backups()
+    assert backup_titles(home_backup) == ["home shelf"]
+    [mine_backup] = write_safety.list_backups(mine.library_path, backup_dir)
+    assert backup_titles(mine_backup) == ["mine shelf"]
+    assert titles(home) == ["home shelf", "home write"] and titles(mine) == ["mine shelf", "mine write"]
+
+
+def test_instance_writes_leave_the_default_backups(make_library, clean_env, monkeypatch):
+    home, mine = make(make_library, "home"), make(make_library, "mine")
+    clean_env.setenv("HOME", str(home.root))
+    PyAppleBooks().create_collection("home write")
+    [home_backup] = write_safety.list_backups()
+    monkeypatch.setattr(write_safety, "BACKUP_MIN_INTERVAL", 0.0)
+    api = PyAppleBooks(data_dir=mine.data_dir)
+    try:
+        for i in range(write_safety.BACKUP_KEEP + 1):
+            api.create_collection(f"mine {i}")
+        mine_backups = write_safety.list_backups(mine.library_path, api.store_info().backup_dir)
+    finally:
+        api.close()
+    assert len(mine_backups) == write_safety.BACKUP_KEEP
+    assert write_safety.list_backups() == [home_backup] and backup_titles(home_backup) == ["home shelf"]
 
 
 def test_ambiguous_instance_store_refuses_writes(make_library, clean_env):
@@ -232,6 +285,127 @@ def test_default_instance_in_use_library_writes_that_library(make_library, clean
     finally:
         mine.close()
     assert titles(other) == ["other shelf", "Here"] and titles(home) == ["home shelf"]
+
+
+# -- a store other than the live one ------------------------------------------------
+
+COPY = "BKLibrary-1-091020131601 copy.sqlite"
+
+
+@pytest.fixture
+def copy_beside(make_library, clean_env):
+    """A library with a stale Finder copy of its store next to it; the
+    live store has a collection (pk 2) the copy lacks."""
+    lib = make(make_library, "live")
+    copy = lib.library_path.parent / COPY
+    shutil.copyfile(lib.library_path, copy)
+    conn = sqlite3.connect(copy)
+    try:
+        conn.execute("UPDATE ZBKCOLLECTION SET ZTITLE = 'stale shelf'")
+        conn.commit()
+    finally:
+        conn.close()
+    lib.second = lib.add_collection("live second")
+    return lib, copy
+
+
+def fail_validation(monkeypatch, path):
+    """Make ``path`` fail store validation, as a store locked past the
+    discovery busy timeout does."""
+    real = client._is_store
+    monkeypatch.setattr(client, "_is_store",
+                        lambda p, entity: False if Path(p) == path else real(p, entity))
+
+
+@pytest.mark.parametrize("default", [False, True])
+def test_canonical_store_failing_validation_refuses_writes(copy_beside, clean_env, monkeypatch, default):
+    """Reads settled on the canonical store; when it can't be validated at
+    write time, strict discovery would pick the copy. The write refuses
+    before opening anything, so no collection of the live store comes
+    back as the one created."""
+    lib, copy = copy_beside
+    clean_env.setenv("HOME", str(lib.root))
+    api = PyAppleBooks() if default else PyAppleBooks(data_dir=lib.data_dir)
+    try:
+        assert [c.title for c in api.list_collections()] == ["live shelf", "live second"]
+        before = {p.name: digest(p) for p in lib.library_path.parent.iterdir()}
+        fail_validation(monkeypatch, lib.library_path)
+        with pytest.raises(AmbiguousStoreError, match="can't be read right now") as exc:
+            api.create_collection("New")
+        assert COPY in str(exc.value)
+        with pytest.raises(AmbiguousStoreError):
+            api.add_book_to_collection(lib.second["id"], lib.book["id"])
+        if default:
+            with pytest.raises(AmbiguousStoreError):
+                collection_writer.create_collection("New", backup=False)
+            with pytest.raises(AmbiguousStoreError):
+                write_safety.restore_library(copy)
+    finally:
+        api.close()
+    assert {p.name: digest(p) for p in lib.library_path.parent.iterdir()} == before
+    assert not (write_safety.BACKUP_DIR).exists()
+
+
+def test_reads_fallen_back_to_a_copy_refuse_writes(copy_beside, monkeypatch):
+    """The canonical store failed validation when first read, so reads
+    use the copy; writes still refuse it."""
+    lib, copy = copy_beside
+    fail_validation(monkeypatch, lib.library_path)
+    api = PyAppleBooks(data_dir=lib.data_dir)
+    try:
+        assert [c.title for c in api.list_collections()] == ["stale shelf"]
+        with pytest.raises(AmbiguousStoreError, match="can't be read right now"):
+            api.create_collection("New", backup=False)
+    finally:
+        api.close()
+    assert titles(lib) == ["live shelf", "live second"]
+
+
+@pytest.mark.parametrize("name", [COPY, "BKLibrary-1-091020131601.old.sqlite",
+                                  "BKLibrary-1-091020131601-20260101-120000-000000.sqlite"])
+def test_lone_copy_refuses_writes(make_library, clean_env, name):
+    """No canonical store, only a copy, a '.old' file or a backup: reads
+    use it, writes refuse (Apple Books doesn't read it)."""
+    lib = make(make_library, "lib")
+    store = lib.library_path.rename(lib.library_path.parent / name)
+    before = digest(store)
+    api = PyAppleBooks(data_dir=lib.data_dir)
+    try:
+        assert [c.title for c in api.list_collections()] == ["lib shelf"]
+        with pytest.raises(AmbiguousStoreError, match="isn't named like"):
+            api.create_collection("Nope", backup=False)
+    finally:
+        api.close()
+    clean_env.setenv("APPLE_BOOKS_DATA_DIR", str(lib.data_dir))
+    with pytest.raises(AmbiguousStoreError, match="isn't named like"):
+        collection_writer._default_db_path()
+    assert digest(store) == before
+
+
+def test_single_future_generation_takes_writes(make_library, clean_env):
+    lib = make(make_library, "lib")
+    newer = lib.library_path.rename(lib.library_path.parent / "BKLibrary-2-1.sqlite")
+    api = PyAppleBooks(data_dir=lib.data_dir)
+    try:
+        assert api._write_path() == newer
+        assert api.create_collection("Here", backup=False).title == "Here"
+        assert [c.title for c in api.list_collections()] == ["lib shelf", "Here"]
+    finally:
+        api.close()
+
+
+def test_store_other_than_the_one_read_refuses_writes(make_library, clean_env):
+    """The location changed after the reads resolved it: the write would
+    go to a store other than the one the reads (and the collection the
+    write returns) come from."""
+    one, two = make(make_library, "one"), make(make_library, "two")
+    clean_env.setenv("APPLE_BOOKS_LIBRARY_DB", str(one.library_path))
+    api = PyAppleBooks()
+    assert [c.title for c in api.list_collections()] == ["one shelf"]
+    clean_env.setenv("APPLE_BOOKS_LIBRARY_DB", str(two.library_path))
+    with pytest.raises(AmbiguousStoreError, match="isn't the file being read"):
+        api.create_collection("Nope", backup=False)
+    assert titles(one) == ["one shelf"] and titles(two) == ["two shelf"]
 
 
 def test_explicit_missing_store_is_not_found(tmp_path):
