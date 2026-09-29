@@ -162,6 +162,20 @@ class TestSortKeyAndSpineIndex:
         assert loc.sort_key is None
         assert loc.spine_index is None
 
+    def test_unclosed_bracket_is_not_an_assertion(self):
+        """A ``[`` with no closing ``]`` (a ``^]`` doesn't close) is kept,
+        so the steps after it still count."""
+        assert Location("epubcfi(/6/4[c1!/4/2/1:0)").sort_key == (6, 4, 4, 2, 1, 0)
+        assert Location("epubcfi(/6/4[c1]!/4[x^]/2/1:0)").sort_key == (6, 4, 4, 2, 1, 0)
+        # A long run of them is scanned once, not once per bracket.
+        assert Location("epubcfi(/6/4!/4" + "[" * 20000 + "/2:0)").sort_key == (6, 4, 4, 2, 0)
+
+    def test_oversized_step_does_not_raise(self):
+        """int() may refuse a long digit string (sys.get_int_max_str_digits);
+        the key is then None rather than an exception."""
+        loc = Location("epubcfi(/6/" + "9" * 5000 + "!/4/2/1:0)")
+        assert loc.sort_key is None or loc.sort_key[1] > 10 ** 4000
+
     def test_equality_hash_and_repr_unchanged(self):
         """The derived fields stay out of ==, hash() and repr()."""
         cfi = "epubcfi(/6/8[c3]!/4/2[p1]/18/1,:629,:691)"

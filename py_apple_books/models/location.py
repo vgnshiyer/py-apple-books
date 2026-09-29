@@ -54,8 +54,11 @@ _CHAR_RANGE = re.compile(r",:(\d+),:(\d+)\s*$")
 _BRACKET_HINT = re.compile(r"\[([^\]]+)\]")
 
 # ``[...]`` assertions (id hints, text assertions), including ``^``
-# escapes inside them; dropped before collecting the sort key.
-_ASSERTION = re.compile(r"\[(?:\^.|[^\]^])*\]")
+# escapes inside them; dropped before collecting the sort key. An
+# unclosed ``[`` matches through to the end with group 1 empty and is
+# kept as is: no later ``[`` could close either, and consuming the tail
+# in one match keeps the scan linear on runs of unbalanced brackets.
+_ASSERTION = re.compile(r"\[(?:\^.?|[^\]^])*(\]|\Z)")
 
 # A step ``/N`` or a character offset ``:N``.
 _STEP_OR_OFFSET = re.compile(r"/(\d+)|:(\d+)")
@@ -74,11 +77,14 @@ def _cfi_sort_key(cfi: str) -> Optional[Tuple[int, ...]]:
     m = _CFI_WRAPPER.match(cfi)
     if not m:
         return None
-    body = _ASSERTION.sub("", m.group(1))
+    body = _ASSERTION.sub(lambda hit: "" if hit.group(1) else hit.group(0), m.group(1))
     # Assertions are gone, so every remaining comma is top-level.
     parent, _, rest = body.partition(",")
     start = rest.partition(",")[0]
-    ints = [int(a or b) for a, b in _STEP_OR_OFFSET.findall(parent + start)]
+    try:
+        ints = [int(a or b) for a, b in _STEP_OR_OFFSET.findall(parent + start)]
+    except ValueError:  # more digits than int() accepts from a string
+        return None
     return tuple(ints) or None
 
 
