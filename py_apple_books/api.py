@@ -495,9 +495,7 @@ class PyAppleBooks:
             order_by=order_by,
             offset=offset,
         )
-        # iter() first: list() on the ModelIterable itself would also call
-        # its __len__, which runs the query a second time.
-        return list(iter(matches))
+        return list(matches)
 
     def get_annotations_by_date_range(self, after: datetime = None, before: datetime = None,
                                        limit: int = None, order_by: str = None, *,
