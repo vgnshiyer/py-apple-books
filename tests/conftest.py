@@ -4,8 +4,8 @@ The whole suite runs against a synthetic Apple Books library: at import
 time, before any test module imports py_apple_books, this file removes
 the developer's APPLE_BOOKS_* settings, builds both stores from the
 committed schema fixture in a temporary HOME and points HOME (and
-APPLE_BOOKS_DATA_DIR) at it. Tests never open the real library and
-don't need one.
+APPLE_BOOKS_DATA_DIR) at it. The default library resolves from those.
+Tests never open the real library and don't need one.
 
 Also includes a helper to build unzipped EPUB bundle directories in a
 tmp path. Apple Books stores EPUBs unzipped on disk, so fixture EPUBs
@@ -42,22 +42,59 @@ def pytest_unconfigure(config):
 @pytest.fixture(scope="session", autouse=True)
 def _fixture_home_guard():
     """Stop the run if the library would resolve outside the fixture HOME."""
-    from py_apple_books.db.client import AppleBooksDBClient
+    from py_apple_books.db.client import AppleBooksDBClient, default_library
 
     root = FIXTURE_HOME.resolve()
     lib_dir = getattr(AppleBooksDBClient, "book_lib_db", (None, None))[1]
-    for label, path in (("Path.home()", pathlib.Path.home()), ("AppleBooksDBClient.book_lib_db", lib_dir)):
-        if path is not None and not pathlib.Path(path).resolve().is_relative_to(root):
+    paths = default_library().paths()
+    for label, path in (("Path.home()", pathlib.Path.home()), ("AppleBooksDBClient.book_lib_db", lib_dir),
+                        ("default_library().paths().library", paths.library),
+                        ("default_library().paths().annotations", paths.annotations)):
+        if path is None or not pathlib.Path(path).resolve().is_relative_to(root):
             pytest.exit(f"{label} is {path}, outside the fixture HOME {root}; refusing to run "
                         f"against a real library", returncode=3)
+
+
+def _library_env() -> dict:
+    return {k: v for k, v in os.environ.items() if k.startswith(_bootstrap.ENV_PREFIX) or k == "HOME"}
+
+
+@pytest.fixture(autouse=True)
+def _library_env_guard(monkeypatch):
+    """Undo a test's changes to HOME and APPLE_BOOKS_* and drop the
+    default library it resolved from them.
+
+    Depends on ``monkeypatch`` so it runs before monkeypatch's own undo
+    and still sees the test's changes.
+    """
+    from py_apple_books.db import client
+
+    before = _library_env()
+    yield
+    if _library_env() != before:
+        for key in set(_library_env()) - set(before):
+            del os.environ[key]
+        os.environ.update(before)
+        client._reset_default_library()
+
+
+@pytest.fixture
+def fresh_default_library():
+    """Start and end the test with a new default library, so it resolves
+    from the environment the test sets up."""
+    from py_apple_books.db import client
+
+    client._reset_default_library()
+    yield
+    client._reset_default_library()
 
 
 @pytest.fixture
 def library():
     """The session's synthetic library, emptied before and after each test.
 
-    py_apple_books <= 1.9 binds to this store at import, so ``api`` and
-    the models always read it; tests seed exactly the rows they assert on.
+    The default library (``PyAppleBooks()``, the model managers) reads
+    it; tests seed exactly the rows they assert on.
     """
     from py_apple_books.testing import FixtureLibrary
 
@@ -80,9 +117,9 @@ def make_library(tmp_path):
     """Factory for independent libraries under ``tmp_path``.
 
     ``make_library(schema=None, journal_mode='DELETE')`` returns a new
-    ``FixtureLibrary`` in its own root. py_apple_books <= 1.9 can't be
-    pointed at it in-process; run a subprocess with HOME set to
-    ``lib.root``.
+    ``FixtureLibrary`` in its own root. Read it with
+    ``LibraryDB(data_dir=lib.data_dir)``, inside ``use_library(db)`` for
+    the models and ``PyAppleBooks()`` (see ``lib_db``).
     """
     from py_apple_books.testing import FixtureLibrary
 
@@ -97,26 +134,35 @@ def make_library(tmp_path):
 
 
 @pytest.fixture
+def lib_db(make_library):
+    """A ``LibraryDB`` over a new ``FixtureLibrary`` (``lib_db.fixture``),
+    closed after the test."""
+    from py_apple_books.db import LibraryDB
+
+    lib = make_library()
+    db = LibraryDB(data_dir=lib.data_dir)
+    db.fixture = lib
+    yield db
+    db.close()
+
+
+@pytest.fixture
 def sql_trace(monkeypatch):
     """Record every statement the read path executes as ``(sql, params)``.
 
-    Hooks ``LibraryDB.execute`` when the connection layer provides it,
-    otherwise ``QueryCompiler.execute`` (1.9), at class level so every
+    Hooks ``LibraryDB.execute`` at class level, so every library and
     manager is covered.
     """
-    from py_apple_books.db import client
+    from py_apple_books.db import LibraryDB
 
-    target = getattr(client, "LibraryDB", None)
-    if target is None:
-        from py_apple_books.db.query import QueryCompiler as target
-    original = target.execute
+    original = LibraryDB.execute
     calls = []
 
-    def traced(self, sql, *args, **kwargs):
-        calls.append((sql, args[0] if args else kwargs.get("params", ())))
-        return original(self, sql, *args, **kwargs)
+    def traced(self, sql, params=()):
+        calls.append((sql, tuple(params or ())))
+        return original(self, sql, params)
 
-    monkeypatch.setattr(target, "execute", traced)
+    monkeypatch.setattr(LibraryDB, "execute", traced)
     yield calls
 
 

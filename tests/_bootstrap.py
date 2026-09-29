@@ -1,11 +1,12 @@
 """Point the test run at a synthetic Apple Books library before py_apple_books loads.
 
-py_apple_books <= 1.9 opens its read connections at import, bound to
-``Path.home()``, so the fake HOME must exist before anything imports
-the package. This module therefore never imports py_apple_books: it
-finds the schema SQL through importlib's finder (which doesn't execute
-the package) and builds the stores with plain sqlite3. ``conftest.py``
-calls it at import time.
+py_apple_books finds its stores lazily, but some paths are still fixed
+from ``Path.home()`` at import (the writer's default library directory,
+the backup directory), so the fake HOME must exist before anything
+imports the package. This module therefore never imports py_apple_books:
+it finds the schema SQL through importlib's finder (which doesn't
+execute the package) and builds the stores with plain sqlite3.
+``conftest.py`` calls it at import time.
 """
 
 from __future__ import annotations

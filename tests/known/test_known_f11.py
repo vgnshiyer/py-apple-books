@@ -1,5 +1,5 @@
-"""F11: connections are opened at import and bound to the importing
-thread (stream 3.1 removes the markers)."""
+"""F11: connections were opened at import and bound to the importing
+thread (fixed by stream 3.1)."""
 
 import os
 import pathlib
@@ -7,12 +7,7 @@ import subprocess
 import sys
 import threading
 
-import pytest
 
-F11 = "F11: import-time, thread-bound SQLite connections; stream 3.1 (connections) removes this marker"
-
-
-@pytest.mark.xfail(strict=True, reason=F11)
 def test_query_from_worker_thread(api, library):
     library.add_book("Synthetic Book")
     outcome = {}
@@ -29,7 +24,6 @@ def test_query_from_worker_thread(api, library):
     assert outcome == {"books": 1}
 
 
-@pytest.mark.xfail(strict=True, reason=F11)
 def test_import_without_a_library(tmp_path):
     """Importing the package must not need Apple Books data."""
     import py_apple_books
