@@ -286,3 +286,50 @@ class TestContent:
         with pytest.raises(IndexError) as exc:
             api.get_book_content(9999)
         assert not isinstance(exc.value, AppleBooksError)
+
+
+class TestStatementBudgets:
+    """Statements per MCP 0.8.2 call, replaying its library calls
+    (1.10, F02: relations are lazy and ``Annotation.book`` loads once per
+    result). 1.9.1 ran about two statements per annotation instead."""
+
+    def test_get_library_stats(self, api, seeded, sql_trace):
+        books = list(api.list_books())
+        annotations = list(api.list_annotations())
+        assert len(books) == 3 and len(annotations) == 4
+        assert sum(getattr(a, "book", None) is None for a in annotations) == 0
+        assert len(sql_trace) == 3
+
+    def test_describe_book(self, api, seeded, sql_trace):
+        book = api.get_book_by_id(str(seeded["reading"]))
+        assert len(list(book.annotations)) == 3
+        assert len(sql_trace) == 2
+
+    def test_list_annotations_of_a_book(self, api, seeded, sql_trace):
+        book = api.get_book_by_id(seeded["reading"])
+        annotations = list(book.annotations)
+        chapters = {c.id: c.title for c in api.get_book_content(book.id).list_chapters()}
+        order = {c.id: c.order for c in api.get_book_content(book.id).list_chapters()}
+        assert len(annotations) == 3 and chapters and order
+        assert len(sql_trace) == 4
+
+    def test_currently_reading_resource(self, api, seeded, sql_trace):
+        [book] = api.get_books_in_progress(limit=1, order_by="-last_opened_date")
+        chapter = api.get_current_reading_chapter(book.id)
+        total = len(api.get_book_content(book.id).list_chapters())
+        assert chapter.id == "chap1" and total == 2
+        assert len(list(book.annotations)) == 3
+        assert len(sql_trace) == 6
+
+    def test_listing_tools_group_by_book(self, api, seeded, library, sql_trace):
+        library.add_annotation("ORPHANASSET", "orphan highlight", created=day(8))
+        annotations = list(api.list_annotations(limit=None, order_by="-creation_date"))
+        by_book = {}
+        for anno in annotations:
+            book = getattr(anno, "book", None)
+            by_book.setdefault(book.id if book else None, []).append(anno.id)
+        for book_id in by_book:
+            if book_id is not None:
+                api.get_book_by_id(book_id)
+        assert set(by_book) == {seeded["reading"], seeded["done"], None}
+        assert len(sql_trace) == 2 + 2  # the list, one Book query, one lookup per book
