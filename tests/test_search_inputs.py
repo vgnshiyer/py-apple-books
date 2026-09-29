@@ -188,8 +188,9 @@ def test_text_search_is_one_query(api, seeded, sql_trace):
     searches = [(sql, params) for sql, params in sql_trace if "abk_fold" in sql]
     assert len(searches) == 1
     sql, params = searches[0]
-    assert ("WHERE ZANNOTATIONTYPE != ? AND (instr(abk_fold(CAST(ZANNOTATIONSELECTEDTEXT AS BLOB)), ?) > 0 "
+    assert ("WHERE ZANNOTATIONTYPE > ? AND ZANNOTATIONTYPE != ? AND ZANNOTATIONDELETED IS NOT ? "
+            "AND (instr(abk_fold(CAST(ZANNOTATIONSELECTEDTEXT AS BLOB)), ?) > 0 "
             "OR instr(abk_fold(CAST(ZANNOTATIONREPRESENTATIVETEXT AS BLOB)), ?) > 0 "
             "OR instr(abk_fold(CAST(ZANNOTATIONNOTE AS BLOB)), ?) > 0) "
             "ORDER BY ZANNOTATIONCREATIONDATE DESC, Z_PK ASC LIMIT ?") in sql
-    assert tuple(params) == (3, "don't", "don't", "don't", 2)
+    assert tuple(params) == (0, 3, 1, "don't", "don't", "don't", 2)

@@ -105,6 +105,9 @@ class TestForms:
         newer = library.add_book("Newer", progress=0.3, last_opened=day(2))["id"]
         assert ids(api.get_books_in_progress(limit=1, order_by="-last_opened_date")) == [newer]
         assert ids(api.get_recently_read_books(limit=10)) == [newer, older]
+        # The default order (last_read_date) sorts in Python since 1.10;
+        # '-last_opened_date' is the 1.9 order, in SQL.
+        assert ids(api.get_recently_read_books(limit=10, order_by="-last_opened_date")) == [newer, older]
         assert "ORDER BY ZLASTOPENDATE DESC, Z_PK ASC" in last_sql(sql_trace, "ZBKLIBRARYASSET")
 
     @pytest.mark.parametrize("order_by", ["nope", "-nope", "title,nope", ["title", "-nope"], "+title",

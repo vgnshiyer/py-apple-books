@@ -96,14 +96,17 @@ class TestSql:
     def test_offset_zero_orders_by_primary_key(self, api, seeded, sql_trace):
         list(api.list_annotations(offset=0))
         sql, _ = last_query(sql_trace, "anno_db.ZAEANNOTATION")
-        assert sql.endswith("WHERE ZANNOTATIONTYPE != ? ORDER BY Z_PK ASC")
+        assert sql.endswith("WHERE ZANNOTATIONTYPE > ? AND ZANNOTATIONTYPE != ? "
+                            "AND ZANNOTATIONDELETED IS NOT ? ORDER BY Z_PK ASC")
         list(api.list_annotations(limit=3, offset=0))
         sql, _ = last_query(sql_trace, "anno_db.ZAEANNOTATION")
         assert sql.endswith("ORDER BY Z_PK ASC LIMIT ?")
         list(api.list_books(offset=4))
         sql, params = last_query(sql_trace, "ZBKLIBRARYASSET")
-        assert sql.endswith("FROM ZBKLIBRARYASSET ORDER BY Z_PK ASC LIMIT ? OFFSET ?")
-        assert tuple(params) == (-1, 4)
+        assert sql.endswith("FROM ZBKLIBRARYASSET WHERE ZCONTENTTYPE IS NOT ? AND "
+                            "(ZDATASOURCEIDENTIFIER IS NOT ? OR ZCANREDOWNLOAD = ?) "
+                            "ORDER BY Z_PK ASC LIMIT ? OFFSET ?")
+        assert tuple(params)[-2:] == (-1, 4)
 
     def test_limit_alone_keeps_storage_order(self, api, seeded, sql_trace):
         list(api.list_annotations(limit=3))
