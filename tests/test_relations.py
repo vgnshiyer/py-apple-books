@@ -9,6 +9,8 @@ import copy
 import gc
 import pickle
 import sqlite3
+import sys
+import threading
 import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -32,6 +34,15 @@ def db(lib_db):
 
 def ids(rows) -> list:
     return [row.id for row in rows]
+
+
+@pytest.fixture
+def fast_switching():
+    """Switch threads as often as possible, to widen race windows."""
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    yield
+    sys.setswitchinterval(interval)
 
 
 class TestAnnotationBook:
@@ -98,12 +109,40 @@ class TestAnnotationBook:
         _, params = sql_trace[-1]
         assert sorted(params) == sorted([book["asset_id"], "GONE-ASSET"])
 
+    def test_a_null_key_releases_the_sibling_list(self, db):
+        lib = db.fixture
+        book = lib.add_book("Kept")
+        lib.add_annotation(book, "kept")
+        null = lib.add_annotation(book, "no asset", raw={"ZANNOTATIONASSETID": None})
+        annotations = {a.id: a for a in Annotation.manager.all()}
+        assert annotations[null].book is None
+        assert "_ab_siblings" not in annotations[null].__dict__
+
     def test_getattr_default_still_works(self, db):
         """apple-books-mcp 0.8.2 reads ``getattr(anno, 'book', None)``."""
         book = db.fixture.add_book("Kept")
         db.fixture.add_annotation(book, "kept")
         db.fixture.add_annotation("GONE-ASSET", "orphaned")
         assert [getattr(a, "book", None) is None for a in Annotation.manager.all()] == [False, True]
+
+    def test_threads_sharing_one_result(self, db, fast_switching):
+        """Threads reading ``.book`` across one result at once each get
+        the right books, and every sibling list is released."""
+        db.fixture.populate(books=300, annotations_per_book=4)
+        expected = [a.book.id for a in list(Annotation.manager.all())]
+        for _ in range(3):
+            annotations = list(Annotation.manager.all())
+            start = threading.Barrier(8)
+
+            def work(i):
+                start.wait()
+                order = annotations if i % 2 else annotations[::-1]
+                return {a.id: a.book.id for a in order}
+
+            with ThreadPoolExecutor(8) as pool:
+                got = list(pool.map(work, range(8)))
+            assert all([g[a.id] for a in annotations] == expected for g in got)
+            assert all("_ab_siblings" not in a.__dict__ for a in annotations)
 
     def test_errors_propagate(self, db, monkeypatch):
         db.fixture.add_annotation(db.fixture.add_book("Kept"), "kept")
@@ -237,6 +276,27 @@ class TestCopies:
         assert len(pickle.loads(pickle.dumps(book)).annotations) == 3  # reloads
         assert pickle.loads(pickle.dumps(annotations[2])).book.id == row["id"]
 
+    def test_copies_while_another_thread_loads_a_sibling(self, db, fast_switching):
+        """Loading ``.book`` writes into every sibling's ``__dict__``;
+        pickling one of them meanwhile (``__getstate__``, which copy and
+        deepcopy use too) doesn't see it change size. Before the fix,
+        about one trial in four failed."""
+        db.fixture.populate(books=300, annotations_per_book=4)
+        for _ in range(30):
+            annotations = list(Annotation.manager.all())
+            start = threading.Barrier(2)
+
+            def load():
+                start.wait()
+                annotations[-1].book
+
+            loader = threading.Thread(target=load)
+            loader.start()
+            start.wait()
+            pickled = [pickle.dumps(a) for a in annotations]
+            loader.join()
+            assert [pickle.loads(p).id for p in pickled] == ids(annotations)
+
     def test_models_built_directly(self, db):
         """A model not read from a library resolves in the current one."""
         book = db.fixture.add_book("Kept")
@@ -290,6 +350,17 @@ class TestLibraryOfTheModel:
         with use_library(other):
             rows = Book.manager.all().run_query()
             [book] = ModelIterable(lambda: rows, Book)
+        assert book.__dict__["_ab_db"] is other
+        assert [a.selected_text for a in book.annotations] == [f"other highlight {i}" for i in range(3)]
+
+    def test_manager_results_with_a_pre_110_from_db(self, other, monkeypatch):
+        """An override without ``db=`` still builds manager results; the
+        library is recorded on the models afterwards."""
+        original = Book.from_db
+        monkeypatch.setattr(Book, "from_db", classmethod(lambda cls, row: original(row)))
+        with use_library(other):
+            [book] = Book.manager.all()
+            assert Book.manager.all(limit=1).first().id == book.id
         assert book.__dict__["_ab_db"] is other
         assert [a.selected_text for a in book.annotations] == [f"other highlight {i}" for i in range(3)]
 

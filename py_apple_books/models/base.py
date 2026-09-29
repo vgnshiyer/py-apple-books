@@ -120,7 +120,9 @@ class Model(metaclass=ModelBase):
     def __getstate__(self):
         # For pickle and copy: the library and the sibling list are not
         # part of a model's data, nor is a to-many relation's result.
-        return {key: value for key, value in self.__dict__.items()
+        # Iterates a copy: loading a sibling's relation (in another
+        # thread) writes into this __dict__.
+        return {key: value for key, value in self.__dict__.copy().items()
                 if not key.startswith('_ab_') and not isinstance(value, ModelIterable)}
 
     @classmethod

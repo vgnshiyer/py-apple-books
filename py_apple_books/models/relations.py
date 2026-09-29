@@ -9,7 +9,10 @@
   loads the related rows of every model of that result at once (one
   ``IN`` query per :data:`BATCH_SIZE` keys) instead of one query per row.
 
-A relation reads the library its instance was read from.
+A relation reads the library its instance was read from, even once
+that library is closed: the relations of models from a
+``with LibraryDB(...)`` block, used after the block, open its
+connections again.
 """
 
 from __future__ import annotations
@@ -143,6 +146,7 @@ class _ToOne(Relation[T]):
         value = getattr(instance, key)
         if value is None:
             state[self.name] = None
+            _release_siblings((instance,))
             return None
         siblings = state.get('_ab_siblings')
         if not siblings:
