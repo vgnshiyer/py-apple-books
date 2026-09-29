@@ -1,5 +1,5 @@
 # list_all_annotations {"limit": 3} isError=False
 Synthetic Book (Test Author):
-  [4] removed synthetic highlight — Chapter 1 (ch=chap1)
   [3] Closing words. — Chapter 1 (ch=chap1)
   [2] Opening words. — Chapter 2 (ch=chap2)
+  [1] a synthetic highlight — Chapter 1 (ch=chap1)

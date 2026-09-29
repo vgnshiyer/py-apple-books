@@ -1,7 +1,5 @@
 # get_books_in_progress {} isError=False
 [1] Synthetic Book by Test Author
   Progress: In Progress (42.0%) | Last Read: 2026-09-20
-[2] Don't Panic by Second Author
-  Progress: Finished | Last Read: 2026-09-10
 [7] Locked Store Book by Store Author
   Progress: In Progress (25.0%) | Last Read: 2026-09-12

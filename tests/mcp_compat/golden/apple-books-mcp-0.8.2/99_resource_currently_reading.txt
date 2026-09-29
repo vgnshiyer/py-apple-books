@@ -5,4 +5,4 @@ Currently Reading: Synthetic Book by Test Author
 
 Current chapter: [1/2] Chapter 1  (use get_chapter_content(1, "chap1") for the text)
 
-Highlights in this book: 6  (use list_annotations(1) to browse)
+Highlights in this book: 5  (use list_annotations(1) to browse)

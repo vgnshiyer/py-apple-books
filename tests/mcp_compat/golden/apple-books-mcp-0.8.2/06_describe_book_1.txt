@@ -3,4 +3,4 @@ Synthetic Book by Test Author
   Book id: 1
   Genre:    Fiction
   Progress: In Progress (42.0%) | Last Read: 2026-09-20
-  Annotations: 6
+  Annotations: 5
