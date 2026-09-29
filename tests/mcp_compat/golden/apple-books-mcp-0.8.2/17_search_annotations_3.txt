@@ -1,3 +1,4 @@
 # search_annotations {"text": "don't"} isError=False
 Synthetic Book (Test Author):
   [9] Don't panic, it's 100% fine. — Chapter 2 (ch=chap2)
+  [10] don’t touch snake_case names — Chapter 2 (ch=chap2)

@@ -28,6 +28,11 @@ from py_apple_books.utils import APPLE_EPOCH_OFFSET, snap_window
 # the bookmark itself, use :meth:`PyAppleBooks.get_current_reading_location`.
 _ANNOTATION_TYPE_READING_BOOKMARK = 3
 
+# Default order of the colour and annotation text searches: newest
+# first, so a ``limit`` keeps the most recent matches. Pass
+# ``order_by=None`` for storage order (the pre-1.10 default).
+_SEARCH_ORDER = "-creation_date"
+
 
 class PyAppleBooks:
     """Facade class for accessing Apple Books data."""
@@ -56,8 +61,9 @@ class PyAppleBooks:
 
     def get_collection_by_title(self, title: str, *, limit: int = None, order_by: str = None,
                                 offset: int = None) -> ModelIterable:
-        """Get a collection and its books."""
-        return Collection.manager.filter(title__contains=title, is_deleted=0,
+        """Get the collections whose title contains ``title``, ignoring
+        case, accents and quote/dash style (deleted ones excluded)."""
+        return Collection.manager.filter(title__search=title, is_deleted=0,
                                          limit=limit, order_by=order_by, offset=offset)
 
     # -- collection write actions --
@@ -103,13 +109,15 @@ class PyAppleBooks:
 
     def get_book_by_title(self, title: str, *, limit: int = None, order_by: str = None,
                           offset: int = None) -> ModelIterable:
-        """Get a book by title."""
-        return Book.manager.filter(title__contains=title, limit=limit, order_by=order_by, offset=offset)
+        """Get the books whose title contains ``title``, ignoring case,
+        accents and quote/dash style."""
+        return Book.manager.filter(title__search=title, limit=limit, order_by=order_by, offset=offset)
 
     def get_books_by_genre(self, genre: str, limit: int = None, order_by: str = None, *,
                            offset: int = None) -> ModelIterable:
-        """Get books whose genre contains the given string (case-sensitive)."""
-        return Book.manager.filter(genre__contains=genre, limit=limit, order_by=order_by, offset=offset)
+        """Get books whose genre contains the given string, ignoring case,
+        accents and quote/dash style."""
+        return Book.manager.filter(genre__search=genre, limit=limit, order_by=order_by, offset=offset)
 
     # -- annotation actions --
     #
@@ -136,9 +144,9 @@ class PyAppleBooks:
         caller has already obtained the id from a specific API)."""
         return Annotation.manager.filter(id=annotation_id)[0]
 
-    def get_annotations_by_color(self, color: str, limit: int = None, order_by: str = None, *,
+    def get_annotations_by_color(self, color: str, limit: int = None, order_by: str = _SEARCH_ORDER, *,
                                  offset: int = None) -> ModelIterable:
-        """Get user highlights by color."""
+        """Get user highlights by color, newest first by default."""
         style = AnnotationColor[color.upper()].value
         # The color filter (style in 1..5) already excludes bookmarks
         # (style = 0); the explicit type filter is a belt-and-suspenders
@@ -151,38 +159,42 @@ class PyAppleBooks:
             offset=offset,
         )
 
+    # The text searches ignore case, accents and quote/dash/whitespace
+    # style on both sides (py_apple_books.text.fold_for_match): "don't"
+    # finds "Don’t", "Godel" finds "Gödel". % and _ match themselves.
+
     def search_annotation_by_highlighted_text(self, text: str, limit: int = None,
-                                              order_by: str = None, *,
+                                              order_by: str = _SEARCH_ORDER, *,
                                               offset: int = None) -> ModelIterable:
-        """Search user annotations by highlighted text."""
+        """Search user annotations by highlighted text, newest first by default."""
         return Annotation.manager.filter(
-            selected_text__contains=text,
+            selected_text__search=text,
             type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
             limit=limit,
             order_by=order_by,
             offset=offset,
         )
 
-    def search_annotation_by_note(self, note: str, limit: int = None, order_by: str = None, *,
+    def search_annotation_by_note(self, note: str, limit: int = None, order_by: str = _SEARCH_ORDER, *,
                                   offset: int = None) -> ModelIterable:
-        """Search user annotations by note."""
+        """Search user annotations by note, newest first by default."""
         return Annotation.manager.filter(
-            note__contains=note,
+            note__search=note,
             type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
             limit=limit,
             order_by=order_by,
             offset=offset,
         )
 
-    def search_annotation_by_text(self, text: str, limit: int = None, order_by: str = None, *,
+    def search_annotation_by_text(self, text: str, limit: int = None, order_by: str = _SEARCH_ORDER, *,
                                   offset: int = None):
         """Search user annotations whose highlighted text, surrounding
-        text or note contains the given text.
+        text or note contains the given text, newest first by default.
 
         Returns a list (not a :class:`ModelIterable`), as before 1.10.
         """
         matches = Annotation.manager.filter(
-            where=Q(selected_text__contains=text) | Q(representative_text__contains=text) | Q(note__contains=text),
+            where=Q(selected_text__search=text) | Q(representative_text__search=text) | Q(note__search=text),
             type__ne=_ANNOTATION_TYPE_READING_BOOKMARK,
             limit=limit,
             order_by=order_by,

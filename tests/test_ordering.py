@@ -1,5 +1,6 @@
-"""``order_by`` (1.10): comma-separated and list forms, and a primary-key
-tie-break."""
+"""``order_by`` (1.10): comma-separated and list forms, a primary-key
+tie-break, and the newest-first default of the colour and annotation text
+searches (F28)."""
 
 import datetime as dt
 
@@ -21,6 +22,55 @@ def ids(rows) -> list:
 
 def last_sql(sql_trace, table: str) -> str:
     return [sql for sql, _ in sql_trace if f"FROM {table}" in sql][-1]
+
+
+@pytest.fixture
+def annotations(library):
+    """Yellow highlights whose ids run opposite to their dates, plus a tie."""
+    book = library.add_book("Synthetic Book")
+    old = library.add_annotation(book, "the oldest words", note="the note", created=day(1))
+    new = library.add_annotation(book, "the newest words", note="the note", created=day(9))
+    mid_a = library.add_annotation(book, "the middle words", note="the note", created=day(5))
+    mid_b = library.add_annotation(book, "the middle words again", note="the note", created=day(5))
+    library.add_annotation(book, None, kind="reading_position", created=day(20))
+    return {"old": old, "new": new, "mid_a": mid_a, "mid_b": mid_b}
+
+
+class TestSearchDefaults:
+    SEARCHES = [
+        lambda api, **kw: api.get_annotations_by_color("yellow", **kw),
+        lambda api, **kw: api.search_annotation_by_highlighted_text("words", **kw),
+        lambda api, **kw: api.search_annotation_by_note("note", **kw),
+        lambda api, **kw: api.search_annotation_by_text("the", **kw),
+    ]
+
+    @pytest.mark.parametrize("search", SEARCHES)
+    def test_newest_first_by_default(self, api, annotations, search):
+        a = annotations
+        assert ids(search(api)) == [a["new"], a["mid_a"], a["mid_b"], a["old"]]
+        assert ids(search(api, limit=2)) == [a["new"], a["mid_a"]]
+
+    @pytest.mark.parametrize("search", SEARCHES)
+    def test_explicit_none_keeps_storage_order(self, api, annotations, search, sql_trace):
+        assert set(ids(search(api, order_by=None))) == set(annotations.values())
+        assert "ORDER BY" not in last_sql(sql_trace, "anno_db.ZAEANNOTATION")
+
+    @pytest.mark.parametrize("search", SEARCHES)
+    def test_default_order_sql(self, api, annotations, search, sql_trace):
+        list(search(api, limit=3))
+        assert "ORDER BY ZANNOTATIONCREATIONDATE DESC, Z_PK ASC LIMIT ?" in last_sql(
+            sql_trace, "anno_db.ZAEANNOTATION")
+
+    def test_date_range_and_list_keep_storage_order(self, api, annotations, sql_trace):
+        list(api.get_annotations_by_date_range(after=dt.datetime(2026, 1, 1), limit=2))
+        assert "ORDER BY" not in last_sql(sql_trace, "anno_db.ZAEANNOTATION")
+        list(api.list_annotations(limit=2))
+        assert "ORDER BY" not in last_sql(sql_trace, "anno_db.ZAEANNOTATION")
+
+    def test_recent_annotations_shape(self, api, annotations):
+        """MCP's ``list_annotations(limit=, order_by='-creation_date')``."""
+        a = annotations
+        assert ids(api.list_annotations(limit=3, order_by="-creation_date")) == [a["new"], a["mid_a"], a["mid_b"]]
 
 
 class TestForms:
