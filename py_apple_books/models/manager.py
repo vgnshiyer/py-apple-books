@@ -6,6 +6,7 @@ from py_apple_books.db.query import CompiledQuery
 from py_apple_books.exceptions import InvalidArgumentError, UnknownFieldError
 from typing import Callable, Any, List, Optional, Union
 from functools import partial
+import numbers
 import operator
 import sys
 import warnings
@@ -49,9 +50,9 @@ def _caller_stacklevel() -> int:
 def normalize_limit(limit) -> Optional[int]:
     """Validate a ``limit`` argument; None means all rows.
 
-    Accepts an int, an integral float or a numeric string. A limit
-    above 2**63 - 1 means all rows. A limit <= 0 also means all rows,
-    as before 1.10, with a DeprecationWarning: 2.0 will raise.
+    Accepts an int, an integral float or Decimal, or a numeric string.
+    A limit above 2**63 - 1 means all rows. A limit <= 0 also means all
+    rows, as before 1.10, with a DeprecationWarning: 2.0 will raise.
     Anything else raises :class:`InvalidArgumentError`.
     """
     if limit is None:
@@ -61,10 +62,15 @@ def normalize_limit(limit) -> Optional[int]:
             limit = int(limit)
         except ValueError:
             raise InvalidArgumentError(f"limit must be an integer or None, not {limit!r}") from None
-    elif isinstance(limit, float):
-        if not limit.is_integer():
+    elif isinstance(limit, numbers.Number) and not isinstance(limit, numbers.Integral):
+        # float, Decimal, Fraction: accepted when integral.
+        try:
+            as_int = int(limit)
+        except (TypeError, ValueError, OverflowError):
+            as_int = None
+        if as_int is None or as_int != limit:
             raise InvalidArgumentError(f"limit must be an integer or None, not {limit!r}")
-        limit = int(limit)
+        limit = as_int
     else:
         try:
             limit = operator.index(limit)

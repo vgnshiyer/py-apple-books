@@ -8,6 +8,9 @@ values into the SQL text, where SQLite read an out-of-range int as a
 REAL that matched nothing; binding keeps that result.
 """
 
+from decimal import Decimal
+from fractions import Fraction
+
 import pytest
 
 from py_apple_books.db import adapt_params
@@ -15,6 +18,16 @@ from py_apple_books.db.exceptions import DBError, DBQueryError
 from py_apple_books.models import Book
 
 REPLACEMENT = chr(0xFFFD)
+
+
+class Index:
+    """An integer type sqlite3 can't bind, like numpy.int64."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __index__(self):
+        return self.value
 
 
 class TestAdaptParams:
@@ -39,6 +52,16 @@ class TestAdaptParams:
         values = [None, 1.5, "don’t", b"\x00", 7]
         assert adapt_params(values) == tuple(values)
         assert adapt_params(()) == ()
+
+    def test_numbers_sqlite3_cannot_bind(self):
+        """Pre-1.10 wrote str(value) into the SQL: Decimal('1') and an
+        __index__ type such as numpy.int64 matched id 1."""
+        got = adapt_params([Index(1), Index(2**64), Decimal("1"), Decimal("2.50"), Fraction(1, 4),
+                            Decimal("1E+30")])
+        assert got == (1, str(2**64), 1, 2.5, 0.25, str(10**30))
+        assert [type(v) for v in got] == [int, str, int, float, float, str]
+        nan = Decimal("NaN")
+        assert adapt_params([nan, 1j])[0] is nan  # left for sqlite3 to reject
 
     def test_client_binds_through_it(self):
         client = Book.manager.compiler.client
@@ -76,6 +99,14 @@ class TestEndToEnd:
         library.add_annotation(book, "a synthetic highlight")
         assert api.search_annotation_by_text("a" + chr(0xD800)) == []
         assert list(api.get_book_by_title(chr(0xDFFF))) == []
+
+    @pytest.mark.parametrize("make_id", [Index, Decimal, lambda pk: Decimal(f"{pk}.0")])
+    def test_id_of_a_number_type_sqlite3_cannot_bind(self, api, library, book, make_id):
+        assert api.get_book_by_id(make_id(book["id"])).id == book["id"]
+        assert [b.id for b in Book.manager.filter(id__in=[make_id(book["id"]), Index(10**20)])] == [book["id"]]
+        library.add_annotation(book, "a synthetic highlight")
+        annotation = api.list_annotations()[0]
+        assert api.get_annotation_by_id(make_id(annotation.id)).id == annotation.id
 
     def test_huge_int_in_a_list(self, library, book):
         """The out-of-range item matches nothing; the others still match."""

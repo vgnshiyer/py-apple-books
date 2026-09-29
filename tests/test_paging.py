@@ -8,6 +8,8 @@ storage order, as before 1.10.
 """
 
 import warnings
+from decimal import Decimal
+from fractions import Fraction
 
 import pytest
 
@@ -136,13 +138,15 @@ class TestArguments:
         assert len(got) == expected > 0
         assert [w.filename for w in record] == [__file__]
 
-    @pytest.mark.parametrize("limit,expected", [("5", 5), (" 2 ", 2), (2.0, 2), (True, 1), (10**20, 10)])
+    @pytest.mark.parametrize("limit,expected", [("5", 5), (" 2 ", 2), (2.0, 2), (True, 1), (10**20, 10),
+                                                (Decimal(3), 3), (Decimal("4.0"), 4), (Fraction(6, 2), 3)])
     def test_limit_forms(self, api, seeded, limit, expected):
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             assert len(list(api.list_books(limit=limit))) == expected
 
-    @pytest.mark.parametrize("limit", ["abc", "5.0", 2.5, float("nan"), float("inf"), object(), [5]])
+    @pytest.mark.parametrize("limit", ["abc", "5.0", 2.5, float("nan"), float("inf"), object(), [5],
+                                       Decimal("2.5"), Decimal("NaN"), 3j])
     def test_bad_limit(self, api, seeded, limit):
         with pytest.raises(InvalidArgumentError) as exc:
             api.list_books(limit=limit)

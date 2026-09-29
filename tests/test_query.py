@@ -199,6 +199,18 @@ class TestWhereToSql:
             assert Not(Where("col", needle, "SEARCH")).to_sql() == ("(0) IS NOT 1", [])
         assert Where("col", "", "SEARCH").to_sql() == ("instr(abk_fold(CAST(col AS BLOB)), ?) > 0", [""])
 
+    def test_in_iterates_an_object_with_a_to_sql_method(self):
+        """A pandas Series has to_sql(name, con); it is a list of values."""
+        class Series:
+            def __iter__(self):
+                return iter([1, "a"])
+
+            def to_sql(self, name, con):
+                raise AssertionError("not a subquery")
+
+        assert Where("id", Series(), "IN").to_sql() == ("id IN (?, ?)", [1, "a"])
+        assert str(Where("id", Series(), "IN")) == "id IN (1, 'a')"
+
     def test_columns(self):
         assert Where("a", 1).columns() == {"a"}
         assert WhereGroup([Where("a", 1), Not(Where("b", 2))], "OR").columns() == {"a", "b"}

@@ -1,11 +1,16 @@
 from py_apple_books.db.clause import Clause, Where
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Any, Sequence, Tuple, Union
+import numbers
+import operator
 
 if TYPE_CHECKING:
     from py_apple_books.db.client import DBClient
 
 _INT64_MIN = -2**63
 _INT64_MAX = 2**63 - 1
+
+# Types sqlite3 binds as they are (bool is handled as an int).
+_NATIVE = (int, float, str, bytes, bytearray, memoryview)
 
 
 def __getattr__(name):
@@ -17,11 +22,35 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _as_number(value):
+    """``value`` as an ``int`` or ``float`` if it is a number sqlite3
+    can't bind, otherwise ``value`` unchanged."""
+    try:
+        return operator.index(value)
+    except TypeError:
+        pass
+    if isinstance(value, numbers.Real) or (
+            isinstance(value, numbers.Number) and not isinstance(value, numbers.Complex)):
+        # Real, or registered only as a Number (Decimal).
+        try:
+            as_int = int(value)
+            return as_int if as_int == value else float(value)
+        except (TypeError, ValueError, OverflowError):
+            pass  # NaN or infinite: sqlite3 reports it, as it did before
+    return value
+
+
 def adapt_params(params: Sequence[Any]) -> tuple:
     """Make query parameters safe to bind with :mod:`sqlite3`.
 
     Every read query binds its parameters through this function:
 
+    * A number of a type sqlite3 can't bind, which pre-1.10 releases
+      wrote into the SQL as ``str(value)``, becomes an ``int`` or a
+      ``float``: an object with ``__index__`` (such as
+      ``numpy.int64``) through ``operator.index``, and a real number
+      such as ``Decimal`` or ``Fraction`` as an ``int`` when it is
+      integral, else as a ``float``. The rules below then apply.
     * ``bool`` becomes ``int`` (``True`` → 1).
     * An ``int`` outside SQLite's 64-bit range [-2**63, 2**63 - 1] is
       bound as its decimal ``str``. sqlite3 would raise
@@ -38,6 +67,8 @@ def adapt_params(params: Sequence[Any]) -> tuple:
     """
     out = []
     for value in params:
+        if value is not None and not isinstance(value, _NATIVE):
+            value = _as_number(value)
         if isinstance(value, bool):
             value = int(value)
         elif isinstance(value, int):

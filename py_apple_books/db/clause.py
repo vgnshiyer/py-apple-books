@@ -34,6 +34,16 @@ def escape_like(s: str) -> str:
              .replace('_', LIKE_ESCAPE + '_'))
 
 
+def _is_subquery(value) -> bool:
+    """Whether ``value`` is the right-hand side of ``IN (SELECT ...)``.
+
+    Checked by type, not by a ``to_sql`` attribute: a pandas Series has
+    a ``to_sql`` method, and is a list of values here.
+    """
+    from py_apple_books.db.query import CompiledQuery  # query imports this module
+    return isinstance(value, (Subquery, CompiledQuery, Clause))
+
+
 class Clause:
     def to_sql(self) -> Tuple[str, list]:
         """``(sql, params)``: SQL text with ``?`` placeholders and the
@@ -93,7 +103,7 @@ class Where(Clause):
                 f"Operator {self.operator!r} is not supported for parameterized queries; "
                 "use a manager lookup such as __gte/__lte")
         if op in ('IN', 'NOT IN'):
-            if hasattr(value, 'to_sql'):
+            if _is_subquery(value):
                 sub_sql, sub_params = value.to_sql()
                 return f"{field} {op} ({sub_sql})", list(sub_params)
             if isinstance(value, (str, bytes, bytearray)):
@@ -129,7 +139,7 @@ class Where(Clause):
             if isinstance(self.value, str):
                 # If it's already a comma-separated string, use it directly
                 formatted_value = f"({self.value})"
-            elif hasattr(self.value, 'to_sql'):
+            elif _is_subquery(self.value):
                 formatted_value = f"({self.value})"
             else:
                 # Format each item separately and join them
