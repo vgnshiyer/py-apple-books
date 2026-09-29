@@ -1,0 +1,2 @@
+# get_chapter_content {"book_id": 999999, "chapter_id": "chap1"} isError=False
+No book found with id 999999.

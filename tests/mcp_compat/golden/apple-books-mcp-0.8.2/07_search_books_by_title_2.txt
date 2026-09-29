@@ -1,0 +1,2 @@
+# search_books_by_title {"title": "Don't"} isError=True
+Error executing tool search_books_by_title: Error executing query: near "t": syntax error

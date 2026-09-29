@@ -1,0 +1,8 @@
+# search_annotations {"text": "synthetic"} isError=False
+Synthetic Book (Test Author):
+  [1] a synthetic highlight — Chapter 1 (ch=chap1)
+  [2] Opening words. — Chapter 2 (ch=chap2)
+  [4] removed synthetic highlight — Chapter 1 (ch=chap1)
+
+Unassigned (book no longer in library):
+  [7] orphan synthetic highlight

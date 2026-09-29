@@ -1,0 +1,2 @@
+# list_book_chapters {"book_id": 5} isError=False
+Book not available: 'Series Stack' has not been downloaded to this Mac. Open it in Apple Books to download a local copy, then try again.

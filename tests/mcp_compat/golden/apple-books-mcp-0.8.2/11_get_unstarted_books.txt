@@ -1,0 +1,9 @@
+# get_unstarted_books {} isError=False
+[3] Finished At Zero by Test Author
+  Progress: Finished
+[4] Unopened Book by Test Author
+  Progress: Not Started
+[5] Series Stack by Test Author
+  Progress: Not Started
+[6] Owned Series Volume by Test Author
+  Progress: Not Started

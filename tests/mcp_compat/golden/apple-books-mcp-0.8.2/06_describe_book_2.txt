@@ -1,0 +1,5 @@
+# describe_book {"book_id": "3"} isError=False
+Finished At Zero by Test Author
+  Book id: 3
+  Genre:    History
+  Progress: Finished

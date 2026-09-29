@@ -1,0 +1,2 @@
+# search_annotations {"text": "don't"} isError=True
+Error executing tool search_annotations: Error executing query: near "t": syntax error

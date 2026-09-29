@@ -1,0 +1,2 @@
+# get_current_reading_position {"book_id": 1} isError=False
+Current chapter: [1] Chapter 1  (use get_chapter_content(1, "chap1") for the text)

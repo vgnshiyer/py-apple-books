@@ -1,0 +1,2 @@
+# get_annotation_context {"annotation_id": 9} isError=False
+Chapter 2 Opening words. «Don't panic, it's 100% fine.» Please don’t touch snake_case names. Closing words.

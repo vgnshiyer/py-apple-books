@@ -1,0 +1,8 @@
+# get_chapter_content {"book_id": 1, "chapter_id": "2"} isError=False
+Chapter 2
+
+Opening words. Don't panic, it's 100% fine.
+
+Please don’t touch snake_case names. Closing words.
+
+(full chapter returned: 107 chars.)

@@ -1,0 +1,2 @@
+# get_collection_books {"collection_id": "10"} isError=False
+No collection found with id 10.

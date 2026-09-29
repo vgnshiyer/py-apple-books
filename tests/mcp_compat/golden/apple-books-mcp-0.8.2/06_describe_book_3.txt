@@ -1,0 +1,5 @@
+# describe_book {"book_id": "5"} isError=False
+Series Stack by Test Author
+  Book id: 5
+  Genre:    Fantasy
+  Progress: Not Started

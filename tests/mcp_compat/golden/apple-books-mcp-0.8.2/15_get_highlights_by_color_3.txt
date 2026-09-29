@@ -1,0 +1,3 @@
+# get_highlights_by_color {"color": "blue", "limit": 1} isError=False
+Synthetic Book (Test Author) — 1 blue highlight:
+  [9] Don't panic, it's 100% fine. — Chapter 2 (ch=chap2)

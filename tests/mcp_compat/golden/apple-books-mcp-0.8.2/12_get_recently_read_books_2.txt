@@ -1,0 +1,5 @@
+# get_recently_read_books {"limit": 2} isError=False
+[5] Series Stack by Test Author
+  Progress: Not Started
+[1] Synthetic Book by Test Author
+  Progress: In Progress (42.0%) | Last Read: 2026-09-20

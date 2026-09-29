@@ -1,0 +1,7 @@
+# list_annotations {"book_id": 1} isError=False
+[1] a synthetic highlight — Chapter 1 (ch=chap1)
+[3] Closing words. — Chapter 1 (ch=chap1)
+[4] removed synthetic highlight — Chapter 1 (ch=chap1)
+[10] don’t touch snake_case names — Chapter 2 (ch=chap2)
+[9] Don't panic, it's 100% fine. — Chapter 2 (ch=chap2)
+[2] Opening words. — Chapter 2 (ch=chap2)

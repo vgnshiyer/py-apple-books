@@ -1,0 +1,10 @@
+# get_library_stats {} isError=False
+Total books: 7
+  Finished: 2
+  In progress: 2
+  Unstarted: 3
+Total annotations: 9
+  (2 from books no longer in the library)
+Most annotated books:
+  [1] Synthetic Book: 6
+  [2] Don't Panic: 1

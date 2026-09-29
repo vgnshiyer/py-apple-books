@@ -1,0 +1,5 @@
+# get_chapter_content {"book_id": 1, "chapter_id": "chap2", "max_chars": 20, "offset": 10} isError=False
+
+Opening words. Don'
+
+…(returned chars 10–30 of 107 [20 chars]. Call again with offset=30 to continue; 77 chars remaining.)

@@ -1,0 +1,2 @@
+# get_books_by_genre {"genre": "Fantasy", "limit": 1} isError=False
+[5] Series Stack by Test Author (Fantasy)

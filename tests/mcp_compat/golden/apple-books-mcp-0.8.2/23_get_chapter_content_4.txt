@@ -1,0 +1,2 @@
+# get_chapter_content {"book_id": 1, "chapter_id": "Chapter 5"} isError=False
+Could not read chapter: No chapter or spine entry with id 'Chapter 5'. Use list_chapters() to see available ids.
