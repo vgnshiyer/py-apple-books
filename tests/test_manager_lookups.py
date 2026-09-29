@@ -157,7 +157,7 @@ class TestHasFields:
         assert Book.manager.has_fields("id", "title", "genre")
         assert Annotation.manager.has_fields("note", "selected_text")
         assert Collection.manager.has_fields("is_deleted")
-        assert "PRAGMA anno_db.table_info(ZAEANNOTATION)" in [sql for sql, _ in sql_trace]
+        assert sql_trace == []  # it reads the cached schema, without a statement
 
     def test_dropped_column(self, make_library):
         """In a store without ZGENRE / ZANNOTATIONNOTE (read by a fresh
