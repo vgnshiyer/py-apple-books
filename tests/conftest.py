@@ -1,20 +1,123 @@
 """Shared pytest fixtures.
 
-Includes a helper to build unzipped EPUB bundle directories in a tmp
-path. Apple Books stores EPUBs unzipped on disk, so fixture EPUBs are
-written as directories rather than ``.zip`` files — ``BookContent``
+The whole suite runs against a synthetic Apple Books library: at import
+time, before any test module imports py_apple_books, this file removes
+the developer's APPLE_BOOKS_* settings, builds both stores from the
+committed schema fixture in a temporary HOME and points HOME (and
+APPLE_BOOKS_DATA_DIR) at it. Tests never open the real library and
+don't need one.
+
+Also includes a helper to build unzipped EPUB bundle directories in a
+tmp path. Apple Books stores EPUBs unzipped on disk, so fixture EPUBs
+are written as directories rather than ``.zip`` files — ``BookContent``
 only supports that layout.
 """
 
 from __future__ import annotations
 
+import os
 import pathlib
+import shutil
+import tempfile
 import zipfile
 from dataclasses import dataclass
 from typing import List, Optional
 
 import pytest
 from ebooklib import epub
+
+from tests import _bootstrap
+
+_bootstrap.isolate_environment()
+FIXTURE_HOME = pathlib.Path(tempfile.mkdtemp(prefix="pab-home-"))
+FIXTURE_SCHEMA = _bootstrap.build_home(FIXTURE_HOME)
+os.environ["HOME"] = str(FIXTURE_HOME)
+os.environ["APPLE_BOOKS_DATA_DIR"] = str(FIXTURE_HOME / _bootstrap.DOCUMENTS)
+
+
+def pytest_unconfigure(config):
+    shutil.rmtree(FIXTURE_HOME, ignore_errors=True)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _fixture_home_guard():
+    """Stop the run if the library would resolve outside the fixture HOME."""
+    from py_apple_books.db.client import AppleBooksDBClient
+
+    root = FIXTURE_HOME.resolve()
+    lib_dir = getattr(AppleBooksDBClient, "book_lib_db", (None, None))[1]
+    for label, path in (("Path.home()", pathlib.Path.home()), ("AppleBooksDBClient.book_lib_db", lib_dir)):
+        if path is not None and not pathlib.Path(path).resolve().is_relative_to(root):
+            pytest.exit(f"{label} is {path}, outside the fixture HOME {root}; refusing to run "
+                        f"against a real library", returncode=3)
+
+
+@pytest.fixture
+def library():
+    """The session's synthetic library, emptied before and after each test.
+
+    py_apple_books <= 1.9 binds to this store at import, so ``api`` and
+    the models always read it; tests seed exactly the rows they assert on.
+    """
+    from py_apple_books.testing import FixtureLibrary
+
+    lib = FixtureLibrary(FIXTURE_HOME, FIXTURE_SCHEMA)
+    lib.reset()
+    yield lib
+    lib.reset()
+
+
+@pytest.fixture
+def api(library):
+    """A ``PyAppleBooks`` reading the (empty) session library."""
+    from py_apple_books import PyAppleBooks
+
+    return PyAppleBooks()
+
+
+@pytest.fixture
+def make_library(tmp_path):
+    """Factory for independent libraries under ``tmp_path``.
+
+    ``make_library(schema=None, journal_mode='DELETE')`` returns a new
+    ``FixtureLibrary`` in its own root. py_apple_books <= 1.9 can't be
+    pointed at it in-process; run a subprocess with HOME set to
+    ``lib.root``.
+    """
+    from py_apple_books.testing import FixtureLibrary
+
+    count = {"n": 0}
+
+    def _make(schema: Optional[str] = None, journal_mode: str = "DELETE"):
+        count["n"] += 1
+        return FixtureLibrary.create(tmp_path / f"home-{count['n']}",
+                                     schema or FIXTURE_SCHEMA, journal_mode=journal_mode)
+
+    return _make
+
+
+@pytest.fixture
+def sql_trace(monkeypatch):
+    """Record every statement the read path executes as ``(sql, params)``.
+
+    Hooks ``LibraryDB.execute`` when the connection layer provides it,
+    otherwise ``QueryCompiler.execute`` (1.9), at class level so every
+    manager is covered.
+    """
+    from py_apple_books.db import client
+
+    target = getattr(client, "LibraryDB", None)
+    if target is None:
+        from py_apple_books.db.query import QueryCompiler as target
+    original = target.execute
+    calls = []
+
+    def traced(self, sql, *args, **kwargs):
+        calls.append((sql, args[0] if args else kwargs.get("params", ())))
+        return original(self, sql, *args, **kwargs)
+
+    monkeypatch.setattr(target, "execute", traced)
+    yield calls
 
 
 @dataclass
