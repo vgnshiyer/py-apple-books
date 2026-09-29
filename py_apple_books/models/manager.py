@@ -3,12 +3,15 @@ from __future__ import annotations
 from py_apple_books.db import QueryCompiler
 from py_apple_books.db import AppleBooksDBClient
 from py_apple_books.db import Query
-from py_apple_books.db.client import ANNOTATION_SCHEMA, ANNOTATIONS_NOT_FOUND, current_library, use_library
+from py_apple_books.db.client import (
+    ANNOTATION_SCHEMA, ANNOTATIONS_NOT_FOUND, NOT_A_DATABASE, current_library, use_library,
+)
 from py_apple_books.db.clause import Clause, Not, Q, Subquery, Where, WhereGroup
 from py_apple_books.db.query import CompiledQuery
 from py_apple_books.models.relations import _to_one_names
 from py_apple_books.exceptions import (
     AnnotationStoreNotFoundError,
+    DBError,
     DBQueryError,
     InvalidArgumentError,
     LibraryNotFoundError,
@@ -21,6 +24,7 @@ from typing import (
 )
 from dataclasses import dataclass, replace
 from functools import lru_cache, partial
+import inspect
 import numbers
 import operator
 import re
@@ -160,6 +164,17 @@ def _missing_column(model_name: str, field: Optional[str], table: str, column: s
         table=_display(table), column=column)
 
 
+def _from_schema(error: DBError) -> bool:
+    """Whether a compile error came from the cached schema, which a new
+    read may change: a missing column, or no table for the model. Not a
+    missing store or annotation store, nor a file that isn't a database:
+    reading the schema again would only find them again."""
+    if isinstance(error, UnsupportedSchemaError):
+        return True
+    return (not isinstance(error, AnnotationStoreNotFoundError)
+            and getattr(error, 'path', None) is None and str(error) != NOT_A_DATABASE)
+
+
 def _clause_columns(clause) -> set:
     columns = getattr(clause, 'columns', None)
     return set(columns()) if callable(columns) else set()
@@ -213,10 +228,25 @@ class _Spec:
     limit: Optional[int]
     offset: Optional[int]
 
+    @property
+    def storage_window(self) -> bool:
+        """Whether this is a limit without ``order_by`` or offset: the
+        first rows SQLite reads (storage or index order, R23), which a
+        query of its own, ordered by primary key, would not pick again."""
+        return self.limit is not None and self.offset is None and not self.order
+
+    def reads(self, field: str) -> bool:
+        """Whether rows of this query hold ``field``'s column (``only``
+        and the required fields), where the store has it."""
+        return self.only is None or field in self.only or field in self.manager.required_fields
+
     def sliced(self, start: int, stop: Optional[int]) -> '_Spec':
         """Rows ``[start:stop]`` of this query (``start`` and ``stop`` >= 0),
         composed onto its own limit and offset. The offset is always set,
-        0 included, so an unordered slice is ordered by primary key (R23)."""
+        0 included, so an unordered slice is ordered by primary key (R23).
+        On a :attr:`storage_window` that picks other rows than the
+        window's, so only an answer that doesn't depend on which rows
+        (``exists()``) may use it there."""
         limit = None if stop is None else max(stop - start, 0)
         if self.limit is not None:
             remaining = max(self.limit - start, 0)
@@ -259,8 +289,7 @@ class _Spec:
         select = []
         for field, column in mapping.items():
             if column.upper() in have:
-                wanted = self.only is None or field in self.only or field in required
-                select.append(column if wanted else 'NULL')
+                select.append(column if self.reads(field) else 'NULL')
             elif field in required:
                 raise _missing_column(mgr.model_name, field, table, column)
             else:
@@ -296,9 +325,18 @@ class ModelIterable(Generic[M]):
     order of the rows read. Unordered, ``first()`` is the lowest
     primary key either way.
 
+    The exception is a ``limit`` without ``order_by`` or ``offset``: its
+    rows are the first SQLite reads, in storage (or index) order, which
+    a query of their own can't pick again. There ``first()``, a slice
+    and ``count_by()`` evaluate the iterable and answer from its rows.
+
     ``ModelIterable(callable, model_class)``, the pre-1.10 form, wraps a
     function that returns raw rows; its models' relations read the
     library current when it was created.
+
+    Models keep the library they were read from: relations used after
+    it is closed (a ``with LibraryDB(...)`` block's models, after the
+    block) open its connections again.
     """
 
     def __init__(self, callable: Optional[Callable[[], list]] = None, model_class=None, *,
@@ -325,7 +363,8 @@ class ModelIterable(Generic[M]):
         replaced or an annotation store found). So when compiling fails
         on a missing table or column, or the statement fails with 'no
         such table' or 'no such column', the schema is read again and the
-        query compiled (and run) once more.
+        query compiled (and run) once more. The retry runs outside the
+        first error's handler, so a lasting failure raises one error.
         """
         db = self._db if self._db is not None else current_library()
         compiler = self._spec.manager.compiler
@@ -333,8 +372,10 @@ class ModelIterable(Generic[M]):
             try:
                 query = build(db)
             except (LibraryNotFoundError, UnsupportedSchemaError) as e:
-                if isinstance(e, AnnotationStoreNotFoundError):
+                if not _from_schema(e):
                     raise
+                query = None
+            if query is None:
                 db.invalidate_schema()
                 query = build(db)
             try:
@@ -342,9 +383,9 @@ class ModelIterable(Generic[M]):
             except DBQueryError as e:
                 if not _STALE_SCHEMA.search(str(e)):
                     raise
-                db.invalidate_schema()
-                query = build(db)
-                return compiler.execute(query.sql, query.params)
+            db.invalidate_schema()
+            query = build(db)
+            return compiler.execute(query.sql, query.params)
 
     def run_query(self) -> list:
         """Run the query and return its raw rows, uncached (pre-1.10
@@ -364,11 +405,11 @@ class ModelIterable(Generic[M]):
         if self._objs is None:
             rows = self._fetch()
             from_db = self.model_class.from_db
-            if self._spec is not None:
+            if _takes_db(from_db):
                 objs = [from_db(row, db=self._db) for row in rows]
             else:
-                # A pre-1.10 callable: from_db may be an override without
-                # db=, so the library is recorded afterwards.
+                # A pre-1.10 override without db=: the library is
+                # recorded afterwards.
                 objs = [from_db(row) for row in rows]
                 if self._db is not None:
                     for obj in objs:
@@ -408,7 +449,8 @@ class ModelIterable(Generic[M]):
         if isinstance(index, slice):
             start, stop, step = (None if v is None else operator.index(v)
                                  for v in (index.start, index.stop, index.step))
-            if (self._spec is not None and self._rows is None and self._objs is None
+            if (self._spec is not None and not self._spec.storage_window
+                    and self._rows is None and self._objs is None
                     and step in (None, 1) and (start is None or start >= 0)
                     and (stop is None or stop >= 0)):
                 page = ModelIterable(model_class=self.model_class,
@@ -441,25 +483,30 @@ class ModelIterable(Generic[M]):
 
     def first(self) -> Optional[M]:
         """The first model, or None. Without ``order_by``, that is the one
-        with the lowest primary key, evaluated or not."""
-        if self._spec is not None and not self._spec.order and (
-                self._objs is not None or self._rows is not None):
+        with the lowest primary key, evaluated or not (under a limit
+        without an offset, of the rows the iterable holds)."""
+        spec = self._spec
+        if spec is not None and not spec.order and (
+                self._objs is not None or self._rows is not None or spec.storage_window):
             objs = self._materialize()
             return min(objs, key=operator.attrgetter('id')) if objs else None
         page = self[0:1]
         return page[0] if page else None
 
     def count_by(self, field: str) -> dict:
-        """``{value: number of rows}`` for a model field, grouped in SQL
-        (raw column values, e.g. Core Data seconds for dates). A column
-        the store lacks counts as None.
+        """``{value: number of rows}`` for a model field, grouped in SQL:
+        the raw values the iterable's rows hold (e.g. Core Data seconds
+        for dates), so a column the store lacks, or a field ``only=``
+        leaves out, counts as None.
 
-        An iterable over a pre-1.10 callable groups its raw rows the same
-        way; one built from models (``_from_objects``) counts their
-        attribute values.
+        Under a limit without ``order_by`` or offset (see the class), and
+        on an iterable over a pre-1.10 callable, the raw rows are grouped
+        in Python instead, which evaluates the iterable. One built from
+        models (``_from_objects``) counts their attribute values.
         """
-        if self._spec is None:
-            mgr = self.model_class.manager
+        spec = self._spec
+        if spec is None or spec.storage_window:
+            mgr = self.model_class.manager if spec is None else spec.manager
             mgr._get_db_field(field)  # an unknown field raises
             if self._rows is None and self._objs is not None:
                 values = [getattr(obj, field) for obj in self._objs]
@@ -470,18 +517,30 @@ class ModelIterable(Generic[M]):
             for value in values:
                 counts[value] = counts.get(value, 0) + 1
             return counts
-        spec = self._spec
         mgr = spec.manager
         column = mgr._get_db_field(field)
         # The order only matters for which rows a limit or offset keeps.
         ordered = spec.limit is not None or bool(spec.offset)
 
         def build(db):
-            present = column.upper() in _upper(db.schema().get(mgr.table_name) or frozenset())
+            present = spec.reads(field) and column.upper() in _upper(
+                db.schema().get(mgr.table_name) or frozenset())
             inner = spec.compile(db, fields=[f"{column if present else 'NULL'} AS _k"], ordered=ordered)
             return CompiledQuery(f"SELECT _k, COUNT(*) FROM ({inner.sql}) GROUP BY _k", inner.params)
 
         return {key: n for key, n in self._execute(build)}
+
+
+@lru_cache(maxsize=64)
+def _takes_db(from_db) -> bool:
+    """Whether a model's ``from_db`` accepts ``db=``: an override written
+    before 1.10 may be ``from_db(cls, row)``."""
+    try:
+        parameters = inspect.signature(from_db).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.kind is p.VAR_KEYWORD or (p.name == 'db' and p.kind is not p.POSITIONAL_ONLY)
+               for p in parameters)
 
 
 def _link(objs: list) -> list:

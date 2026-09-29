@@ -143,6 +143,19 @@ def test_count_by_keys_are_raw_values_on_every_path(db, field):
     assert in_python.count_by(field) == in_sql.count_by(field)
 
 
+def test_count_by_counts_what_the_rows_hold(db):
+    """``count_by`` groups the values the iterable's rows hold: a field
+    ``only=`` leaves out counts as None, as it reads on the models, with
+    or without a limit (which groups the rows read, see test_manager)."""
+    for make in (lambda: Book.manager.all(only=["title"]),
+                 lambda: Book.manager.all(only=["title"], limit=4),
+                 lambda: Book.manager.all(only=["title"], limit=4, order_by="-title"),
+                 lambda: Book.manager.all(only=["title"], offset=2)):
+        assert make().count_by("genre") == {None: len(make())}
+        for field in ("title", "asset_id"):  # listed, and required
+            assert make().count_by(field) == Counter(getattr(b, field) for b in make())
+
+
 def test_counts_leave_out_the_order(db, sql_trace):
     """A count doesn't depend on the order, so its SQL has none; its
     columns are still checked."""

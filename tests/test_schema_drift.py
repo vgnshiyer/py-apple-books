@@ -399,11 +399,38 @@ class TestLiveDrift:
             new.replace(lib.library_path)
             clock[0] += 1  # past the file identity recheck, not the schema's
             for _ in range(2):
-                with pytest.raises(LibraryNotFoundError):
+                with pytest.raises(LibraryNotFoundError) as exc:
                     list(Book.manager.all())
+                # One error: the retry runs outside the first one's handler.
+                assert exc.value.__context__ is None
 
 
 class TestMissingStoresAndTables:
+    @pytest.fixture
+    def invalidations(self, monkeypatch):
+        calls = []
+        original = LibraryDB.invalidate_schema
+
+        def counted(self):
+            calls.append(self)
+            original(self)
+
+        monkeypatch.setattr(LibraryDB, "invalidate_schema", counted)
+        return calls
+
+    def test_a_missing_store_is_not_retried(self, tmp_path, invalidations):
+        """Store discovery (or a file that isn't a database) doesn't
+        depend on the cached schema, so it isn't looked for twice."""
+        garbage = tmp_path / "garbage.sqlite"
+        garbage.write_bytes(b"not a database" * 100)
+        for db in (LibraryDB(data_dir=tmp_path / "nothing-here"),
+                   LibraryDB(library_db=garbage, annotation_db=garbage)):
+            with use_library(db), pytest.raises(LibraryNotFoundError) as exc:
+                list(Book.manager.all())
+            assert not isinstance(exc.value.__context__, LibraryNotFoundError)
+            db.close()
+        assert invalidations == []
+
     def test_no_annotation_store(self, make_library):
         lib = make_library()
         book = lib.add_book("Book")
@@ -427,7 +454,8 @@ class TestMissingStoresAndTables:
         with use_library(db):
             for model, table in ((Book, "ZBKLIBRARYASSET"), (Collection, "ZBKCOLLECTION"),
                                  (Annotation, "ZAEANNOTATION")):
-                with pytest.raises(LibraryNotFoundError, match=f"has no {table} table"):
+                with pytest.raises(LibraryNotFoundError, match=f"has no {table} table") as exc:
                     list(model.manager.all())
+                assert exc.value.__context__ is None
             assert not Book.manager.has_fields("id")
         db.close()

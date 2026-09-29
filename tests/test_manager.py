@@ -6,6 +6,8 @@ Each test reads its own ``FixtureLibrary`` through a ``LibraryDB``
 under ``use_library``; statements are counted at ``LibraryDB.execute``.
 """
 
+from collections import Counter
+
 import pytest
 
 from py_apple_books.db import AppleBooksDBClient, LibraryDB, QueryCompiler, use_library
@@ -197,6 +199,73 @@ class TestFirstAndExists:
         list(titled)
         assert titled.first().title == "Book 0"
         assert ModelIterable._from_objects(Book, reversed(list(titled))).first().title == "Book 9"
+
+
+class TestStorageWindow:
+    """A limit without order_by or offset keeps the first rows SQLite
+    reads (R23). Here the ZASSETID index returns them against primary-key
+    order, so a query of its own ordered by primary key (or reading only
+    the asset id, from the index) would pick other rows."""
+
+    @pytest.fixture
+    def keys(self, lib_db):
+        lib = lib_db.fixture
+        for i in range(10):
+            lib.add_book(f"Book {i}", asset_id=f"A{9 - i}", genre=("Fiction", "History")[i % 2])
+        with use_library(lib_db):
+            yield [f"A{i}" for i in range(10)]
+
+    @staticmethod
+    def windows(keys):
+        return {"asset_id__in": lambda: Book.manager.filter(asset_id__in=keys, limit=3),
+                "all": lambda: Book.manager.all(limit=3)}
+
+    def test_premise_the_index_order_is_not_primary_key_order(self, keys):
+        listed = ids(Book.manager.filter(asset_id__in=keys, limit=3))
+        assert listed != sorted(listed)
+        assert set(listed).isdisjoint(ids(Book.manager.all(order_by="id", limit=3)))
+
+    @pytest.mark.parametrize("s", [slice(0, 3), slice(1, None), slice(None, 2), slice(1, 2),
+                                   slice(0, 1), slice(2, 10), slice(5, None), slice(-2, None)])
+    def test_slices_come_from_the_rows_listed(self, keys, sql_trace, s):
+        for window in self.windows(keys).values():
+            listed = ids(window())
+            before = len(sql_trace)
+            it = window()
+            assert ids(it[s]) == listed[s]
+            # One statement, which evaluates the iterable.
+            assert len(sql_trace) == before + 1 and repr(it) == "<ModelIterable[Book]: 3 rows>"
+            assert ids(it) == listed and len(sql_trace) == before + 1
+
+    def test_first_is_in_the_list_before_and_after_evaluation(self, keys, sql_trace):
+        for window in self.windows(keys).values():
+            listed = ids(window())
+            unevaluated = window().first()
+            evaluated = window()
+            list(evaluated)
+            assert unevaluated.id == evaluated.first().id == min(listed)
+            assert unevaluated.id in listed
+
+    def test_count_by_counts_the_rows_listed(self, keys):
+        for window in self.windows(keys).values():
+            for field in ("asset_id", "genre", "id"):
+                assert window().count_by(field) == Counter(getattr(b, field) for b in window())
+
+    def test_count_and_exists_stay_one_query(self, keys, sql_trace):
+        for window in self.windows(keys).values():
+            it = window()
+            assert it.count() == 3 and it.exists()
+            assert repr(it) == "<ModelIterable[Book]: unevaluated>"
+        assert len(sql_trace) == 4
+
+    def test_ordered_or_offset_windows_keep_the_one_query_slice(self, keys, sql_trace):
+        for make in (lambda: Book.manager.filter(asset_id__in=keys, limit=3, order_by="title"),
+                     lambda: Book.manager.filter(asset_id__in=keys, limit=3, offset=0)):
+            listed = ids(make())
+            it = make()
+            before = len(sql_trace)
+            assert ids(it[1:3]) == listed[1:3] and it.first().id == listed[0]
+            assert len(sql_trace) == before + 2 and repr(it) == "<ModelIterable[Book]: unevaluated>"
 
 
 class TestOnly:
