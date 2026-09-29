@@ -40,6 +40,26 @@ RUNAWAY = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELEC
 
 needs_permissions = pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
 
+# Run in another process: whether some process holds a lock on SQLite's
+# SHARED byte range of the file. A WAL reader holds it while it is open,
+# which keeps others from checkpointing and deleting the -wal under it.
+SHARED_RANGE_PROBE = (
+    "import fcntl, os, sys\n"
+    "fd = os.open(sys.argv[1], os.O_RDWR)\n"
+    "try:\n"
+    "    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 510, 0x40000002)\n"
+    "    print('free')\n"
+    "except OSError:\n"
+    "    print('held')\n"
+)
+
+
+def _shared_lock_held(path):
+    proc = subprocess.run([sys.executable, "-c", SHARED_RANGE_PROBE, str(path)],
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return proc.stdout.strip() == "held"
+
 
 # -- import and discovery -------------------------------------------------------
 
@@ -98,6 +118,41 @@ def test_access_denied_to_an_explicit_store(lib_db):
     finally:
         path.chmod(0o644)
     assert exc.value.path == path
+
+
+@pytest.mark.parametrize("failure", [pytest.param("unreadable", marks=needs_permissions), "removed"])
+def test_failed_connect_keeps_this_process_locks(make_library, failure):
+    """A connect that fails on one store doesn't open() and close() the
+    store files to find out why: closing a descriptor drops every POSIX
+    lock this process holds on the file, including the pool's."""
+    lib = make_library(journal_mode="WAL")
+    lib.add_book("Synthetic Book")
+    db = LibraryDB(data_dir=lib.data_dir)
+    with db.connection() as held:
+        assert held.execute(COUNT_BOOKS).fetchone() == (1,)
+        assert _shared_lock_held(lib.library_path)
+        # The next statement needs a second connection; its ATTACH fails.
+        if failure == "unreadable":
+            lib.annotation_path.chmod(0)
+            try:
+                with pytest.raises(LibraryAccessDeniedError) as exc:
+                    db.execute(COUNT_BOOKS)
+            finally:
+                lib.annotation_path.chmod(0o644)
+            assert exc.value.path == lib.annotation_path
+        else:
+            lib.annotation_path.rename(lib.root / "moved.sqlite")
+            assert db.execute(COUNT_BOOKS) == [(1,)]  # resolved again, without annotations
+            assert db.paths().annotations is None
+        assert _shared_lock_held(lib.library_path)
+    db.close()
+
+
+def test_store_removed_after_its_path_was_resolved(lib_db):
+    assert lib_db.paths().library == lib_db.fixture.library_path
+    lib_db.fixture.library_path.unlink()
+    with pytest.raises(LibraryNotFoundError, match="No Apple Books library store found"):
+        lib_db.execute(COUNT_BOOKS)
 
 
 def test_missing_annotation_store(make_library):
@@ -183,8 +238,8 @@ def test_pool_bounds(lib_db, monkeypatch):
 
     real_connect, real_close = db._connect, client._close_quietly
 
-    def connect(paths, check_same_thread):
-        conn = real_connect(paths, check_same_thread)
+    def connect(*args):
+        conn = real_connect(*args)
         track("open", 1)
         return conn
 
@@ -232,6 +287,33 @@ def test_transaction_left_open_is_rolled_back(lib_db):
         assert again is conn and not again.in_transaction
 
 
+def test_connection_is_returned_without_a_progress_handler(lib_db):
+    db = LibraryDB(data_dir=lib_db.fixture.data_dir, query_timeout=None, max_idle=1)
+    with db.connection() as conn:
+        conn.set_progress_handler(lambda: 1, 1)  # would stop every statement
+    assert db.execute("SELECT 1") == [(1,)]
+    db.close()
+
+
+def test_dropping_a_library_closes_its_connections(lib_db):
+    """Without this, sqlite3 connections wait for the cyclic garbage
+    collector, keeping their files open."""
+    db = LibraryDB(data_dir=lib_db.fixture.data_dir)
+    assert db.execute(COUNT_BOOKS) == [(0,)]
+    conn = db._idle[0].conn
+    del db
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+
+    with LibraryDB(data_dir=lib_db.fixture.data_dir) as db:
+        assert db.execute(COUNT_BOOKS) == [(0,)]
+        conn = db._idle[0].conn
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+    assert db.execute(COUNT_BOOKS) == [(0,)]  # still usable
+    db.close()
+
+
 def test_close_keeps_the_library_usable(lib_db):
     assert lib_db.execute(COUNT_BOOKS) == [(0,)]
     [pooled] = lib_db._idle
@@ -245,8 +327,10 @@ def test_close_keeps_the_library_usable(lib_db):
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 def test_fork_child(lib_db):
+    """The child makes its own connections; the parent's stay unused."""
     lib_db.fixture.add_book("Synthetic Book")
-    assert lib_db.execute(COUNT_BOOKS) == [(1,)]  # the parent holds a pooled connection
+    assert lib_db.execute(COUNT_BOOKS) == [(1,)]
+    [parents] = lib_db._idle
     read_end, write_end = os.pipe()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)  # fork() with other threads alive
@@ -257,6 +341,8 @@ def test_fork_child(lib_db):
             os.close(read_end)
             with use_library(lib_db):
                 result = (lib_db.execute(COUNT_BOOKS), [b.title for b in PyAppleBooks().list_books()])
+            own = [p.conn is not parents.conn and p.pid == os.getpid() for p in lib_db._idle]
+            result += (own, [p is parents for p in lib_db._inherited])
             os.write(write_end, repr(result).encode())
             status = 0
         finally:
@@ -266,8 +352,26 @@ def test_fork_child(lib_db):
         output = pipe.read()
     _, status = os.waitpid(pid, 0)
     assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
-    assert output == repr(([(1,)], ["Synthetic Book"])).encode()
+    assert output == repr(([(1,)], ["Synthetic Book"], [True], [True])).encode()
     assert lib_db.execute(COUNT_BOOKS) == [(1,)]
+    assert lib_db._idle == [parents]
+
+
+def test_fork_bookkeeping(lib_db):
+    """What a (grand)child does on first use, simulated by changing the
+    recorded pid."""
+    assert lib_db.execute(COUNT_BOOKS) == [(0,)]
+    [first] = lib_db._idle
+    lib_db._pid = -1  # a child
+    lib_db.invalidate_schema()
+    assert lib_db._inherited == [first] and lib_db._idle == []
+    assert lib_db.execute(COUNT_BOOKS) == [(0,)]
+    [second] = lib_db._idle
+    lib_db._pid = -2  # a grandchild keeps both generations referenced
+    assert lib_db.execute(COUNT_BOOKS) == [(0,)]
+    assert lib_db._inherited == [first, second] and lib_db._idle[0] not in (first, second)
+    for pooled in lib_db._inherited:
+        pooled.conn.close()
 
 
 # -- deadlines and errors -----------------------------------------------------
@@ -293,6 +397,50 @@ def test_query_deadline(lib_db):
     assert time.monotonic() - start < 1
     with query_deadline(None):
         assert db.execute("SELECT 1") == [(1,)]
+    db.close()
+
+
+@pytest.mark.parametrize("pooled", [True, False])
+def test_lock_waits_end_at_the_deadline(make_library, pooled):
+    """Waiting for another connection's lock (rollback journal) ends at
+    the deadline, on a pooled connection or while connecting."""
+    lib = make_library()
+    if pooled:
+        db = LibraryDB(data_dir=lib.data_dir, query_timeout=0.3)
+        assert db.execute(COUNT_BOOKS) == [(0,)]
+    else:  # explicit files: no discovery
+        db = LibraryDB(library_db=lib.library_path, annotation_db=lib.annotation_path,
+                       query_timeout=0.3)
+    writer = sqlite3.connect(lib.library_path, isolation_level=None, timeout=0)
+    writer.execute("BEGIN EXCLUSIVE")
+    try:
+        start = time.monotonic()
+        with pytest.raises(QueryTimeoutError, match=r"Timed out waiting for a locked database \(limit 0\.3 s\)"):
+            db.execute(COUNT_BOOKS)
+        assert time.monotonic() - start < 1.5
+    finally:
+        writer.execute("ROLLBACK")
+        writer.close()
+    assert db.execute(COUNT_BOOKS) == [(0,)]
+    db.close()
+
+
+def test_a_sooner_deadline_shortens_the_lock_wait(make_library):
+    lib = make_library()
+    db = LibraryDB(data_dir=lib.data_dir, query_timeout=None, max_idle=1)
+    assert db.execute(COUNT_BOOKS) == [(0,)]
+    writer = sqlite3.connect(lib.library_path, isolation_level=None, timeout=0)
+    writer.execute("BEGIN EXCLUSIVE")
+    try:
+        start = time.monotonic()
+        with query_deadline(0.3), pytest.raises(QueryTimeoutError, match=r"locked database \(limit 0\.3 s\)"):
+            db.execute(COUNT_BOOKS)
+        assert time.monotonic() - start < 1.5
+    finally:
+        writer.execute("ROLLBACK")
+        writer.close()
+    assert db.execute(COUNT_BOOKS) == [(0,)]
+    assert db._idle[0].busy == client._BUSY_TIMEOUT  # back to the usual wait
     db.close()
 
 

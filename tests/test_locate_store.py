@@ -7,11 +7,14 @@ metadata, so they validate) or files that aren't stores.
 import logging
 import os
 import shutil
+import sqlite3
 import time
+from unittest import mock
 
 import pytest
 
 from py_apple_books.db import LibraryDB, locate_store
+from py_apple_books.db import client
 from py_apple_books.db.client import FALLBACK_TTL, find_sqlite_file
 from py_apple_books.exceptions import (
     AmbiguousStoreError,
@@ -177,6 +180,44 @@ def test_fallback_store_is_replaced_in_the_pool(lib):
     _copy(valid, folder / "BKLibrary-2-1.sqlite")
     now[0] += FALLBACK_TTL
     assert db.execute("SELECT count(*) FROM ZBKLIBRARYASSET") == [(0,)]
+    db.close()
+
+
+@pytest.mark.parametrize("canonical", ["missing", "locked"])
+def test_store_chosen_without_the_canonical_one_expires(lib, canonical):
+    """A copy chosen while the canonical file was briefly missing (a
+    non-atomic replace) or locked is used for FALLBACK_TTL at most."""
+    count = "SELECT count(*) FROM ZBKLIBRARYASSET"
+    copy = _copy(lib.library_path, lib.library_path.parent / COPY)
+    lib.add_book("Added after the copy")
+    db = LibraryDB(data_dir=lib.data_dir)
+    now = [1000.0]
+    db._clock = lambda: now[0]
+    assert db.execute(count) == [(1,)]
+
+    now[0] += 1  # time for the pool to re-check the files
+    if canonical == "missing":
+        moved = lib.library_path.rename(lib.root / "staging.sqlite")
+        assert db.execute(count) == [(0,)]
+        moved.rename(lib.library_path)
+    else:
+        db.close()
+        writer = sqlite3.connect(lib.library_path, isolation_level=None, timeout=0)
+        writer.execute("BEGIN EXCLUSIVE")
+        try:
+            with mock.patch.object(client, "_DISCOVERY_BUSY_TIMEOUT", 0.01):
+                assert db.paths().library == copy
+        finally:
+            writer.execute("ROLLBACK")
+            writer.close()
+    assert db.paths().library == copy
+    now[0] += FALLBACK_TTL - 1
+    assert db.execute(count) == [(0,)]
+    now[0] += 1
+    assert db.execute(count) == [(1,)]
+    assert db.paths().library == lib.library_path
+    now[0] += 100 * FALLBACK_TTL
+    assert db.paths().library == lib.library_path
     db.close()
 
 

@@ -51,8 +51,9 @@ _T = TypeVar("_T")
 #: ``APPLE_BOOKS_QUERY_TIMEOUT`` or ``LibraryDB(query_timeout=...)`` says
 #: otherwise.
 DEFAULT_QUERY_TIMEOUT = 30.0
-#: Seconds a store chosen by the unvalidated fallback is used before
-#: discovery runs again.
+#: Seconds a store other than a valid canonical file is used before
+#: discovery runs again: the unvalidated fallback, or another store
+#: chosen while the canonical file was missing, locked or invalid.
 FALLBACK_TTL = 30.0
 #: Seconds between lookups of a missing annotation store.
 ANNOTATION_RETRY = 30.0
@@ -64,6 +65,14 @@ SCHEMA_RECHECK = 2.0
 #: per statement would add about 10% to the 1.9-style ORM's thousands of
 #: statements per call.
 IDENTITY_RECHECK = 0.02
+# Seconds SQLite waits for a lock another process holds (sqlite3's
+# default); less when the statement's deadline is sooner.
+_BUSY_TIMEOUT = 5.0
+# A pooled connection's wait is changed only when it is off by more.
+_BUSY_SLACK = 0.05
+# The wait of the Core Data metadata reads that validate a store (as in
+# read_store_metadata).
+_DISCOVERY_BUSY_TIMEOUT = 2.0
 
 ENV_DATA_DIR = "APPLE_BOOKS_DATA_DIR"
 ENV_LIBRARY_DB = "APPLE_BOOKS_LIBRARY_DB"
@@ -176,11 +185,33 @@ def _listing_error(store: _Store, e: OSError) -> DBConnectionError:
 
 
 def _is_store(path: Path, entity: str) -> bool:
-    """Whether ``path`` is a Core Data store whose model has ``entity``."""
+    """Whether ``path`` is a Core Data store whose model has ``entity``.
+
+    Store files are only ever opened through SQLite. Closing a
+    descriptor drops every POSIX lock this process holds on the file,
+    including those of connections still reading it, and SQLite keeps
+    its descriptors open while such locks are held. (Hence the
+    connection handed to ``read_store_metadata``: given a path it fails
+    to open, that function probes it with ``open()``.) Only regular
+    files are opened: SQLite would block forever on a FIFO.
+    """
     try:
-        meta = read_store_metadata(path)
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return False
     except PermissionError as e:
         raise LibraryAccessDeniedError(ACCESS_DENIED, path=path) from e
+    except (OSError, ValueError):
+        return False
+    try:
+        conn = sqlite3.connect(read_only_uri(path), uri=True, timeout=_DISCOVERY_BUSY_TIMEOUT)
+    except sqlite3.Error as e:
+        if _access_denied(path):
+            raise LibraryAccessDeniedError(ACCESS_DENIED, path=path) from e
+        return False
+    try:
+        meta = read_store_metadata(conn)
+    finally:
+        conn.close()
     return meta is not None and entity in meta.entities
 
 
@@ -196,10 +227,13 @@ def _last_write(path: Path) -> float:
 
 
 def _locate(kind: str, data_dir=None, strict: bool = False) -> Tuple[Path, bool]:
-    """:func:`locate_store`, plus whether the store was validated.
+    """:func:`locate_store`, plus whether the store is settled: the
+    canonical file, validated.
 
-    ``False`` means the unvalidated fallback chose it; :class:`LibraryDB`
-    re-runs discovery after :data:`FALLBACK_TTL` in that case.
+    ``False`` means the canonical file was missing, locked or invalid,
+    and another store or the unvalidated fallback was chosen. That may
+    be passing (a store being replaced, or written), so :class:`LibraryDB`
+    re-runs discovery after :data:`FALLBACK_TTL`.
     """
     store = _store(kind)
     base = _as_path(data_dir) if data_dir is not None else default_data_dir()
@@ -213,10 +247,8 @@ def _locate(kind: str, data_dir=None, strict: bool = False) -> Tuple[Path, bool]
     except OSError as e:
         raise _listing_error(store, e) from e
 
-    # Validation reads Z_METADATA through SQLite, which also reports a
-    # file the OS won't let us read. It never open()s the file itself:
-    # closing a descriptor drops this process's POSIX locks on the file,
-    # including those of connections already open on it.
+    # Validation reads Z_METADATA through SQLite, and reports a file the
+    # OS won't let us read, without open()ing it (see _is_store).
     if store.canonical in names and _is_store(directory / store.canonical, store.entity):
         return directory / store.canonical, True
 
@@ -225,7 +257,7 @@ def _locate(kind: str, data_dir=None, strict: bool = False) -> Tuple[Path, bool]
              and _is_store(directory / name, store.entity)]
     candidates = [name for name in valid if store.generation.fullmatch(name)] or valid
     if len(candidates) == 1:
-        return directory / candidates[0], True
+        return directory / candidates[0], False
     if candidates:
         if strict:
             raise AmbiguousStoreError(
@@ -235,7 +267,7 @@ def _locate(kind: str, data_dir=None, strict: bool = False) -> Tuple[Path, bool]
         logger.warning("Several Apple Books %s stores found in %s/ (%s); using the most "
                        "recently written one, %s.", kind, store.subdir, ", ".join(candidates),
                        chosen.name)
-        return chosen, True
+        return chosen, False
 
     if names and not strict:
         name = store.canonical if store.canonical in names else names[0]
@@ -287,19 +319,38 @@ def _require_file(path: Path, kind: str) -> Path:
 
 
 def _access_denied(path) -> bool:
-    """Whether the OS refuses to let this process read ``path``.
+    """Whether the OS refuses to let this process read ``path``, which
+    SQLite failed to open.
 
-    Only called after SQLite failed to open ``path``. ``O_NONBLOCK``
-    because a FIFO would block.
+    Asked without opening the file (see :func:`_is_store`): ``stat()``
+    and ``access()`` it, and list its folder, which is what macOS
+    privacy protection refuses.
     """
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        os.stat(path)
+        if not os.access(path, os.R_OK):
+            return True
+        with os.scandir(os.path.dirname(os.fspath(path)) or os.curdir):
+            pass
     except PermissionError:
         return True
     except (OSError, TypeError, ValueError):
         return False
-    os.close(fd)
     return False
+
+
+def _busy_wait(deadline: Optional[float]) -> float:
+    """Seconds SQLite may wait for a lock, given the statement's deadline."""
+    if deadline is None:
+        return _BUSY_TIMEOUT
+    return min(_BUSY_TIMEOUT, max(0.0, deadline - time.monotonic()))
+
+
+def _gave_up_on_lock(e, deadline: Optional[float]) -> bool:
+    """Whether ``e`` is SQLite giving up on a lock because the deadline
+    came (see :func:`_busy_wait`)."""
+    return (deadline is not None and isinstance(e, sqlite3.OperationalError)
+            and "locked" in str(e) and time.monotonic() >= deadline - _BUSY_SLACK)
 
 
 def _identity(path: Optional[Path]):
@@ -375,13 +426,21 @@ class StorePaths(NamedTuple):
     annotations: Optional[Path]
 
 
-class _Pooled(NamedTuple):
-    conn: sqlite3.Connection
-    paths: StorePaths
-    #: ``_identity`` of both files, taken just before they were opened.
-    identity: tuple
-    pid: int
-    generation: int
+class _Pooled:
+    """A pooled connection and what it was opened on."""
+
+    __slots__ = ("conn", "paths", "identity", "pid", "generation", "busy")
+
+    def __init__(self, conn: sqlite3.Connection, paths: StorePaths, identity: tuple,
+                 pid: int, generation: int, busy: float):
+        self.conn = conn
+        self.paths = paths
+        #: ``_identity`` of both files, taken just before they were opened.
+        self.identity = identity
+        self.pid = pid
+        self.generation = generation
+        #: Seconds SQLite waits for a lock on this connection.
+        self.busy = busy
 
 
 class _Schema(NamedTuple):
@@ -425,7 +484,14 @@ class LibraryDB:
     an error: book and collection queries work, and it is looked for
     again every :data:`ANNOTATION_RETRY` seconds.
 
-    Thread-safe. A connection is used by one thread at a time.
+    Thread-safe. A connection is used by one thread at a time. Close a
+    library you made when done with it (:meth:`close`, or ``with``):
+    dropping it closes its idle connections too, but only in the
+    process that opened them.
+
+    A forked child makes its own connections. Fork only while no other
+    thread is running a query: SQLite's internal locks are copied in
+    whatever state they were in.
     """
 
     def __init__(self, data_dir=None, *, library_db=None, annotation_db=None,
@@ -447,10 +513,14 @@ class LibraryDB:
         self._lock = threading.RLock()
         self._slots = threading.BoundedSemaphore(max_connections)
         self._idle: List[_Pooled] = []
+        # Idle connections a forked child got from its parents: never
+        # used, and kept referenced so garbage collection doesn't close
+        # them.
+        self._inherited: List[_Pooled] = []
         # Bumped whenever pooled connections must not be reused.
         self._generation = 0
         self._paths: Optional[StorePaths] = None
-        # Clock time the cached paths expire (a fallback was used).
+        # Clock time the cached paths expire (a store is not settled; see _locate).
         self._paths_expire: Optional[float] = None
         # Clock time of the last failed annotation store lookup.
         self._annotations_attempt: Optional[float] = None
@@ -466,6 +536,25 @@ class LibraryDB:
             ("data_dir", self._data_dir), ("library_db", self._library_db),
             ("annotation_db", self._annotation_db)) if value is not None]
         return f"LibraryDB({', '.join(args)})"
+
+    def __enter__(self) -> "LibraryDB":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+    def __del__(self):
+        # Close the idle connections now: left alone they wait for the
+        # cyclic garbage collector (sqlite3's statement cache refers back
+        # to its connection), and SQLite keeps the files of connections
+        # closed then open for as long as another connection of this
+        # process holds a lock on them.
+        try:
+            if self._pid == os.getpid():
+                for pooled in self._idle:
+                    pooled.conn.close()
+        except Exception:
+            pass
 
     # -- store paths ------------------------------------------------------
 
@@ -485,14 +574,14 @@ class LibraryDB:
         return _locate(kind, data_dir, strict)
 
     def _resolve(self, now: float) -> Tuple[StorePaths, Optional[float]]:
-        library, library_valid = self._find("library")
+        library, library_settled = self._find("library")
         try:
-            annotations, annotations_valid = self._find("annotations")
+            annotations, annotations_settled = self._find("annotations")
             self._annotations_attempt = None
         except AnnotationStoreNotFoundError:
-            annotations, annotations_valid = None, True
+            annotations, annotations_settled = None, True
             self._annotations_attempt = now
-        expire = None if library_valid and annotations_valid else now + FALLBACK_TTL
+        expire = None if library_settled and annotations_settled else now + FALLBACK_TTL
         return StorePaths(library, annotations), expire
 
     def paths(self) -> StorePaths:
@@ -538,13 +627,13 @@ class LibraryDB:
             if last is not None and now - last < ANNOTATION_RETRY:
                 return False
             try:
-                annotations, valid = self._find("annotations")
+                annotations, settled = self._find("annotations")
             except AnnotationStoreNotFoundError:
                 self._annotations_attempt = now
                 return False
             self._annotations_attempt = None
             self._paths = paths._replace(annotations=annotations)
-            if not valid:
+            if not settled:
                 expire = now + FALLBACK_TTL
                 self._paths_expire = expire if self._paths_expire is None else min(self._paths_expire, expire)
             self._generation += 1
@@ -574,21 +663,23 @@ class LibraryDB:
         pid = os.getpid()
         if pid != self._pid:
             # A forked child: the parent's connections and locks aren't
-            # ours. Set the connections aside unused and unclosed (and
-            # still referenced, so garbage collection doesn't close them).
+            # ours. Set the connections aside unused and unclosed.
             self._pid = pid
-            self._inherited, self._idle = self._idle, []
+            self._inherited = self._inherited + self._idle
+            self._idle = []
             self._lock = threading.RLock()
             self._slots = threading.BoundedSemaphore(self.max_connections)
             self._generation += 1
 
-    def _connect(self, paths: StorePaths, check_same_thread: bool) -> sqlite3.Connection:
-        """A configured read-only connection to ``paths``."""
+    def _connect(self, paths: StorePaths, check_same_thread: bool,
+                 busy: float = _BUSY_TIMEOUT) -> sqlite3.Connection:
+        """A configured read-only connection to ``paths``, waiting at most
+        ``busy`` seconds for a lock."""
         try:
-            conn = sqlite3.connect(read_only_uri(paths.library), uri=True,
+            conn = sqlite3.connect(read_only_uri(paths.library), uri=True, timeout=busy,
                                    check_same_thread=check_same_thread)
         except sqlite3.Error as e:
-            raise self._connect_error(e, paths) from e
+            raise self._connect_error(e, paths.library, "library") from e
         try:
             conn.execute("PRAGMA query_only=1")
             if paths.annotations is not None:
@@ -598,28 +689,62 @@ class LibraryDB:
             _register_functions(conn)
         except sqlite3.Error as e:
             conn.close()
-            raise self._connect_error(e, paths) from e
+            # Of these statements only the ATTACH opens a file.
+            if paths.annotations is not None:
+                raise self._connect_error(e, paths.annotations, "annotations") from e
+            raise self._connect_error(e, paths.library, "library") from e
         return conn
 
     @staticmethod
-    def _connect_error(e: sqlite3.Error, paths: StorePaths) -> DBError:
-        if "not a database" in str(e):
-            return LibraryNotFoundError(NOT_A_DATABASE)
-        if "unable to open" in str(e):
-            for path in paths:
-                if path is not None and _access_denied(path):
-                    return LibraryAccessDeniedError(ACCESS_DENIED, path=path)
-        return DBConnectionError(f"Error connecting to database: {e}")
+    def _connect_error(e: sqlite3.Error, path: Path, kind: str) -> DBError:
+        """The error for SQLite failing to open (or attach) ``path``.
 
-    def _open(self) -> _Pooled:
-        with self._lock:
-            paths = self.paths()
-            generation = self._generation
-        # Identity before opening: if a file is replaced in between, the
-        # connection looks stale at its next checkout rather than fresh.
-        identity = (_identity(paths.library), _identity(paths.annotations))
-        conn = self._connect(paths, check_same_thread=False)
-        return _Pooled(conn, paths, identity, os.getpid(), generation)
+        The file is never opened here: other connections of this process
+        may hold locks on it (see :func:`_is_store`).
+        """
+        message = str(e)
+        if "not a database" in message:
+            return LibraryNotFoundError(NOT_A_DATABASE)
+        if "unable to open" in message:
+            if _access_denied(path):
+                return LibraryAccessDeniedError(ACCESS_DENIED, path=path)
+            if _identity(path) is None:
+                store = _store(kind)
+                return store.missing_error(store.missing_message, path=path)
+            # An ATTACH's message goes on to name the file.
+            message = "unable to open database file"
+        return DBConnectionError(f"Error connecting to database: {message}")
+
+    def _connect_current(self, check_same_thread: bool, busy: float):
+        """Connect to the resolved stores: ``(connection, paths, identity,
+        generation)``.
+
+        A store file gone since the paths were resolved (removed, or
+        halfway through a replacement) makes them resolve again, and the
+        connection is tried once more.
+        """
+        for last in (False, True):
+            with self._lock:
+                paths = self.paths()
+                generation = self._generation
+            # Identity before opening: if a file is replaced in between, the
+            # connection looks stale at its next checkout rather than fresh.
+            identity = (_identity(paths.library), _identity(paths.annotations))
+            try:
+                return self._connect(paths, check_same_thread, busy), paths, identity, generation
+            except LibraryNotFoundError as e:
+                if e.path is None:
+                    raise  # not a database
+                with self._lock:
+                    if self._paths == paths:
+                        self._paths = self._paths_expire = None
+                if last:
+                    raise
+
+    def _open(self, deadline: Optional[float] = None) -> _Pooled:
+        busy = _busy_wait(deadline)
+        conn, paths, identity, generation = self._connect_current(False, busy)
+        return _Pooled(conn, paths, identity, os.getpid(), generation, busy)
 
     def open_connection(self) -> sqlite3.Connection:
         """A new read-only connection to this library, owned by the
@@ -630,7 +755,7 @@ class LibraryDB:
         to the calling thread and not subject to the query timeout.
         """
         self.has_annotations()
-        return self._connect(self.paths(), check_same_thread=True)
+        return self._connect_current(True, _BUSY_TIMEOUT)[0]
 
     def _fresh(self, pooled: _Pooled) -> bool:
         """Whether an idle connection may be reused: its store files are
@@ -695,10 +820,18 @@ class LibraryDB:
             raise QueryTimeoutError(
                 f"Timed out waiting for a database connection (limit {limit:g} s).", timeout=limit)
         try:
-            return self._take_idle() or self._open(), slots
+            return self._take_idle() or self._open(deadline), slots
         except BaseException:
             slots.release()
             raise
+
+    @staticmethod
+    def _limit_busy_wait(pooled: _Pooled, deadline: Optional[float]) -> None:
+        """Make SQLite wait for a lock no longer than ``deadline`` allows."""
+        busy = _busy_wait(deadline)
+        if abs(busy - pooled.busy) > _BUSY_SLACK:
+            pooled.conn.execute(f"PRAGMA busy_timeout = {round(busy * 1000)}")
+            pooled.busy = busy
 
     def _release(self, pooled: _Pooled, slots: threading.BoundedSemaphore) -> None:
         try:
@@ -712,17 +845,28 @@ class LibraryDB:
 
         :param deadline: ``time.monotonic()`` value by which a connection
             must be free; :class:`QueryTimeoutError` otherwise. None waits
-            as long as it takes.
+            as long as it takes. SQLite then waits no longer than that
+            for a lock another process holds; statements aren't stopped.
 
-        The connection is shared with other threads between checkouts:
-        don't keep it, or a cursor, after the block. An open transaction
-        is rolled back when it is returned.
+        The connection goes back to the pool, and to other threads,
+        after the block, so leave it as you found it:
+
+        - Don't keep it, or a cursor, after the block. Fetch all rows or
+          close each cursor inside it: an unfinished ``SELECT`` keeps a
+          read lock on the store, which can hold up Apple Books' writes.
+        - Don't detach ``anno_db``, change PRAGMAs or register functions.
+
+        An open transaction is rolled back and a progress handler
+        removed when it is returned.
         """
         self.paths()  # an expired fallback is resolved again first
         pooled, slots = self._acquire(deadline, None)
         try:
+            self._limit_busy_wait(pooled, deadline)
             yield pooled.conn
         finally:
+            with contextlib.suppress(sqlite3.Error):
+                pooled.conn.set_progress_handler(None, 0)
             self._release(pooled, slots)
 
     def close(self) -> None:
@@ -767,19 +911,28 @@ class LibraryDB:
                 if deadline is not None:
                     conn.set_progress_handler(lambda: time.monotonic() > deadline, _PROGRESS_OPCODES)
                 try:
+                    if pooled.busy != _BUSY_TIMEOUT or (
+                            deadline is not None and deadline - time.monotonic() < _BUSY_TIMEOUT):
+                        self._limit_busy_wait(pooled, deadline)
                     return fn(pooled)
                 finally:
                     if deadline is not None:
                         conn.set_progress_handler(None, 0)
             finally:
                 self._release(pooled, slots)
-        except AppleBooksError:
+        except AppleBooksError as e:
+            if isinstance(e, DBConnectionError) and _gave_up_on_lock(e.__cause__, deadline):
+                raise QueryTimeoutError(
+                    f"Timed out waiting for a locked database (limit {limit:g} s).", timeout=limit) from e
             raise
         except sqlite3.OperationalError as e:
             message = str(e)
             if "interrupted" in message and deadline is not None:
                 raise QueryTimeoutError(
                     f"Query took too long and was stopped (limit {limit:g} s).", timeout=limit) from e
+            if _gave_up_on_lock(e, deadline):
+                raise QueryTimeoutError(
+                    f"Timed out waiting for a locked database (limit {limit:g} s).", timeout=limit) from e
             if (f"{ANNOTATION_SCHEMA}." in message or f"database {ANNOTATION_SCHEMA}" in message) \
                     and pooled is not None and pooled.paths.annotations is None:
                 raise AnnotationStoreNotFoundError(ANNOTATIONS_NOT_FOUND) from e
@@ -865,6 +1018,7 @@ class LibraryDB:
 
     def invalidate_schema(self) -> None:
         """Make the next :meth:`schema` call read the schema again."""
+        self._check_fork()
         with self._lock:
             self._schema = None
 
