@@ -1,0 +1,64 @@
+[build-system]
+# 77+: PEP 639 `license` expressions and `license-files`.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-apple-books"
+# Single source for the version: py_apple_books/__init__.py.
+dynamic = ["version"]
+description = "Python library for Apple Books"
+readme = "README.md"
+# 3.10+: PEP 604 `X | None` annotations are evaluated at import.
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Vignesh Iyer", email = "vgnshiyer@gmail.com" }]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = [
+    # EPUB parsing: handles EPUB2 (NCX) and EPUB3 (nav doc) ToCs.
+    "ebooklib>=0.20",
+    # XHTML → plain text for chapter content extraction.
+    "beautifulsoup4>=4.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/vgnshiyer/py-apple-books"
+Issues = "https://github.com/vgnshiyer/py-apple-books/issues"
+
+[dependency-groups]
+dev = ["pytest>=8", "coverage>=7", "anyio>=4"]
+
+[tool.setuptools.dynamic]
+# Read statically from the AST, so building doesn't import the package.
+version = { attr = "py_apple_books.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["py_apple_books*"]
+
+[tool.setuptools.package-data]
+# scripts/check_dist.py mirrors this list; keep the two in sync.
+py_apple_books = [
+    "py.typed",
+    "models/*.ini",
+    "testing/schemas/*/*.sql",
+    "testing/schemas/*/*.json",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# sqlite3 and other stdlib deprecations (3.12-3.14) raised from library
+# code fail the suite instead of scrolling past.
+filterwarnings = ["error::DeprecationWarning:py_apple_books"]
