@@ -192,12 +192,29 @@ class TestWhereToSql:
 
     def test_search_needle_that_folds_to_nothing(self):
         """Folding drops combining accents, zero-width characters and the
-        soft hyphen; a needle made only of them matches nothing, while ''
-        still matches every non-NULL value (1.9.1's LIKE '%%')."""
-        for needle in (chr(0x200B), chr(0x301), chr(0xAD) + chr(0xFEFF)):
-            assert Where("col", needle, "SEARCH").to_sql() == ("0", [])
+        soft hyphen, and turns a spacing accent into a space; a needle
+        with visible characters that all fold away (whitespace around
+        them included) matches nothing, while '' still matches every
+        non-NULL value (1.9.1's LIKE '%%') and whitespace every value
+        with whitespace."""
+        for needle in (chr(0x200B), chr(0x301), chr(0xAD) + chr(0xFEFF),
+                       chr(0x200B) + " " + chr(0x200B), " " + chr(0x301), chr(0x301) + "\n",
+                       chr(0xAD) + "\n", "\t" + chr(0x200B), chr(0xB4), chr(0xA8) + " " + chr(0xB4)):
+            assert Where("col", needle, "SEARCH").to_sql() == ("0", []), ascii(needle)
             assert Not(Where("col", needle, "SEARCH")).to_sql() == ("(0) IS NOT 1", [])
-        assert Where("col", "", "SEARCH").to_sql() == ("instr(abk_fold(CAST(col AS BLOB)), ?) > 0", [""])
+        search = "instr(abk_fold(CAST(col AS BLOB)), ?) > 0"
+        assert Where("col", "", "SEARCH").to_sql() == (search, [""])
+        for needle in (" ", "\n", "\t ", chr(0xA0)):
+            assert Where("col", needle, "SEARCH").to_sql() == (search, [" "]), ascii(needle)
+        assert Where("col", "a" + chr(0x301), "SEARCH").to_sql() == (search, ["a"])
+
+    def test_int_too_long_for_str_matches_nothing(self):
+        """str() of an int beyond sys.get_int_max_str_digits() raises
+        ValueError; as a text needle it has no text to find."""
+        huge = 10**5000
+        assert Where("col", huge, "SEARCH").to_sql() == ("0", [])
+        assert Where("col", huge, "CONTAINS").to_sql() == ("0", [])
+        assert Where("col", -huge, "SEARCH").to_sql() == ("0", [])
 
     def test_in_iterates_an_object_with_a_to_sql_method(self):
         """A pandas Series has to_sql(name, con); it is a list of values."""
@@ -210,6 +227,13 @@ class TestWhereToSql:
 
         assert Where("id", Series(), "IN").to_sql() == ("id IN (?, ?)", [1, "a"])
         assert str(Where("id", Series(), "IN")) == "id IN (1, 'a')"
+
+    def test_in_with_a_clause_is_a_type_error(self):
+        """A condition isn't a SELECT: IN takes a list or a Subquery."""
+        with pytest.raises(TypeError):
+            Where("Z_PK", Where("ZTITLE", "x"), "IN").to_sql()
+        with pytest.raises(TypeError):
+            Where("Z_PK", Not(Where("ZTITLE", "x")), "NOT IN").to_sql()
 
     def test_columns(self):
         assert Where("a", 1).columns() == {"a"}

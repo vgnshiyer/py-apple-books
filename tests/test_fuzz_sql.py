@@ -122,8 +122,8 @@ def corpus(library):
 
 def oracle(rows: dict, needle_: str) -> set:
     folded = fold_for_match(needle_)
-    if needle_ and not folded:
-        return set()  # only characters folding drops
+    if needle_.strip() and not folded.strip():
+        return set()  # visible characters that all fold away
     return {pk for pk, fields in rows.items()
             if any(f is not None and folded in fold_for_match(f) for f in fields)}
 

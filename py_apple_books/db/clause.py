@@ -38,10 +38,21 @@ def _is_subquery(value) -> bool:
     """Whether ``value`` is the right-hand side of ``IN (SELECT ...)``.
 
     Checked by type, not by a ``to_sql`` attribute: a pandas Series has
-    a ``to_sql`` method, and is a list of values here.
+    a ``to_sql`` method, and is a list of values here. A :class:`Clause`
+    is a condition, not a SELECT, so it isn't one either (and, not being
+    iterable, gets a ``TypeError``).
     """
     from py_apple_books.db.query import CompiledQuery  # query imports this module
-    return isinstance(value, (Subquery, CompiledQuery, Clause))
+    return isinstance(value, (Subquery, CompiledQuery))
+
+
+def _text(value):
+    """``str(value)``, or None for an int too long to convert
+    (``sys.get_int_max_str_digits()``): no text, so nothing to match."""
+    try:
+        return str(value)
+    except ValueError:
+        return None
 
 
 class Clause:
@@ -114,18 +125,25 @@ class Where(Clause):
             return f"{field} {op} ({', '.join('?' * len(items))})", items
         if op in ('IS', 'IS NOT') and (value is None or value == 'NULL'):
             return f"{field} {op} NULL", []
+        if op in ('CONTAINS', 'SEARCH'):
+            raw = _text(value)
+            if raw is None:
+                return "0", []
         if op == 'CONTAINS':
             # Literal substring, case-insensitive for ASCII letters only,
             # like LIKE. instr() compares whole values; LIKE stops reading
             # both sides at a NUL character.
-            return f"instr(upper({field}), upper(?)) > 0", [str(value)]
+            return f"instr(upper({field}), upper(?)) > 0", [raw]
         if op == 'SEARCH':
-            raw = str(value)
             needle = fold_for_match(raw)
-            if raw and not needle:
-                # Only characters folding drops (combining accents,
-                # zero-width characters, soft hyphen): nothing to find.
-                # An empty needle still matches every non-NULL row.
+            if raw.strip() and not needle.strip():
+                # The needle has visible characters, but folding drops
+                # them all (combining accents, zero-width characters, the
+                # soft hyphen) or turns them into a space (a spacing
+                # accent such as U+00B4): nothing to find, rather than
+                # every row (or every row with a space). '' still
+                # matches every non-NULL row, as 1.9.1's LIKE '%%' did,
+                # and a whitespace-only needle every row with whitespace.
                 return "0", []
             # abk_fold is registered on every read connection (db.client).
             # It gets the column's bytes, so a row that isn't valid UTF-8

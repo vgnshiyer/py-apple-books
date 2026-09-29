@@ -17,9 +17,15 @@ RECURSIVE_CTE = ("0' OR (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 F
                  "SELECT count(*) FROM c) OR '")
 NEEDLES = ["'", "don't", "O'Brien", "%", "_", "\\", "’", "1' OR '1'='1", "x' OR 1=1 --",
            UNION, RECURSIVE_CTE]
-# Only characters folding drops (zero-width space, combining acute, soft
-# hyphen + BOM): they match nothing, not every row.
-FOLDS_TO_NOTHING = [chr(0x200B), chr(0x301), chr(0xAD) + chr(0xFEFF)]
+# Visible characters that all fold away: dropped (zero-width space,
+# combining acute, soft hyphen + BOM) or turned into a space (the spacing
+# acute U+00B4), alone or with whitespace around them. They match
+# nothing, not every row (or every row with a space).
+FOLDS_TO_NOTHING = [chr(0x200B), chr(0x301), chr(0xAD) + chr(0xFEFF),
+                    chr(0x200B) + " " + chr(0x200B), " " + chr(0x301), chr(0x301) + "\n",
+                    chr(0xAD) + "\n", "\t" + chr(0x200B), chr(0xB4), " " + chr(0xA8) + " "]
+# Whitespace only: folds to one space and matches every row with whitespace.
+WHITESPACE = [" ", "\n", "\t\t", chr(0xA0)]
 METHODS = [
     "get_book_by_title", "get_books_by_genre", "get_collection_by_title",
     "search_annotation_by_highlighted_text", "search_annotation_by_note", "search_annotation_by_text",
@@ -62,8 +68,8 @@ def corpus(library, store, sql):
 
 def oracle(rows: dict, needle: str) -> set:
     folded = fold_for_match(needle)
-    if needle and not folded:
-        return set()
+    if needle.strip() and not folded.strip():
+        return set()  # visible characters that all fold away
     return {pk for pk, fields in rows.items()
             if any(f is not None and folded in fold_for_match(f) for f in fields)}
 
@@ -92,7 +98,7 @@ def cases(api, library, seeded):
     }
 
 
-@pytest.mark.parametrize("needle", NEEDLES + FOLDS_TO_NOTHING)
+@pytest.mark.parametrize("needle", NEEDLES + FOLDS_TO_NOTHING + WHITESPACE)
 @pytest.mark.parametrize("method", METHODS)
 def test_search_matches_the_fold_oracle(cases, method, needle):
     search, rows = cases[method]
@@ -121,7 +127,26 @@ def test_the_oracle_is_not_trivial(cases):
     assert len(oracle(titles[1], "_")) == 1
     assert len(oracle(cases["get_collection_by_title"][1], "'")) == 1
     assert all(oracle(titles[1], needle) == set() for needle in FOLDS_TO_NOTHING)
+    # Without the rule, the whitespace-mixed ones would match every title
+    # with a space.
+    assert fold_for_match(chr(0x200B) + " " + chr(0x200B)) == fold_for_match(chr(0xB4)) == " "
+    assert len(oracle(titles[1], " ")) == len(titles[1]) > 1
     assert len(oracle(titles[1], "cafe")) == 1
+
+
+def test_annotation_with_a_null_type_is_out_of_scope(api, library):
+    """The text search scopes with SQL ``type__ne=3``, like
+    list_annotations and the other annotation searches, so a row whose
+    ZANNOTATIONTYPE is NULL is left out everywhere (1.9.1's Python
+    post-filter in search_annotation_by_text kept it)."""
+    book = library.add_book("Synthetic Book")
+    kept = library.add_annotation(book, "typed highlight", note="a highlight note")
+    library.add_annotation(book, "untyped highlight", note="a highlight note",
+                           raw={"ZANNOTATIONTYPE": None})
+    assert ids(api.list_annotations()) == {kept}
+    for search in (api.search_annotation_by_text, api.search_annotation_by_highlighted_text,
+                   api.search_annotation_by_note):
+        assert ids(search("highlight")) == {kept}, search.__name__
 
 
 @pytest.mark.parametrize("payload", NEEDLES + ["0' OR ZDELETEDFLAG=1 OR '", "1 OR 1=1"])

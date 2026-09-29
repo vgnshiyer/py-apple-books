@@ -1,5 +1,6 @@
 from py_apple_books.db.clause import Clause, Where
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Any, Sequence, Tuple, Union
+import datetime
 import numbers
 import operator
 
@@ -57,7 +58,18 @@ def adapt_params(params: Sequence[Any]) -> tuple:
       ``OverflowError`` binding it; as text, SQLite applies the
       column's numeric affinity and turns it into a REAL, exactly as
       it read the literal pre-1.10 releases wrote into the SQL. Such a
-      value therefore matches no integer id and never raises.
+      value therefore matches no integer id and never raises. One too
+      long for ``str()`` (``sys.get_int_max_str_digits()``) is bound as
+      ``'9e999'`` or ``'-9e999'``, which SQLite reads as the REAL
+      ±infinity a long literal became.
+    * A ``datetime.date`` or ``datetime.datetime`` raises ``TypeError``
+      (``DBQueryError`` from ``AppleBooksDBClient.execute``). Apple
+      Books stores dates as Core Data seconds (seconds since
+      2001-01-01 UTC), and sqlite3's default adapter (deprecated since
+      Python 3.12) would bind ISO text, which compares greater than
+      every number: a ``creation_date__lte`` filter would match every
+      row. Pass ``value.timestamp() - 978307200`` instead, as
+      ``get_annotations_by_date_range`` does.
     * A ``str`` that can't be encoded as UTF-8 (it holds lone
       surrogates) gets U+FFFD in their place (encoded with
       ``surrogatepass``, decoded with ``replace``, as
@@ -73,12 +85,19 @@ def adapt_params(params: Sequence[Any]) -> tuple:
             value = int(value)
         elif isinstance(value, int):
             if value < _INT64_MIN or value > _INT64_MAX:
-                value = str(value)
+                try:
+                    value = str(value)
+                except ValueError:  # beyond sys.get_int_max_str_digits()
+                    value = '9e999' if value > 0 else '-9e999'
         elif isinstance(value, str):
             try:
                 value.encode('utf-8')
             except UnicodeEncodeError:
                 value = value.encode('utf-8', 'surrogatepass').decode('utf-8', 'replace')
+        elif isinstance(value, datetime.date):  # datetime.datetime too
+            raise TypeError(
+                f"can't bind a {type(value).__name__}: Apple Books stores dates as Core Data "
+                "seconds since 2001-01-01 UTC; pass a_datetime.timestamp() - 978307200")
         out.append(value)
     return tuple(out)
 
