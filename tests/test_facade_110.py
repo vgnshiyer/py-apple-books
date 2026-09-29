@@ -29,7 +29,7 @@ from py_apple_books.exceptions import (
     LibraryNotFoundError,
     QueryTimeoutError,
 )
-from py_apple_books.models import Book, ReadingStatus
+from py_apple_books.models import Annotation, Book, ReadingStatus
 from py_apple_books.testing import STORE_SERIES, core_data_time, seed_demo
 
 UTC = dt.timezone.utc
@@ -430,3 +430,20 @@ def test_statement_counts_on_a_large_library(api, library, sql_trace):
     assert {n for _, _, n in stats.annotations_per_book} == {100}
     assert [bid for bid, _, _ in stats.annotations_per_book] == sorted(b.id for b in Book.manager.all())
     assert stats.total_books == 100 == stats.finished_books + stats.in_progress_books + stats.unstarted_books
+
+
+# -- typing -------------------------------------------------------------------
+
+
+def test_typed_reverse_relations_are_not_fields():
+    """Annotation.book and Book.collections are declared for type
+    checkers only (``if TYPE_CHECKING``); at run time they are the
+    relations ModelBase installs, not dataclass fields."""
+    import dataclasses
+
+    from py_apple_books.models.relations import ReverseManyToMany, ReverseToOne
+
+    assert "book" not in {f.name for f in dataclasses.fields(Annotation)}
+    assert "collections" not in {f.name for f in dataclasses.fields(Book)}
+    assert isinstance(Annotation.__dict__["book"], ReverseToOne)
+    assert isinstance(Book.__dict__["collections"], ReverseManyToMany)

@@ -7,7 +7,11 @@ from py_apple_books.utils import apple_timestamp_to_datetime
 import pathlib
 import re
 from datetime import datetime
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from py_apple_books.models.collection import Collection
+    from py_apple_books.models.manager import ModelIterable
 
 # Apple Books stores a missing author as a Private Use Area glyph plus a
 # localization key (U+E83A + 'UnknownAuthor'), which Books.app renders as
@@ -114,6 +118,14 @@ class Book(Model):
         foreign_key='asset_id',
         extra_filters={'type__gt': 0, 'type__ne': 3, 'is_deleted__isnot': 1},
     )
+
+    if TYPE_CHECKING:
+        # For type checkers only: ModelBase installs the relation (the
+        # reverse of Collection.books) when Collection is defined. A
+        # class-level annotation would make it a dataclass field.
+        @property
+        def collections(self) -> ModelIterable[Collection]:
+            """The collections the book is in, deleted ones included."""
 
     def __post_init__(self):
         self.creation_date = apple_timestamp_to_datetime(self.creation_date)

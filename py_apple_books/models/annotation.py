@@ -1,11 +1,14 @@
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from datetime import datetime
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from py_apple_books.models.base import Model
 from py_apple_books.models.location import Location
 from py_apple_books.utils import apple_timestamp_to_datetime
+
+if TYPE_CHECKING:
+    from py_apple_books.models.book import Book
 
 
 class AnnotationColor(Enum):
@@ -81,6 +84,14 @@ class Annotation(Model):
     # ``order_by='position'`` sorts by book order. Meaningless on
     # reading-position rows (type 3).
     position: Optional[int] = None
+
+    if TYPE_CHECKING:
+        # For type checkers only: ModelBase installs the relation (the
+        # reverse of Book.annotations) when Book is defined. A class-level
+        # annotation would make it a dataclass field.
+        @property
+        def book(self) -> Optional[Book]:
+            """The annotated book, or None if it isn't in the library."""
 
     def __post_init__(self):
         """
