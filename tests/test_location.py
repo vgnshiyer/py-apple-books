@@ -1,10 +1,15 @@
 """Tests for py_apple_books.models.location.
 
 Pure value-object tests — no BookContent, no EPUB fixture, no
-filesystem. Location's whole job is to parse two fields out of a CFI
+filesystem. Location's whole job is to parse a few fields out of a CFI
 string; resolving chapters or text from a location is the facade's
 responsibility, tested elsewhere.
 """
+
+import dataclasses
+import random
+
+import pytest
 
 from py_apple_books.models.location import Location
 
@@ -92,3 +97,77 @@ class TestCfiParsing:
         # Access without triggering any further parse.
         assert loc.chapter_id == "id134"
         assert loc.char_range == (5, 10)
+
+
+class TestSortKeyAndSpineIndex:
+    # In document order. Numeric, not string, order matters: /6/10 comes
+    # after /6/8, and offset :9 before :10.
+    DOCUMENT_ORDER = [
+        "epubcfi(/6/2[cover]!/4/2/1:0)",
+        "epubcfi(/6/8[c3]!/4/2[p1]/18/1,:9,:12)",
+        "epubcfi(/6/8[c3]!/4/2[p1]/18/1,:10,:691)",
+        "epubcfi(/6/8[c3]!/4/2[p1]/18/1,:700,:710)",
+        "epubcfi(/6/8[c3]!/4/2[p1]/20/1,:1,:5)",
+        "epubcfi(/6/8[c3]!/4/2[p1]/20/3:0)",
+        "epubcfi(/6/10[c4]!/4/2/2/1,:0,:5)",
+        "epubcfi(/6/26[c12]!/4[body]/2[s1]/2/2[pb0]/2/2/1,:0,:1)",
+    ]
+
+    def test_sort_key_gives_document_order(self):
+        shuffled = self.DOCUMENT_ORDER[:]
+        random.Random(1).shuffle(shuffled)
+        ordered = sorted((Location(c) for c in shuffled), key=lambda loc: loc.sort_key)
+        assert [loc.cfi for loc in ordered] == self.DOCUMENT_ORDER
+
+    def test_sort_key_collects_steps_then_start_offset(self):
+        loc = Location("epubcfi(/6/8[c3]!/4/2[p1]/18/1,:629,:691)")
+        assert loc.sort_key == (6, 8, 4, 2, 18, 1, 629)
+
+    def test_range_sorts_where_it_starts(self):
+        """A range CFI keys on its parent path plus its start, so it equals
+        the point CFI at that start whatever the range's end."""
+        point = Location("epubcfi(/6/4[chap1]!/4/4/1:0)")
+        range_ = Location("epubcfi(/6/4[chap1]!/4/4,/1:0,/1:21)")
+        assert range_.sort_key == point.sort_key == (6, 4, 4, 4, 1, 0)
+
+    def test_assertions_are_ignored(self):
+        """Bracket assertions may hold commas, colons, slashes and
+        ^-escaped brackets; none of it is a step or offset."""
+        plain = Location("epubcfi(/6/4!/4/10/1,:3,:9)")
+        asserted = Location("epubcfi(/6/4[ch^]1]!/4/10[a,b:7/2]/1,:3[x,y],:9)")
+        assert asserted.sort_key == plain.sort_key == (6, 4, 4, 10, 1, 3)
+        assert asserted.spine_index == 1
+
+    @pytest.mark.parametrize("cfi, spine_index", [
+        ("epubcfi(/6/2[cover]!/4/2/1:0)", 0),
+        ("epubcfi(/6/8[c3]!/4/2/1:0)", 3),
+        ("epubcfi(/6/10[c4]!/4/2/2/1,:0,:5)", 4),
+        ("epubcfi(/6/10!/4/2/2/1,:0,:5)", 4),  # no bracket hint needed
+        ("epubcfi(/6/26[c12]!/4/2/1,:0,:1)", 12),
+    ])
+    def test_spine_index(self, cfi, spine_index):
+        assert Location(cfi).spine_index == spine_index
+
+    @pytest.mark.parametrize("cfi", [
+        "epubcfi(/4/2/1:0)",   # not under the spine (/6)
+        "epubcfi(/6)",         # no spine item step
+        "epubcfi(/6/0!/4/2)",  # no itemref at step 0
+    ])
+    def test_spine_index_none_without_spine_step(self, cfi):
+        assert Location(cfi).spine_index is None
+
+    @pytest.mark.parametrize("cfi", ["", "x", "not a cfi at all", "epubcfi()", "epubcfi([id])"])
+    def test_non_cfi_gives_none(self, cfi):
+        loc = Location(cfi)
+        assert loc.sort_key is None
+        assert loc.spine_index is None
+
+    def test_equality_hash_and_repr_unchanged(self):
+        """The derived fields stay out of ==, hash() and repr()."""
+        cfi = "epubcfi(/6/8[c3]!/4/2[p1]/18/1,:629,:691)"
+        a, b = Location(cfi), Location(cfi)
+        assert a == b and hash(a) == hash(b)
+        assert a != Location("epubcfi(/6/8[c3]!/4/2[p1]/18/1,:629,:692)")
+        assert repr(a) == f"Location(cfi={cfi!r}, chapter_id='c3', char_range=(629, 691))"
+        assert [f.name for f in dataclasses.fields(Location) if f.compare] == ["cfi", "chapter_id", "char_range"]
+        assert [f.name for f in dataclasses.fields(Location) if f.init] == ["cfi"]
