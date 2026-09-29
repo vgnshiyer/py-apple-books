@@ -18,13 +18,26 @@ are not part of the wheel.
 Everything these scripts write holds private library data: `args.json` has ids
 and a book title, run outputs and `DETAIL_DIR` diffs have highlight text. Keep
 all of it in a scratch directory outside the repository. The scripts refuse
-to write inside a git working tree. `compare.py` prints keys and counts, never
-output text, but keys carry library ids and one book title, so paste only
-per-tool counts into a PR. `odd_args.py` stores only result classes.
+to write inside a git working tree.
 
-Never point `HOME` at the real home: the runs read a snapshot. Content tools
-still read book files at the paths the store records, since those are not
-part of the snapshot.
+`compare.py` prints keys and counts, never output text. Keys still carry
+library ids, chapter ids (which can contain title words or ISBNs) and one book
+title. The per-tool table counts calls and characters, so it gives the size of
+the library. `odd_args.py` stores result classes, but its outputs also hold
+the `lib` path, and `len=<n>` is the length of private output.
+
+For PRs and committed `changes/*.md` notes, report only:
+- the `compare.py` exit status;
+- the UNEXPECTED, NEW EXCEPTION and MISSING totals;
+- the `odd_args.py` verdict counts (`same`, `FIXED`, `REGRESSION ...`).
+
+Per-tool or per-item counts go in only if the owner opts in. Keys, `lib` paths
+and `len=` values never go in.
+
+Never point `HOME` at the real home: the runs read a snapshot, and every
+command refuses the real home or a `HOME` without a `BKLibrary` folder.
+Content tools still read book files at the paths the store records, since
+those are not part of the snapshot.
 
 ## Procedure
 
@@ -59,10 +72,16 @@ an editable install can shadow `PYTHONPATH`.
 HOME=$S/home $S/base/bin/python scripts/mcp_regress/harness.py discover $S/args.json
 ```
 
-`discover` exits 2 unless `py_apple_books.__version__` is `1.9.1`. The ids
-must come from the unscoped 1.9.1 view, so rows that later versions hide
-(Store series items, deleted annotations) still get called. `--force`
-overrides the check.
+The ids must come from the unscoped 1.9.1 view, so rows that later versions
+hide (Store series items, deleted annotations) still get called. Always run
+`discover` with the baseline venv: development trees report `__version__`
+`1.9.1` until the release bump.
+
+`discover` exits 2 unless the `py_apple_books` it imports is the 1.9.1
+release. The version must be `1.9.1`, and a digest of the package's `.py` and
+`.ini` files must match the release. So a development tree is refused however
+it is installed (editable, wheel or `PYTHONPATH`). `discover` prints the
+`py_apple_books` it imported. `--force` overrides the check.
 
 **4. Baselines A and B, then the candidate.**
 
@@ -103,6 +122,11 @@ It exits 1 if any list is non-empty, and 0 otherwise. `$S/diffs` gets one
 unified diff per changed key. Each diff is headed by its key and by the items
 that allow it, or by `UNEXPECTED`.
 
+The stage is the latest one already in the branch under test, counting the
+branch's own changes. The table assumes the planned merge order, where writes
+and models-data land before query-layer. If query-layer is already in your
+base, use `query`.
+
 | Stream | `--through` |
 |---|---|
 | Wave 1, writes, models-data (output-neutral by themselves) | `baseline` |
@@ -118,7 +142,8 @@ HOME=$S/home $S/cand/bin/python scripts/mcp_regress/odd_args.py run $S/odd-cand.
 python3 scripts/mcp_regress/odd_args.py compare $S/odd-base.json $S/odd-cand.json
 ```
 
-Each call is stored as `EXC <type>`, `OK notfound` or `OK <md5[:8]> len=<n>`.
+Each call is stored as `EXC <type>`, `OK notfound` (a short one-line
+not-found answer) or `OK <md5[:8]> len=<n>`.
 `compare` prints a transition table. It exits 1 on `OK` -> `EXC`, on
 `OK notfound` -> anything else, or on a missing call. `EXC` -> `OK` is
 reported as `FIXED`. Result classes can depend on the Python version: on

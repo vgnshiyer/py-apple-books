@@ -1,33 +1,44 @@
 """Before/after regression harness for the MCP 0.8.2 read tools (read-only).
 
-  discover [--force] ARGS.json   pick deterministic call arguments (run on 1.9.1)
+  discover [--force] ARGS.json   pick deterministic call arguments (released 1.9.1 only)
   run ARGS.json OUT.json         call every read tool, save {call_key: output}
 
 Run with HOME pointing at a read-only snapshot of the Books stores (see
-README.md). Which py_apple_books is used is decided by the interpreter and
-PYTHONPATH; ``run`` prints its path. Never calls write tools.
+README.md); both commands refuse the real home. Which py_apple_books is used
+is decided by the interpreter and PYTHONPATH; both commands print its path.
+Never calls write tools.
 
-``discover`` refuses anything but py_apple_books 1.9.1 unless ``--force``:
-the ids must come from the unscoped 1.9.1 view, so rows a later version
-hides (Store series items, deleted annotations) are still exercised.
+``discover`` refuses anything but the released py_apple_books 1.9.1 unless
+``--force``: the ids must come from the unscoped 1.9.1 view, so rows a
+later version hides (Store series items, deleted annotations) are still
+exercised. Development trees report version 1.9.1 until the release bump,
+so the check also compares the imported package's sources with the
+release. Run ``discover`` with the baseline venv.
 
 ARGS.json and OUT.json hold private library data (ids, titles, highlight
 text). Write them under a scratch directory and never commit them; both
 commands refuse a path inside a git working tree.
 """
 import argparse
+import hashlib
 import json
+import os
 import pathlib
+import pwd
 import re
 import sys
 import time
 
 MAX_CONTEXT_ANNOTATIONS = 200
 DISCOVER_VERSION = "1.9.1"
+# source_digest() of the py_apple_books 1.9.1 release (the PyPI wheel and
+# the v1.9.1 tag agree).
+DISCOVER_DIGEST = "99e7f4f8ec51d45ee8929f13d91797236935cfdc49681c4e065121b21245f701"
+BOOKS_DOCUMENTS = pathlib.Path("Library/Containers/com.apple.iBooksX/Data/Documents")
 
 # ``s`` (apple_books_mcp.server) and ``py_apple_books`` are imported in
-# __main__ after the version check: importing the server builds its
-# PyAppleBooks(), which a wrong or stub library can't do.
+# __main__ after the version and HOME checks: importing the server builds
+# its PyAppleBooks(), which a wrong or stub library can't do.
 
 
 def private_output(path):
@@ -41,6 +52,18 @@ def private_output(path):
     return p
 
 
+def require_snapshot_home():
+    """Exit 2 unless HOME is a snapshot: not the real home, and holding a BKLibrary folder."""
+    home = os.environ.get("HOME")
+    real = pwd.getpwuid(os.getuid()).pw_dir
+    if not home or pathlib.Path(home).resolve() == pathlib.Path(real).resolve():
+        print("HOME must point at a snapshot made with snap.py, not the real home", file=sys.stderr)
+        sys.exit(2)
+    if not (pathlib.Path(home) / BOOKS_DOCUMENTS / "BKLibrary").is_dir():
+        print(f"HOME has no {BOOKS_DOCUMENTS}/BKLibrary; is it a snapshot?", file=sys.stderr)
+        sys.exit(2)
+
+
 def text_of(result):
     if hasattr(result, "text"):
         return result.text
@@ -51,12 +74,39 @@ def text_of(result):
     return str(result)
 
 
-def require_discover_version(lib, force):
+def source_digest(lib):
+    """Return a sha256 over the package's .py and .ini files (paths and bytes)."""
+    root = pathlib.Path(lib.__file__).resolve().parent
+    h = hashlib.sha256()
+    for f in sorted(p for p in root.rglob("*") if p.suffix in (".py", ".ini")):
+        data = f.read_bytes()
+        h.update(f"{f.relative_to(root).as_posix()}\0{len(data)}\0".encode())
+        h.update(data)
+    return h.hexdigest()
+
+
+def release_problem(lib):
+    """Return why ``lib`` is not the released 1.9.1, or None.
+
+    The version alone can't tell: development trees report 1.9.1 until the
+    release bump, whatever way they are installed. So the imported sources
+    must also match the release byte for byte.
+    """
     version = getattr(lib, "__version__", None)
-    if version == DISCOVER_VERSION:
+    if version != DISCOVER_VERSION:
+        return f"it reports version {version!r}"
+    if source_digest(lib) != DISCOVER_DIGEST:
+        return f"its sources differ from the {DISCOVER_VERSION} release (a development tree?)"
+    return None
+
+
+def require_discover_version(lib, force):
+    problem = release_problem(lib)
+    if problem is None:
         return
-    msg = (f"discover needs py_apple_books {DISCOVER_VERSION} (the unscoped view), "
-           f"got {version!r} from {lib.__file__}")
+    msg = (f"discover needs the released py_apple_books {DISCOVER_VERSION} "
+           f"(the unscoped view), but {problem}; imported from {lib.__file__}. "
+           f"Use the baseline venv with {DISCOVER_VERSION} from PyPI")
     if not force:
         print(f"{msg}; pass --force to use it anyway", file=sys.stderr)
         sys.exit(2)
@@ -64,6 +114,8 @@ def require_discover_version(lib, force):
 
 
 def discover(path):
+    print(f"py_apple_books {py_apple_books.__version__} from {py_apple_books.__file__}",
+          file=sys.stderr)
     lib = s.apple_books
     books = sorted(lib.list_books(), key=lambda b: int(b.id))
     book_ids = [int(b.id) for b in books]
@@ -157,7 +209,7 @@ def parse_args(argv=None):
     d = sub.add_parser("discover", help="write ARGS.json from the 1.9.1 library")
     d.add_argument("args_json")
     d.add_argument("--force", action="store_true",
-                   help=f"run on a py_apple_books other than {DISCOVER_VERSION}")
+                   help=f"accept a py_apple_books other than the {DISCOVER_VERSION} release")
     r = sub.add_parser("run", help="call every read tool with ARGS.json, write OUT.json")
     r.add_argument("args_json")
     r.add_argument("out_json")
@@ -169,10 +221,10 @@ if __name__ == "__main__":
     import py_apple_books
     if cli.cmd == "discover":
         require_discover_version(py_apple_books, cli.force)
-        target = private_output(cli.args_json)
-        from apple_books_mcp import server as s
+    require_snapshot_home()
+    target = private_output(cli.args_json if cli.cmd == "discover" else cli.out_json)
+    from apple_books_mcp import server as s
+    if cli.cmd == "discover":
         discover(target)
     else:
-        target = private_output(cli.out_json)
-        from apple_books_mcp import server as s
         run(cli.args_json, target)

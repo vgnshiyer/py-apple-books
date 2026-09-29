@@ -10,7 +10,8 @@ ids and limits, lone surrogates, NUL and an unknown colour.
 
 Only the class of each result is stored:
   EXC <ExceptionType>   the tool raised (MCP reports isError)
-  OK notfound           text starts with 'No ' or says 'No book found' / 'not found'
+  OK notfound           a short one-line text that starts with 'No ' or says
+                        'No book found' / 'not found'
   OK <md5[:8]> len=<n>  any other text
 
 compare exits 1 on OK -> EXC, on 'OK notfound' -> anything else, or on a
@@ -19,14 +20,12 @@ call missing from CAND; EXC -> OK is reported as FIXED.
 import argparse
 import hashlib
 import json
-import os
 import pathlib
-import pwd
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from harness import private_output, text_of  # noqa: E402
+from harness import private_output, require_snapshot_home, text_of  # noqa: E402
 
 HUGE = 99999999999999999999
 SURROGATE = chr(0xD800)
@@ -50,7 +49,10 @@ CALLS = [
     ("get_highlights_by_color", {"color": "orange"}),
     ("get_chapter_content", {"book_id": HUGE, "chapter_id": "1"}),
 ]
-BOOKS_DOCUMENTS = pathlib.Path("Library/Containers/com.apple.iBooksX/Data/Documents")
+# A not-found answer is one short line; longer texts (e.g. every match for
+# 'x') may quote highlights that happen to say 'not found' or a title
+# starting with 'No '.
+NOTFOUND_MAX_LEN = 200
 
 
 def key_of(name, kwargs):
@@ -58,21 +60,11 @@ def key_of(name, kwargs):
 
 
 def classify(text):
-    if text.startswith("No ") or "No book found" in text or "not found" in text:
+    short = len(text) <= NOTFOUND_MAX_LEN and "\n" not in text
+    if short and (text.startswith("No ") or "No book found" in text or "not found" in text):
         return "OK notfound"
     digest = hashlib.md5(text.encode("utf-8", "surrogatepass")).hexdigest()[:8]
     return f"OK {digest} len={len(text)}"
-
-
-def require_snapshot_home():
-    home = os.environ.get("HOME")
-    real = pwd.getpwuid(os.getuid()).pw_dir
-    if not home or pathlib.Path(home).resolve() == pathlib.Path(real).resolve():
-        print("HOME must point at a snapshot made with snap.py, not the real home", file=sys.stderr)
-        sys.exit(2)
-    if not (pathlib.Path(home) / BOOKS_DOCUMENTS / "BKLibrary").is_dir():
-        print(f"HOME has no {BOOKS_DOCUMENTS}/BKLibrary; is it a snapshot?", file=sys.stderr)
-        sys.exit(2)
 
 
 def run(out_path):
