@@ -14,27 +14,42 @@ Feature-agnostic safety utilities shared by any write path (today:
 * :func:`restore_library` — one-command restore of a backup over the
   live database (with the WAL/SHM sidecars removed so SQLite doesn't
   replay stale journal pages over the restored file).
-* :func:`validate_table_schema` — abort-don't-guess check that a table
-  still looks the way the writer expects, so a macOS schema change
-  fails loudly instead of writing wrong rows.
+* :func:`validate_table_columns` — exact check (column names and
+  declared types) for the tables the writer inserts into. Core Data
+  never declares NOT NULL, so a new mandatory attribute only shows up
+  as a column this version doesn't know.
+* :func:`validate_table_schema` — presence check for the tables the
+  writer only reads.
+* :func:`check_model_hashes` — compares Core Data's per-entity model
+  version hashes against the ones this version was verified with;
+  :data:`MODEL_CHECK_ENV` selects whether a mismatch warns, refuses or
+  is ignored.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 import sqlite3
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Mapping, Optional
 
-from py_apple_books.db.client import _read_only_uri
+from py_apple_books.db.metadata import (  # noqa: F401  (re-exported)
+    StoreMetadata,
+    read_only_uri,
+    read_store_metadata,
+)
 from py_apple_books.exceptions import (
     BooksAppRunningError,
     SchemaValidationError,
     WriteError,
 )
+
+logger = logging.getLogger(__name__)
 
 #: Default location for pre-write backups.
 BACKUP_DIR = Path.home() / ".py_apple_books" / "backups"
@@ -52,6 +67,21 @@ BACKUP_MIN_INTERVAL = 300.0
 #: seconds. A younger one may be another process's backup still in
 #: progress; deleting it would make that process's write abort.
 BACKUP_PART_STALE_AFTER = 600.0
+
+#: Environment variable choosing what the writer does about schema
+#: drift it can't vouch for: ``warn`` (the default: log an unknown Core
+#: Data model hash and write), ``enforce`` (refuse on an unknown hash)
+#: or ``off`` (skip the hash check, and allow unknown *nullable* columns
+#: in the tables the writer inserts into, leaving them empty). Missing
+#: or retyped columns refuse in every mode.
+MODEL_CHECK_ENV = "APPLE_BOOKS_MODEL_CHECK"
+MODEL_CHECK_DEFAULT = "warn"
+_MODEL_CHECK_MODES = ("warn", "enforce", "off")
+
+_REPORT_HINT = (
+    "Please report your schema: python -m py_apple_books.testing.dump_schema "
+    "--out ~/Desktop/apple-books-schema"
+)
 
 
 def books_is_running() -> bool:
@@ -140,7 +170,7 @@ def backup_library(
     part = dest.with_name(dest.name + ".part")
 
     try:
-        src = sqlite3.connect(_read_only_uri(db_path), uri=True)
+        src = sqlite3.connect(read_only_uri(db_path), uri=True)
     except sqlite3.Error as e:
         raise WriteError(f"Backup failed, aborting write: {e}")
     try:
@@ -197,7 +227,7 @@ def restore_library(backup_path: Path, db_path: Path) -> None:
     ensure_books_not_running()
 
     try:
-        src = sqlite3.connect(_read_only_uri(backup_path), uri=True)
+        src = sqlite3.connect(read_only_uri(backup_path), uri=True)
     except sqlite3.Error as e:
         raise WriteError(f"Restore failed: {e}")
     try:
@@ -212,20 +242,173 @@ def restore_library(backup_path: Path, db_path: Path) -> None:
         src.close()
 
 
+# ---------------------------------------------------------------------------
+# Schema and model checks
+# ---------------------------------------------------------------------------
+
+
+def resolve_model_check(mode: Optional[str] = None) -> str:
+    """The effective model-check mode: ``mode`` if given, else the
+    :data:`MODEL_CHECK_ENV` environment variable, else
+    :data:`MODEL_CHECK_DEFAULT`.
+
+    Case-insensitive. An unrecognised value logs a warning and counts
+    as the default, ``'warn'``.
+    """
+    if mode is None:
+        mode = os.environ.get(MODEL_CHECK_ENV, "")
+    value = str(mode).strip().lower()
+    if not value:
+        return MODEL_CHECK_DEFAULT
+    if value in _MODEL_CHECK_MODES:
+        return value
+    logger.warning(
+        "Unrecognised model check mode %r (expected warn, enforce or off; "
+        "set via %s or model_check=); using %r.",
+        mode, MODEL_CHECK_ENV, MODEL_CHECK_DEFAULT,
+    )
+    return MODEL_CHECK_DEFAULT
+
+
+def check_model_hashes(
+    conn: sqlite3.Connection,
+    known: Mapping[str, Iterable[str]],
+    mode: Optional[str] = None,
+) -> dict:
+    """Compare the store's Core Data model hashes with verified ones.
+
+    ``known`` maps each entity to check to the base64
+    ``NSStoreModelVersionHashes`` values it was verified with; other
+    entities are never checked. A store without readable ``Z_METADATA``
+    counts as unknown.
+
+    On an unknown hash, ``mode`` (resolved by :func:`resolve_model_check`)
+    decides: ``'warn'`` logs one warning naming each entity's hash and
+    the Core Data framework version, ``'enforce'`` raises
+    :class:`SchemaValidationError` with the same details, and ``'off'``
+    skips the check without reading anything.
+
+    :return: ``{entity: observed hash or None}`` for the entities in
+        ``known``; ``{}`` when the check is off.
+    """
+    mode = resolve_model_check(mode)
+    if mode == "off":
+        return {}
+    meta = read_store_metadata(conn)
+    observed = {
+        entity: (meta.model_hashes.get(entity) if meta else None) for entity in known
+    }
+    unknown = sorted(
+        entity for entity, value in observed.items() if value not in known[entity]
+    )
+    if not unknown:
+        return observed
+
+    detail = ", ".join(f"{entity}={observed[entity] or 'unavailable'}" for entity in unknown)
+    framework = (meta.framework_version if meta else None) or "unknown"
+    message = (
+        "The library's Core Data model differs from the one this version of "
+        f"py-apple-books was verified against ({detail}; "
+        f"NSPersistenceFrameworkVersion {framework})."
+    )
+    if mode == "enforce":
+        raise SchemaValidationError(
+            f"{message} Writes are refused because {MODEL_CHECK_ENV}=enforce. "
+            f"Check for a newer py-apple-books; to write anyway, set "
+            f"{MODEL_CHECK_ENV}=warn. {_REPORT_HINT}"
+        )
+    logger.warning(
+        "%s Writing anyway (%s=warn; set it to enforce to refuse). %s",
+        message, MODEL_CHECK_ENV, _REPORT_HINT,
+    )
+    return observed
+
+
+def validate_table_columns(
+    conn: sqlite3.Connection,
+    table: str,
+    expected: Mapping[str, str],
+    *,
+    allow_extra_nullable: bool = False,
+) -> None:
+    """Exact check: ``table``'s columns must be ``expected``.
+
+    ``expected`` maps column name to declared type; names and types
+    compare case-insensitively. Every attribute Core Data adds to an
+    entity becomes a column, and a type change rewrites the declared
+    type, so this catches the drift that would make the writer's
+    INSERTs incomplete. A missing or retyped column always raises
+    :class:`SchemaValidationError`. So does an unknown extra column,
+    unless ``allow_extra_nullable``: then an extra column that is
+    neither NOT NULL nor part of the primary key is allowed (the
+    writer leaves it NULL) and one warning names the allowed columns.
+    """
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    if not rows:
+        raise SchemaValidationError(
+            f"Table {table} not found in the library database — "
+            "the schema has changed and writes are not safe."
+        )
+
+    # PRAGMA table_info: (cid, name, type, notnull, dflt_value, pk)
+    actual = {row[1].upper(): row for row in rows}
+    want = {name.upper(): (name, (decl or "").upper()) for name, decl in expected.items()}
+
+    missing = [name for key, (name, _) in want.items() if key not in actual]
+    retyped = [
+        f"{name} {decl}->{(actual[key][2] or '').upper()}"
+        for key, (name, decl) in want.items()
+        if key in actual and (actual[key][2] or "").upper() != decl
+    ]
+    unknown, tolerated = [], []
+    for key, row in actual.items():
+        if key in want:
+            continue
+        if allow_extra_nullable and not row[3] and not row[5]:
+            tolerated.append(row[1])
+        elif row[3] or row[5]:
+            unknown.append(f"{row[1]} ({'PRIMARY KEY' if row[5] else 'NOT NULL'})")
+        else:
+            unknown.append(row[1])
+
+    if unknown or missing or retyped:
+        parts = []
+        if unknown:
+            parts.append(f"unknown column(s) {unknown}")
+        if missing:
+            parts.append(f"missing {missing}")
+        if retyped:
+            parts.append(f"retyped {retyped}")
+        raise SchemaValidationError(
+            f"Table {table} doesn't match the Apple Books schema this version "
+            f"was verified against ({'; '.join(parts)}) — writes are not safe. "
+            "Check for a newer py-apple-books. If Apple Books only added new "
+            f"optional columns, you can set {MODEL_CHECK_ENV}=off to allow "
+            "writes that leave them empty (missing or changed columns still "
+            f"refuse). {_REPORT_HINT}"
+        )
+    if tolerated:
+        logger.warning(
+            "Table %s has column(s) %s this version of py-apple-books wasn't "
+            "verified against; writing anyway because %s=off, leaving them "
+            "empty (NULL).",
+            table, tolerated, MODEL_CHECK_ENV,
+        )
+
+
 def validate_table_schema(
     conn: sqlite3.Connection,
     table: str,
-    required_columns: set[str],
-    writable_columns: set[str],
+    required_columns: Iterable[str],
+    writable_columns: Optional[Iterable[str]] = None,
 ) -> None:
-    """Abort if ``table`` no longer matches what the writer maintains.
+    """Presence check: abort if ``table`` is missing or lacks any of
+    ``required_columns``. Extra columns are fine.
 
-    Two checks:
-
-    * every column the writer populates must still exist;
-    * every NOT NULL column must be one the writer knows how to fill —
-      a new required column added by a macOS update means our INSERTs
-      would produce rows Books considers invalid, so fail loudly.
+    With ``writable_columns``, also abort on a NOT NULL column outside
+    it. Core Data never declares NOT NULL, so that branch can't detect
+    Core Data model drift; use :func:`validate_table_columns` for the
+    tables the writer inserts into.
     """
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     if not rows:
@@ -235,15 +418,17 @@ def validate_table_schema(
         )
 
     names = {row[1] for row in rows}
-    missing = required_columns - names
+    missing = set(required_columns) - names
     if missing:
         raise SchemaValidationError(
             f"Table {table} is missing expected column(s) {sorted(missing)} — "
             "the schema has changed and writes are not safe."
         )
 
+    if writable_columns is None:
+        return
     not_null = {row[1] for row in rows if row[3]}
-    unknown_required = not_null - writable_columns
+    unknown_required = not_null - set(writable_columns)
     if unknown_required:
         raise SchemaValidationError(
             f"Table {table} has NOT NULL column(s) {sorted(unknown_required)} "

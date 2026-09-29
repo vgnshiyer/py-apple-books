@@ -7,8 +7,15 @@ operation here runs inside a :class:`WriteSession` that:
 
 1. refuses while the Books app is running,
 2. takes a WAL-inclusive backup (on by default),
-3. validates the schema and aborts on drift,
-4. wraps all statements in one ``BEGIN IMMEDIATE`` transaction, and
+3. wraps all statements in one ``BEGIN IMMEDIATE`` transaction (a
+   write lock held elsewhere past :data:`BUSY_TIMEOUT` raises
+   :class:`LibraryBusyError`),
+4. inside that transaction, validates the schema and aborts on drift:
+   the collection and membership tables must have exactly the verified
+   columns and types, the tables it reads must have the columns it
+   reads, and the Core Data model hashes are compared with the
+   verified ones (``APPLE_BOOKS_MODEL_CHECK``; see
+   :mod:`py_apple_books.write_safety`), and
 5. maintains Core Data's bookkeeping invariants — primary keys are
    allocated through ``Z_PRIMARYKEY`` (skipping this breaks Books' own
    next insert), ``Z_ENT``/``Z_OPT`` are set the way Books sets them,
@@ -39,13 +46,18 @@ from py_apple_books.db.client import AppleBooksDBClient, find_sqlite_file
 from py_apple_books.exceptions import (
     BookNotFoundError,
     CollectionNotFoundError,
+    LibraryBusyError,
+    SchemaValidationError,
     SystemCollectionError,
     WriteError,
 )
 from py_apple_books.utils import APPLE_EPOCH_OFFSET
 from py_apple_books.write_safety import (
     backup_library,
+    check_model_hashes,
     ensure_books_not_running,
+    resolve_model_check,
+    validate_table_columns,
     validate_table_schema,
 )
 
@@ -56,6 +68,11 @@ _PK_TABLE = "Z_PRIMARYKEY"
 
 _COLLECTION_ENTITY = "BKCollection"
 _MEMBER_ENTITY = "BKCollectionMember"
+
+#: SQLite busy timeout, in seconds, for taking the write lock. If
+#: another program holds it longer, the write gives up with
+#: :class:`LibraryBusyError` and changes nothing.
+BUSY_TIMEOUT = 5.0
 
 #: Books assigns sidebar / in-collection order in multiples of 10000.
 SORT_KEY_STEP = 10000
@@ -81,16 +98,40 @@ SYSTEM_COLLECTION_IDS = frozenset(
 #: Built-in collections whose *membership* the user edits in the app UI.
 MEMBERSHIP_EDITABLE_SYSTEM_IDS = frozenset({"Want_To_Read_Collection_ID"})
 
-# Columns each write populates / requires. Used both to build INSERTs
-# and to validate the live schema before any write.
-_COLLECTION_COLUMNS = {
-    "Z_PK", "Z_ENT", "Z_OPT", "ZDELETEDFLAG", "ZHIDDEN", "ZPLACEHOLDER",
-    "ZSORTKEY", "ZSORTMODE", "ZVIEWMODE", "ZLASTMODIFICATION",
-    "ZLOCALMODDATE", "ZCOLLECTIONID", "ZDETAILS", "ZTITLE",
+# Exact schema (column -> declared type, as ``PRAGMA table_info``
+# reports it) of the tables the writer inserts into, verified on macOS
+# 26.7 / Books 8.5. Every INSERT populates every one of these columns;
+# any other column is an attribute the writer would leave NULL, so the
+# live tables must match exactly before any write.
+_COLLECTION_SCHEMA = {
+    "Z_PK": "INTEGER", "Z_ENT": "INTEGER", "Z_OPT": "INTEGER",
+    "ZDELETEDFLAG": "INTEGER", "ZHIDDEN": "INTEGER", "ZPLACEHOLDER": "INTEGER",
+    "ZSORTKEY": "INTEGER", "ZSORTMODE": "INTEGER", "ZVIEWMODE": "INTEGER",
+    "ZLASTMODIFICATION": "TIMESTAMP", "ZLOCALMODDATE": "TIMESTAMP",
+    "ZCOLLECTIONID": "VARCHAR", "ZDETAILS": "VARCHAR", "ZTITLE": "VARCHAR",
 }
-_MEMBER_COLUMNS = {
-    "Z_PK", "Z_ENT", "Z_OPT", "ZSORTKEY", "ZASSET", "ZCOLLECTION",
-    "ZLOCALMODDATE", "ZASSETID", "ZTEMPORARYASSETID",
+_MEMBER_SCHEMA = {
+    "Z_PK": "INTEGER", "Z_ENT": "INTEGER", "Z_OPT": "INTEGER",
+    "ZSORTKEY": "INTEGER", "ZASSET": "INTEGER", "ZCOLLECTION": "INTEGER",
+    "ZLOCALMODDATE": "TIMESTAMP", "ZASSETID": "VARCHAR",
+    "ZTEMPORARYASSETID": "VARCHAR",
+}
+_COLLECTION_COLUMNS = frozenset(_COLLECTION_SCHEMA)
+_MEMBER_COLUMNS = frozenset(_MEMBER_SCHEMA)
+
+# Tables the writer only reads (or bumps a counter in): the columns it
+# uses must exist; other columns are fine.
+_ASSET_READ_COLUMNS = frozenset({"Z_PK", "ZASSETID"})
+_PK_COLUMNS = frozenset({"Z_ENT", "Z_NAME", "Z_MAX"})
+
+#: Core Data ``NSStoreModelVersionHashes`` (base64) the writer was
+#: verified against, for the entities it inserts into or updates.
+#: BKLibraryAsset isn't pinned: it changes with most Books releases and
+#: the writer only reads Z_PK and ZASSETID from it. Observed on macOS
+#: 26.7 / Books 8.5 (NSPersistenceFrameworkVersion 1526).
+_VERIFIED_MODEL_HASHES = {
+    _COLLECTION_ENTITY: frozenset({"SNZFrt9vtP7OHwxpdgQvjG0aDQCjcaPKMvV4xi2f4wY="}),
+    _MEMBER_ENTITY: frozenset({"iyiO3gHrQVAI21IxwV8Cp2jsmVbWVAixNI4/dJrLPnc="}),
 }
 
 
@@ -116,6 +157,14 @@ class WriteSession:
     :param backup_dir: Override the backup directory.
     :param require_books_closed: Refuse when Books.app is running. On
         by default; only tests against fixture databases turn this off.
+    :param model_check: ``'warn'``, ``'enforce'`` or ``'off'``: what an
+        unverified Core Data model hash does, and (``'off'``) whether
+        unknown nullable columns are allowed. None reads
+        ``APPLE_BOOKS_MODEL_CHECK`` (default ``'warn'``); see
+        :func:`py_apple_books.write_safety.resolve_model_check`.
+
+    After ``__enter__``, ``model_hashes`` holds the store's model hashes
+    for the verified entities (``{}`` when the model check is off).
     """
 
     def __init__(
@@ -124,12 +173,15 @@ class WriteSession:
         backup: bool = True,
         backup_dir: Optional[Path] = None,
         require_books_closed: bool = True,
+        model_check: Optional[str] = None,
     ):
         self.db_path = Path(db_path) if db_path else _default_db_path()
         self.backup = backup
         self.backup_dir = backup_dir
         self.require_books_closed = require_books_closed
+        self.model_check = model_check
         self.backup_path: Optional[Path] = None
+        self.model_hashes: dict = {}
         self.conn: Optional[sqlite3.Connection] = None
 
     def __enter__(self) -> "WriteSession":
@@ -144,24 +196,64 @@ class WriteSession:
         # isolation_level=None -> autocommit off our hands; we control
         # the transaction explicitly. timeout is SQLite's busy timeout:
         # either we get the write lock promptly or we abort.
-        self.conn = sqlite3.connect(self.db_path, timeout=5.0, isolation_level=None)
+        self.conn = sqlite3.connect(
+            self.db_path, timeout=BUSY_TIMEOUT, isolation_level=None
+        )
         try:
-            validate_table_schema(
-                self.conn, _COLLECTION_TABLE,
-                required_columns=_COLLECTION_COLUMNS,
-                writable_columns=_COLLECTION_COLUMNS,
-            )
-            validate_table_schema(
-                self.conn, _MEMBER_TABLE,
-                required_columns=_MEMBER_COLUMNS,
-                writable_columns=_MEMBER_COLUMNS,
-            )
-            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as e:
+                message = str(e).lower()
+                if "locked" in message or "busy" in message:
+                    raise LibraryBusyError(
+                        "The Books library database is busy (another program "
+                        "is writing to it); nothing was changed. Try again in "
+                        "a moment.",
+                        cause=e,
+                    ) from e
+                raise
+            # Validate under the write lock, so the schema can't change
+            # between the check and the write.
+            self._validate_schema()
         except BaseException:
-            self.conn.close()
-            self.conn = None
+            try:
+                if self.conn.in_transaction:
+                    self.conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass  # closing the connection rolls back as well
+            finally:
+                self.conn.close()
+                self.conn = None
             raise
         return self
+
+    def _validate_schema(self) -> None:
+        conn = self.conn
+        mode = resolve_model_check(self.model_check)
+        relaxed = mode == "off"
+        validate_table_columns(
+            conn, _COLLECTION_TABLE, _COLLECTION_SCHEMA, allow_extra_nullable=relaxed
+        )
+        validate_table_columns(
+            conn, _MEMBER_TABLE, _MEMBER_SCHEMA, allow_extra_nullable=relaxed
+        )
+        validate_table_schema(conn, _ASSET_TABLE, _ASSET_READ_COLUMNS)
+        validate_table_schema(conn, _PK_TABLE, _PK_COLUMNS)
+
+        entities = (_COLLECTION_ENTITY, _MEMBER_ENTITY)
+        present = {
+            row[0] for row in conn.execute(
+                f"SELECT Z_NAME FROM {_PK_TABLE} WHERE Z_NAME IN (?, ?)", entities
+            )
+        }
+        missing = [entity for entity in entities if entity not in present]
+        if missing:
+            raise SchemaValidationError(
+                f"Z_PRIMARYKEY has no entry for entity(ies) {missing} — "
+                "the schema has changed and writes are not safe."
+            )
+
+        self.model_hashes = check_model_hashes(conn, _VERIFIED_MODEL_HASHES, mode=mode)
 
     def __exit__(self, exc_type, exc, tb) -> None:
         try:
@@ -186,7 +278,7 @@ def _allocate_pk(cur: sqlite3.Cursor, entity_name: str, table: str) -> tuple[int
         f"SELECT Z_ENT, Z_MAX FROM {_PK_TABLE} WHERE Z_NAME = ?", (entity_name,)
     ).fetchone()
     if row is None:
-        raise WriteError(
+        raise SchemaValidationError(
             f"Z_PRIMARYKEY has no entry for entity {entity_name!r} — "
             "the schema has changed and writes are not safe."
         )
