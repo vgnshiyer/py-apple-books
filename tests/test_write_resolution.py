@@ -7,7 +7,9 @@ honours ``APPLE_BOOKS_LIBRARY_DB`` and then ``APPLE_BOOKS_DATA_DIR``; a
 environment says. Several candidate stores and no canonical one, a
 canonical one that fails validation, a lone copy, or a store other than
 the one being read raise ``AmbiguousStoreError`` instead of a guess.
-An instance's writes back up into a folder of their own per store.
+The current user's store (the one in the Apple Books container) backs up
+into ``write_safety.BACKUP_DIR``; any other store, whether an instance's
+or the one the location variables name, into a folder of its own.
 
 Synthetic libraries only; the Books.app check is switched off.
 """
@@ -23,6 +25,7 @@ import pytest
 from py_apple_books import PyAppleBooks, collection_writer, write_safety
 from py_apple_books.db import client, use_library
 from py_apple_books.exceptions import AmbiguousStoreError, DBConnectionError, WriteError
+from py_apple_books.testing import FixtureLibrary
 
 LOCATION_VARS = ("APPLE_BOOKS_DATA_DIR", "APPLE_BOOKS_LIBRARY_DB", "APPLE_BOOKS_ANNOTATION_DB")
 
@@ -255,6 +258,126 @@ def test_instance_writes_leave_the_default_backups(make_library, clean_env, monk
         api.close()
     assert len(mine_backups) == write_safety.BACKUP_KEEP
     assert write_safety.list_backups() == [home_backup] and backup_titles(home_backup) == ["home shelf"]
+
+
+# -- backups: which folder --------------------------------------------------------
+
+SAME_UUID = {"BKLibrary": "11111111-2222-3333-4444-555555555555"}
+
+
+@pytest.fixture
+def home_and_copy(tmp_path, clean_env):
+    """``(home, copy)``: HOME's library and a copy of it elsewhere with
+    the same store UUID (as a Finder or snapshot copy has), each with a
+    collection named after it."""
+    libs = []
+    for name in ("home", "copy"):
+        lib = FixtureLibrary.create(tmp_path / f"lib-{name}", store_uuids=SAME_UUID)
+        lib.add_collection(f"{name} shelf")
+        libs.append(lib)
+    clean_env.setenv("HOME", str(libs[0].root))
+    return libs
+
+
+def write_through_default(monkeypatch, title, data_dir=None):
+    """``PyAppleBooks().create_collection(title)`` in a fresh default
+    library, with ``APPLE_BOOKS_DATA_DIR`` at ``data_dir`` (unset if None)."""
+    if data_dir is None:
+        monkeypatch.delenv("APPLE_BOOKS_DATA_DIR", raising=False)
+    else:
+        monkeypatch.setenv("APPLE_BOOKS_DATA_DIR", str(data_dir))
+    client._reset_default_library()
+    api = PyAppleBooks()
+    api.create_collection(title)
+    return api.store_info().backup_dir
+
+
+@pytest.mark.parametrize("env_first", [True, False])
+def test_env_redirected_default_backups_stay_apart(home_and_copy, clean_env, tmp_path, env_first):
+    """One process writes a copy named by APPLE_BOOKS_DATA_DIR, another the
+    HOME library, within BACKUP_MIN_INTERVAL: each store's restore point is
+    a backup of that store."""
+    home, copy = home_and_copy
+    if env_first:
+        copy_dir = write_through_default(clean_env, "copy write", copy.data_dir)
+        home_dir = write_through_default(clean_env, "home write")
+    else:
+        home_dir = write_through_default(clean_env, "home write")
+        copy_dir = write_through_default(clean_env, "copy write", copy.data_dir)
+    assert home_dir == write_safety.BACKUP_DIR == tmp_path / "backups"
+    # The copy's folder is the one an instance reading it uses.
+    instance = PyAppleBooks(data_dir=copy.data_dir)
+    try:
+        assert copy_dir == instance.store_info().backup_dir != home_dir
+    finally:
+        instance.close()
+    [home_backup] = write_safety.list_backups(home.library_path)
+    assert backup_titles(home_backup) == ["home shelf"]
+    [copy_backup] = write_safety.list_backups(copy.library_path, copy_dir)
+    assert backup_titles(copy_backup) == ["copy shelf"]
+    assert titles(home) == ["home shelf", "home write"] and titles(copy) == ["copy shelf", "copy write"]
+
+
+def test_env_redirected_writes_leave_the_home_backups(home_and_copy, clean_env, monkeypatch):
+    home, copy = home_and_copy
+    write_through_default(clean_env, "home write")
+    [home_backup] = write_safety.list_backups(home.library_path)
+    monkeypatch.setattr(write_safety, "BACKUP_MIN_INTERVAL", 0.0)
+    for i in range(write_safety.BACKUP_KEEP + 1):
+        copy_dir = write_through_default(clean_env, f"copy {i}", copy.data_dir)
+    assert len(write_safety.list_backups(copy.library_path, copy_dir)) == write_safety.BACKUP_KEEP
+    assert write_safety.list_backups(home.library_path) == [home_backup]
+    assert backup_titles(home_backup) == ["home shelf"]
+
+
+def test_library_db_variable_with_a_prefix_name_has_its_own_backups(home_and_copy, clean_env, tmp_path):
+    """A store named BKLibrary-1.sqlite: its file-name stem is a prefix of
+    the HOME store's, whose backups BKLibrary-1-*.sqlite would match."""
+    home, copy = home_and_copy
+    write_through_default(clean_env, "home write")
+    [home_backup] = write_safety.list_backups(home.library_path)
+    short = tmp_path / "elsewhere" / "BKLibrary-1.sqlite"
+    short.parent.mkdir()
+    shutil.copyfile(copy.library_path, short)
+    clean_env.setenv("APPLE_BOOKS_LIBRARY_DB", str(short))
+    client._reset_default_library()
+    api = PyAppleBooks()
+    api.create_collection("short write")
+    backup_dir = api.store_info().backup_dir
+    assert backup_dir != write_safety.BACKUP_DIR
+    [short_backup] = write_safety.list_backups(short, backup_dir)
+    assert short_backup != home_backup and backup_titles(short_backup) == ["copy shelf"]
+    assert write_safety.list_backups(home.library_path) == [home_backup]
+
+
+@pytest.mark.parametrize("args", ["query_timeout", "annotation_db", "data_dir", "library_db"])
+def test_instances_on_the_home_store_back_up_into_backup_dir(home_and_copy, args):
+    """An instance that reads the HOME store, whatever it was given, keeps
+    its backups with PyAppleBooks()'s, where list_backups() finds them."""
+    home, _ = home_and_copy
+    kwargs = {"query_timeout": {"query_timeout": 5}, "annotation_db": {"annotation_db": home.annotation_path},
+              "data_dir": {"data_dir": home.data_dir}, "library_db": {"library_db": home.library_path}}[args]
+    api = PyAppleBooks(**kwargs)
+    try:
+        assert api.store_info().backup_dir == write_safety.BACKUP_DIR
+        assert api._write_kwargs(backup=True) == {"backup": True, "db_path": home.library_path}
+        api.create_collection("instance write")
+    finally:
+        api.close()
+    [backup] = write_safety.list_backups()
+    assert backup_titles(backup) == ["home shelf"]
+    assert titles(home) == ["home shelf", "instance write"]
+
+
+def test_store_named_otherwise_in_the_home_folder_has_its_own_backups(home_and_copy, clean_env):
+    home, _ = home_and_copy
+    other = home.library_path.parent / "BKLibrary-1.sqlite"
+    shutil.copyfile(home.library_path, other)
+    clean_env.setenv("APPLE_BOOKS_LIBRARY_DB", str(other))
+    api = PyAppleBooks()
+    assert api.store_info().backup_dir.parent == write_safety.BACKUP_DIR / "libraries"
+    assert api._write_kwargs(backup=True) == {"backup": True,
+                                              "backup_dir": api.store_info().backup_dir}
 
 
 def test_ambiguous_instance_store_refuses_writes(make_library, clean_env):

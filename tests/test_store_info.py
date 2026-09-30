@@ -56,9 +56,10 @@ def test_default_instance(library):
     assert info.backup_dir == write_safety.BACKUP_DIR
 
 
-def test_backup_dir_is_one_per_store(make_library, monkeypatch, tmp_path):
-    """An instance's writes back up into a folder of their own per store,
-    under BACKUP_DIR (read when asked), whatever the store is called."""
+def test_backup_dir_is_one_per_store(make_library, monkeypatch, tmp_path, fresh_default_library):
+    """A store other than the current user's backs up into a folder of
+    its own, under BACKUP_DIR (read when asked), whatever the store is
+    called and however it is named."""
     monkeypatch.setattr(write_safety, "BACKUP_DIR", tmp_path / "backups")
     one, two = make_library(), make_library()
     first = info_of(one).backup_dir
@@ -70,6 +71,8 @@ def test_backup_dir_is_one_per_store(make_library, monkeypatch, tmp_path):
         assert api.store_info().backup_dir == first
     finally:
         api.close()
+    monkeypatch.setenv("APPLE_BOOKS_DATA_DIR", str(one.data_dir))
+    assert PyAppleBooks().store_info().backup_dir == first
     assert info_of(two).backup_dir not in (first, write_safety.BACKUP_DIR)
     assert one.library_path.name == two.library_path.name
 
