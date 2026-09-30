@@ -4,7 +4,7 @@ from .api import PyAppleBooks, LibraryStats
 
 __all__ = ['PyAppleBooks', 'LibraryStats']
 
-__version__ = '1.9.1'
+__version__ = '1.10.0rc1'
 
 # Library convention: emit records, let the application configure
 # handlers. Without this, warnings would reach stderr through logging's
