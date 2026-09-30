@@ -528,7 +528,7 @@ def test_restore_refused_while_books_runs(restorable, monkeypatch):
 
 def test_restore_defaults_to_the_books_library(restorable, monkeypatch):
     db, backup, bdir = restorable
-    monkeypatch.setattr(collection_writer, "_default_db_path", lambda: db)
+    monkeypatch.setattr(collection_writer, "_default_db_path", lambda **kwargs: db)
     snap = write_safety.restore_library(backup, backup_dir=bdir)
     assert _collections(db) == COLLECTION_ROWS
     assert write_safety.list_backups(backup_dir=bdir) == [snap, backup]

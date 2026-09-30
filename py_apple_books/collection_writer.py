@@ -143,7 +143,7 @@ def _cd_now() -> float:
     return time.time() - APPLE_EPOCH_OFFSET
 
 
-def _store_for_writes(db) -> Path:
+def _store_for_writes(db, *, unreadable_ok: bool = False) -> Path:
     """The library store file the writes to ``db`` (a
     :class:`~py_apple_books.db.LibraryDB`) go to.
 
@@ -155,6 +155,10 @@ def _store_for_writes(db) -> Path:
     to a copy, a ``.old`` file or a backup next to it, nor is it reported
     as missing. Otherwise :class:`AmbiguousStoreError`, before anything is
     opened for writing.
+
+    ``unreadable_ok`` (restoring over a damaged library, listing its
+    backups): a canonical file that is present but fails validation is
+    the store, unless strict discovery found several other candidates.
     """
     store = _store("library")
     folder = f"{store.subdir}/"
@@ -167,12 +171,18 @@ def _store_for_writes(db) -> Path:
         # Strict discovery treats a canonical file that fails validation
         # as absent: with nothing else there, "no store found".
         directory = (data_dir if data_dir is not None else default_data_dir()) / store.subdir
-        if store_file is None and os.path.lexists(directory / store.canonical):
+        canonical = directory / store.canonical
+        if store_file is None and os.path.lexists(canonical):
+            if unreadable_ok and os.path.isfile(canonical):
+                return canonical
             raise AmbiguousStoreError(
                 f"{unreadable}. Nothing was changed; try again in a moment.") from None
         raise
     if store_file is None and path.name != store.canonical:
-        if os.path.lexists(path.parent / store.canonical):
+        canonical = path.parent / store.canonical
+        if os.path.lexists(canonical):
+            if unreadable_ok and os.path.isfile(canonical):
+                return canonical
             raise AmbiguousStoreError(
                 f"{unreadable}, so the write won't go to {path.name} instead. "
                 "Nothing was changed; try again in a moment.")
@@ -192,13 +202,13 @@ def _store_for_writes(db) -> Path:
     return path
 
 
-def _default_db_path() -> Path:
+def _default_db_path(*, unreadable_ok: bool = False) -> Path:
     """The default library's store file (:func:`default_library`, which
     honours ``APPLE_BOOKS_LIBRARY_DB`` and then ``APPLE_BOOKS_DATA_DIR``),
     found strictly (see :func:`_store_for_writes`): several candidate
     stores raise :class:`AmbiguousStoreError` instead of a guess."""
     from py_apple_books.db.client import default_library
-    return _store_for_writes(default_library())
+    return _store_for_writes(default_library(), unreadable_ok=unreadable_ok)
 
 
 class WriteSession:

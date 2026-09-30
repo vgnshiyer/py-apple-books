@@ -5,10 +5,15 @@
   for its own defaults (``list_backups``, ``restore_library``,
   ``backup_library``, direct ``collection_writer`` calls) as for the
   facade, and tells a store's series apart by the whole backup name.
+- Restoring over a damaged library: without ``db_path`` the target is
+  the canonical store file even if it can't be read, for ``force=True``
+  or ``snapshot=False`` (and ``list_backups()``); several candidate
+  stores still refuse.
 
 Synthetic libraries only; Books.app is never checked for real.
 """
 
+import hashlib
 import os
 import shutil
 import sqlite3
@@ -18,6 +23,10 @@ import pytest
 from py_apple_books import PyAppleBooks, api, collection_writer, write_safety
 from py_apple_books.db import client
 from py_apple_books.db.metadata import read_only_uri
+from py_apple_books.exceptions import (
+    AmbiguousStoreError,
+    BackupValidationError,
+)
 from py_apple_books.testing import FixtureLibrary
 
 LOCATION_VARS = ("APPLE_BOOKS_DATA_DIR", "APPLE_BOOKS_LIBRARY_DB", "APPLE_BOOKS_ANNOTATION_DB")
@@ -52,6 +61,11 @@ def titles(path) -> list:
             "SELECT ZTITLE FROM ZBKCOLLECTION WHERE ZDELETEDFLAG = 0 ORDER BY Z_PK")]
     finally:
         conn.close()
+
+
+def digest(path) -> str:
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
 
 
 def library(path, title, **kwargs) -> FixtureLibrary:
@@ -181,3 +195,114 @@ def test_prefix_stem_stores_prune_their_own_backups(prefix_stores, tmp_path):
     assert stale.exists()  # the long store's to prune
     write_safety.backup_library(long, shared)
     assert not stale.exists()
+
+
+# -- restoring over a damaged library -----------------------------------------------
+
+
+def damage_metadata(path):
+    """Leave the store's Z_METADATA unreadable: the store fails
+    validation, and verify_backup can't read its identity."""
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("UPDATE Z_METADATA SET Z_PLIST = X'00', Z_UUID = NULL")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def damaged_home(tmp_path, clean_env):
+    """``(lib, backup)``: HOME's library, backed up with one collection,
+    then given a second and a damaged Z_METADATA."""
+    lib = library(tmp_path / "home", "before")
+    clean_env.setenv("HOME", str(lib.root))
+    backup = write_safety.backup_library(lib.library_path)
+    assert backup.parent == write_safety.BACKUP_DIR
+    lib.add_collection("after")
+    damage_metadata(lib.library_path)
+    return lib, backup
+
+
+def test_list_backups_of_a_damaged_library(damaged_home):
+    _, backup = damaged_home
+    assert write_safety.list_backups() == [backup]
+
+
+def test_restore_over_a_damaged_library_needs_force(damaged_home):
+    lib, backup = damaged_home
+    before = digest(lib.library_path)
+    with pytest.raises(AmbiguousStoreError, match="can't be read") as exc:
+        write_safety.restore_library(backup)
+    assert "force=True" in str(exc.value)
+    assert digest(lib.library_path) == before
+    assert write_safety.list_backups() == [backup]
+
+
+def test_restore_over_a_damaged_library_with_force(damaged_home):
+    lib, backup = damaged_home
+    snap = write_safety.restore_library(backup, force=True)
+    assert titles(lib.library_path) == ["before"]
+    assert write_safety.read_store_metadata(lib.library_path).uuid
+    assert snap.parent == write_safety.BACKUP_DIR
+    assert write_safety.list_backups() == [snap, backup]
+    assert titles(snap) == ["before", "after"]
+
+
+def test_restore_over_a_damaged_library_without_snapshot(damaged_home):
+    lib, backup = damaged_home
+    # The target is found; the backup can't be checked against it.
+    with pytest.raises(BackupValidationError) as exc:
+        write_safety.restore_library(backup, snapshot=False)
+    assert exc.value.reason == BackupValidationError.LIVE_UNREADABLE
+    assert "force=True" in str(exc.value) and "db_path=" in str(exc.value)
+    assert lib.library_path.name in str(exc.value)
+    assert write_safety.restore_library(backup, force=True, snapshot=False) is None
+    assert titles(lib.library_path) == ["before"]
+    assert write_safety.list_backups() == [backup]
+
+
+def test_restore_over_a_damaged_library_next_to_a_copy(damaged_home):
+    """A damaged canonical store next to a copy: the restore goes to the
+    canonical file, never the copy."""
+    lib, backup = damaged_home
+    copy = lib.library_path.with_name("BKLibrary-1-091020131601 copy.sqlite")
+    shutil.copyfile(backup, copy)
+    before = digest(copy)
+    assert write_safety.list_backups() == [backup]
+    with pytest.raises(AmbiguousStoreError, match="force=True"):
+        write_safety.restore_library(backup)
+    write_safety.restore_library(backup, force=True)
+    assert titles(lib.library_path) == ["before"] and digest(copy) == before
+
+
+@pytest.mark.parametrize("canonical", ["missing", "damaged"])
+def test_several_candidate_stores_still_refuse(tmp_path, clean_env, canonical):
+    lib = library(tmp_path / "home", "shelf")
+    clean_env.setenv("HOME", str(lib.root))
+    backup = write_safety.backup_library(lib.library_path)
+    folder = lib.library_path.parent
+    for name in ("BKLibrary-2-1.sqlite", "BKLibrary-3-1.sqlite"):
+        shutil.copyfile(lib.library_path, folder / name)
+    if canonical == "missing":
+        lib.library_path.unlink()
+    else:
+        damage_metadata(lib.library_path)
+    before = {p.name: digest(p) for p in folder.iterdir()}
+    for call in (write_safety.list_backups,
+                 lambda: write_safety.restore_library(backup),
+                 lambda: write_safety.restore_library(backup, force=True),
+                 lambda: write_safety.restore_library(backup, force=True, snapshot=False)):
+        with pytest.raises(AmbiguousStoreError, match="Several"):
+            call()
+    assert {p.name: digest(p) for p in folder.iterdir()} == before
+
+
+def test_live_unreadable_message_names_db_path(tmp_path):
+    lib = library(tmp_path / "lib", "shelf")
+    backup = write_safety.backup_library(lib.library_path, tmp_path / "b")
+    damage_metadata(lib.library_path)
+    with pytest.raises(BackupValidationError, match="db_path=") as exc:
+        write_safety.verify_backup(backup, lib.library_path)
+    assert exc.value.reason == BackupValidationError.LIVE_UNREADABLE
+    assert "force=True" in str(exc.value)

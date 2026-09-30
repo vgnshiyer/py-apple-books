@@ -53,6 +53,8 @@ from py_apple_books.db.metadata import (  # noqa: F401  (re-exported)
     read_store_metadata,
 )
 from py_apple_books.exceptions import (
+    AmbiguousStoreError,
+    AppleBooksError,
     BackupValidationError,
     BooksAppRunningError,
     SchemaValidationError,
@@ -368,26 +370,32 @@ def list_backups(
     """Backups of the library database, newest first.
 
     ``db_path`` defaults to the Books library (the store the location
-    variables name, else the current user's). ``backup_dir`` defaults to
-    where that store's backups go (see :func:`backup_library`). The
-    first entry is the restore point for the most recent write (writes
-    within :data:`BACKUP_MIN_INTERVAL` of each other share the backup
-    taken before the first of them) or, right after a restore, the
-    snapshot that undoes it. Returns ``[]`` if the directory doesn't
-    exist.
+    variables name, else the current user's; its canonical file when
+    present, even if damaged). ``backup_dir`` defaults to where that
+    store's backups go (see :func:`backup_library`). The first entry is
+    the restore point for the most recent write (writes within
+    :data:`BACKUP_MIN_INTERVAL` of each other share the backup taken
+    before the first of them) or, right after a restore, the snapshot
+    that undoes it. Returns ``[]`` if the directory doesn't exist.
+
+    :raises AmbiguousStoreError: no ``db_path``, and the Books library
+        can't be told for sure (several candidate stores).
     """
-    db_path = Path(db_path) if db_path else _default_library_path()
+    db_path = Path(db_path) if db_path else _default_library_path(unreadable_ok=True)
     backup_dir = _backup_dir(backup_dir, db_path)
     if not backup_dir.is_dir():
         return []
     return _backups_for(db_path, backup_dir)[::-1]
 
 
-def _default_library_path() -> Path:
+def _default_library_path(*, unreadable_ok: bool = False) -> Path:
+    """The Books library's store (``collection_writer._default_db_path``);
+    with ``unreadable_ok``, its canonical file when that is present but
+    fails validation (busy or damaged)."""
     # Imported lazily: collection_writer imports this module.
     from py_apple_books.collection_writer import _default_db_path
 
-    return _default_db_path()
+    return _default_db_path(unreadable_ok=unreadable_ok)
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +450,8 @@ def verify_backup(backup_path: Path, db_path: Path) -> None:
         raise error(
             f"Can't read the live library's store identity ({db_path.name}) to "
             "check the backup against. If you are restoring over a damaged "
-            "library, call restore_library(..., force=True).",
+            "library, call restore_library(..., force=True), with "
+            "db_path=<the library's store file> if it isn't the default library.",
             error.LIVE_UNREADABLE,
         )
 
@@ -467,6 +476,32 @@ def verify_backup(backup_path: Path, db_path: Path) -> None:
             "open the library. Pass force=True only if you know it is safe.",
             error.MODEL_MISMATCH,
         )
+
+
+def _default_restore_target(force: bool, snapshot: bool) -> Path:
+    """:func:`restore_library`'s default ``db_path``.
+
+    Restoring over a damaged library (``force``, or no ``snapshot``)
+    takes the canonical store file even if it can't be read. Otherwise
+    that store is refused, and the refusal says how to restore over it.
+    """
+    damaged_ok = force or not snapshot
+    try:
+        return _default_library_path(unreadable_ok=damaged_ok)
+    except AmbiguousStoreError as e:
+        refused = e
+    if not damaged_ok:
+        try:
+            _default_library_path(unreadable_ok=True)
+        except AppleBooksError:
+            pass
+        else:
+            # The canonical store is there but can't be read.
+            raise AmbiguousStoreError(
+                f"{refused} To restore over it if it is damaged, call "
+                "restore_library(..., force=True)."
+            ) from refused
+    raise refused
 
 
 def restore_library(
@@ -499,7 +534,9 @@ def restore_library(
 
     :param db_path: The library database to overwrite; defaults to the
         Books library (the store the location variables name, else the
-        current user's), found as for a write.
+        current user's), found as for a write. With ``force`` or without
+        ``snapshot`` that is its canonical file when present, even if it
+        can't be read; otherwise a store that can't be read is refused.
     :param force: Skip :func:`verify_backup`, e.g. to restore over a
         damaged library or across a Books data-model change.
     :param snapshot: Snapshot the current library first. Turn it off
@@ -510,11 +547,15 @@ def restore_library(
     :raises BackupValidationError: a pre-restore check failed; nothing
         was changed.
     :raises BooksAppRunningError: Books is running; nothing was changed.
+    :raises AmbiguousStoreError: no ``db_path``, and the Books library
+        can't be told for sure (several candidate stores) or, with
+        ``snapshot`` and without ``force``, can't be read; nothing was
+        changed.
     :raises WriteError: the backup is missing, the snapshot failed
         (nothing was changed), or the restore itself failed.
     """
     backup_path = Path(backup_path)
-    db_path = Path(db_path) if db_path else _default_library_path()
+    db_path = Path(db_path) if db_path else _default_restore_target(force, snapshot)
     if not backup_path.exists():
         raise WriteError(f"Backup file not found: {backup_path}")
     if db_path.exists() and os.path.samefile(backup_path, db_path):
