@@ -32,7 +32,7 @@ from py_apple_books.exceptions import (
 
 from tests.test_collection_writer import (  # noqa: F401  (fixtures)
     COLLECTION_ROWS,
-    FINANCE,
+    SHELF_A,
     OTHER_BOOK,
     _default_backup_dir,
     _q,
@@ -96,7 +96,7 @@ def _create(db, **kwargs):
 
 
 def _add(db, **kwargs):
-    return add_book_to_collection(FINANCE, OTHER_BOOK, **_session_kwargs(db), **kwargs)
+    return add_book_to_collection(SHELF_A, OTHER_BOOK, **_session_kwargs(db), **kwargs)
 
 
 DRIFT_CASES = [
@@ -109,7 +109,7 @@ def _inserted_value(db, table, column):
     if table == "ZBKCOLLECTION":
         sql = f"SELECT {column} FROM ZBKCOLLECTION WHERE ZTITLE = 'Drift'"
     else:
-        sql = f"SELECT {column} FROM ZBKCOLLECTIONMEMBER WHERE ZCOLLECTION = {FINANCE}"
+        sql = f"SELECT {column} FROM ZBKCOLLECTIONMEMBER WHERE ZCOLLECTION = {SHELF_A}"
     rows = _q(db, sql)
     assert len(rows) == 1
     return rows[0][0]

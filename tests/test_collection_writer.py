@@ -40,13 +40,13 @@ CD_2025 = 750000000  # ~ late 2024 in Core Data seconds; new stamps must exceed 
 # fixture.
 BOOKS = 3  # built-in "Books"
 WANT_TO_READ = 8  # built-in "Want to Read"
-FINANCE = 9  # user collection, sort key 60000, no members
-TECH = 15  # user collection, sort key 10000, holds BOOK
+SHELF_A = 9  # user collection, sort key 50000, no members
+SHELF_B = 15  # user collection, sort key 20000, holds BOOK
 BOOK = 151
 OTHER_BOOK = 191
 NO_ASSET_BOOK = 200  # ZASSETID is NULL
-TECH_MEMBER = 126
-COLLECTION_ROWS = 10  # 8 built-ins + FINANCE + TECH
+SHELF_B_MEMBER = 126
+COLLECTION_ROWS = 10  # 8 built-ins + SHELF_A + SHELF_B
 
 
 def _next_pk(lib, entity, pk):
@@ -65,9 +65,9 @@ def fixture_lib(tmp_path):
     assert system["Books_Collection_ID"]["id"] == BOOKS
     assert system["Want_To_Read_Collection_ID"]["id"] == WANT_TO_READ
 
-    assert lib.add_collection("Finance", sort_key=60000)["id"] == FINANCE
-    _next_pk(lib, "BKCollection", TECH)
-    tech = lib.add_collection("Tech", sort_key=10000)
+    assert lib.add_collection("Shelf A", sort_key=50000)["id"] == SHELF_A
+    _next_pk(lib, "BKCollection", SHELF_B)
+    shelf_b = lib.add_collection("Shelf B", sort_key=20000)
 
     _next_pk(lib, "BKLibraryAsset", BOOK)
     book = lib.add_book("Synthetic Book A")
@@ -76,8 +76,8 @@ def fixture_lib(tmp_path):
     _next_pk(lib, "BKLibraryAsset", NO_ASSET_BOOK)
     lib.add_book("Synthetic Book Without Asset Id", raw={"ZASSETID": None})
 
-    _next_pk(lib, "BKCollectionMember", TECH_MEMBER)
-    lib.add_to_collection(tech, book)
+    _next_pk(lib, "BKCollectionMember", SHELF_B_MEMBER)
+    lib.add_to_collection(shelf_b, book)
 
     # Key counters ahead of MAX(Z_PK), as on a real library.
     _next_pk(lib, "BKCollectionMember", 549)
@@ -129,8 +129,8 @@ def test_create_collection_row_and_bookkeeping(fixture_db):
     assert viewmode is None
     assert title == "Philosophy"
     assert details is None
-    # sidebar slot after highest user sortkey (60000)
-    assert sortkey == 60000 + SORT_KEY_STEP
+    # sidebar slot after highest user sortkey (50000)
+    assert sortkey == 50000 + SORT_KEY_STEP
     # uppercase UUID
     assert coll_id == coll_id.upper()
     uuid.UUID(coll_id)  # parses
@@ -164,10 +164,10 @@ def test_create_collection_defensive_pk_when_zmax_stale(fixture_db):
 
 
 def test_rename_collection(fixture_db):
-    before_opt = _q(fixture_db, "SELECT Z_OPT FROM ZBKCOLLECTION WHERE Z_PK = ?", (FINANCE,))[0][0]
-    rename_collection(FINANCE, "Money", **_session_kwargs(fixture_db))
+    before_opt = _q(fixture_db, "SELECT Z_OPT FROM ZBKCOLLECTION WHERE Z_PK = ?", (SHELF_A,))[0][0]
+    rename_collection(SHELF_A, "Money", **_session_kwargs(fixture_db))
     title, z_opt = _q(
-        fixture_db, "SELECT ZTITLE, Z_OPT FROM ZBKCOLLECTION WHERE Z_PK = ?", (FINANCE,)
+        fixture_db, "SELECT ZTITLE, Z_OPT FROM ZBKCOLLECTION WHERE Z_PK = ?", (SHELF_A,)
     )[0]
     assert title == "Money"
     assert z_opt == before_opt + 1
@@ -191,10 +191,10 @@ def test_rename_missing_collection(fixture_db):
 
 
 def test_delete_collection_soft_deletes_and_clears_members(fixture_db):
-    delete_collection(TECH, **_session_kwargs(fixture_db))  # has 1 member
-    deleted = _q(fixture_db, "SELECT ZDELETEDFLAG FROM ZBKCOLLECTION WHERE Z_PK = ?", (TECH,))[0][0]
+    delete_collection(SHELF_B, **_session_kwargs(fixture_db))  # has 1 member
+    deleted = _q(fixture_db, "SELECT ZDELETEDFLAG FROM ZBKCOLLECTION WHERE Z_PK = ?", (SHELF_B,))[0][0]
     assert deleted == 1
-    members = _q(fixture_db, "SELECT * FROM ZBKCOLLECTIONMEMBER WHERE ZCOLLECTION = ?", (TECH,))
+    members = _q(fixture_db, "SELECT * FROM ZBKCOLLECTIONMEMBER WHERE ZCOLLECTION = ?", (SHELF_B,))
     assert members == []
     # the book itself is untouched
     assert _q(fixture_db, "SELECT COUNT(*) FROM ZBKLIBRARYASSET WHERE Z_PK = ?", (BOOK,))[0][0] == 1
@@ -206,9 +206,9 @@ def test_delete_system_collection_refused(fixture_db):
 
 
 def test_deleted_collection_not_addressable(fixture_db):
-    delete_collection(TECH, **_session_kwargs(fixture_db))
+    delete_collection(SHELF_B, **_session_kwargs(fixture_db))
     with pytest.raises(CollectionNotFoundError):
-        rename_collection(TECH, "Back", **_session_kwargs(fixture_db))
+        rename_collection(SHELF_B, "Back", **_session_kwargs(fixture_db))
 
 
 # ---------------------------------------------------------------------------
@@ -217,14 +217,14 @@ def test_deleted_collection_not_addressable(fixture_db):
 
 
 def test_add_book_creates_member_row(fixture_db):
-    changed = add_book_to_collection(FINANCE, OTHER_BOOK, **_session_kwargs(fixture_db))
+    changed = add_book_to_collection(SHELF_A, OTHER_BOOK, **_session_kwargs(fixture_db))
     assert changed is True
 
     row = _q(
         fixture_db,
         "SELECT Z_PK, Z_ENT, Z_OPT, ZSORTKEY, ZASSET, ZCOLLECTION, ZASSETID, "
         "ZTEMPORARYASSETID FROM ZBKCOLLECTIONMEMBER WHERE ZCOLLECTION = ?",
-        (FINANCE,),
+        (SHELF_A,),
     )[0]
     pk, z_ent, z_opt, sortkey, asset, coll, asset_id, temp_id = row
     assert pk == 549  # member Z_MAX was 548
@@ -242,31 +242,31 @@ def test_add_book_creates_member_row(fixture_db):
 
 
 def test_add_book_appends_after_existing_members(fixture_db):
-    add_book_to_collection(TECH, OTHER_BOOK, **_session_kwargs(fixture_db))
+    add_book_to_collection(SHELF_B, OTHER_BOOK, **_session_kwargs(fixture_db))
     sortkey = _q(
         fixture_db,
         "SELECT ZSORTKEY FROM ZBKCOLLECTIONMEMBER WHERE ZCOLLECTION = ? AND ZASSET = ?",
-        (TECH, OTHER_BOOK),
+        (SHELF_B, OTHER_BOOK),
     )[0][0]
     assert sortkey == 10000 + SORT_KEY_STEP  # after BOOK's 10000
 
 
 def test_add_book_touches_parent_collection(fixture_db):
     sql = "SELECT Z_OPT, ZLOCALMODDATE FROM ZBKCOLLECTION WHERE Z_PK = ?"
-    before = _q(fixture_db, sql, (FINANCE,))[0]
-    add_book_to_collection(FINANCE, OTHER_BOOK, **_session_kwargs(fixture_db))
-    after = _q(fixture_db, sql, (FINANCE,))[0]
+    before = _q(fixture_db, sql, (SHELF_A,))[0]
+    add_book_to_collection(SHELF_A, OTHER_BOOK, **_session_kwargs(fixture_db))
+    after = _q(fixture_db, sql, (SHELF_A,))[0]
     assert after[0] == before[0] + 1
     assert after[1] > before[1]
 
 
 def test_add_book_duplicate_is_noop(fixture_db):
-    assert add_book_to_collection(FINANCE, OTHER_BOOK, **_session_kwargs(fixture_db)) is True
-    assert add_book_to_collection(FINANCE, OTHER_BOOK, **_session_kwargs(fixture_db)) is False
+    assert add_book_to_collection(SHELF_A, OTHER_BOOK, **_session_kwargs(fixture_db)) is True
+    assert add_book_to_collection(SHELF_A, OTHER_BOOK, **_session_kwargs(fixture_db)) is False
     count = _q(
         fixture_db,
         "SELECT COUNT(*) FROM ZBKCOLLECTIONMEMBER WHERE ZCOLLECTION = ?",
-        (FINANCE,),
+        (SHELF_A,),
     )[0][0]
     assert count == 1
 
@@ -282,12 +282,12 @@ def test_add_book_to_managed_system_collection_refused(fixture_db):
 
 def test_add_unknown_book(fixture_db):
     with pytest.raises(BookNotFoundError):
-        add_book_to_collection(FINANCE, 999, **_session_kwargs(fixture_db))
+        add_book_to_collection(SHELF_A, 999, **_session_kwargs(fixture_db))
 
 
 def test_add_book_without_asset_id_refused(fixture_db):
     with pytest.raises(WriteError):
-        add_book_to_collection(FINANCE, NO_ASSET_BOOK, **_session_kwargs(fixture_db))
+        add_book_to_collection(SHELF_A, NO_ASSET_BOOK, **_session_kwargs(fixture_db))
 
 
 # ---------------------------------------------------------------------------
@@ -296,13 +296,13 @@ def test_add_book_without_asset_id_refused(fixture_db):
 
 
 def test_remove_book(fixture_db):
-    assert remove_book_from_collection(TECH, BOOK, **_session_kwargs(fixture_db)) is True
-    members = _q(fixture_db, "SELECT * FROM ZBKCOLLECTIONMEMBER WHERE ZCOLLECTION = ?", (TECH,))
+    assert remove_book_from_collection(SHELF_B, BOOK, **_session_kwargs(fixture_db)) is True
+    members = _q(fixture_db, "SELECT * FROM ZBKCOLLECTIONMEMBER WHERE ZCOLLECTION = ?", (SHELF_B,))
     assert members == []
 
 
 def test_remove_book_not_in_collection_is_noop(fixture_db):
-    assert remove_book_from_collection(FINANCE, BOOK, **_session_kwargs(fixture_db)) is False
+    assert remove_book_from_collection(SHELF_A, BOOK, **_session_kwargs(fixture_db)) is False
 
 
 def test_remove_from_managed_system_collection_refused(fixture_db):
@@ -329,7 +329,7 @@ def test_unknown_sentinel_fails_closed(fixture_db):
     conn = sqlite3.connect(fixture_db)
     conn.execute(
         "INSERT INTO ZBKCOLLECTION VALUES (14, 2, 1, 0, 0, 0, -9, 6, NULL, "
-        "758012697.6, 788638310.6, 'Hidden_Collection_ID', NULL, 'Hidden')"
+        "700000000.5, 700086400.5, 'Hidden_Collection_ID', NULL, 'Hidden')"
     )
     conn.commit()
     conn.close()
@@ -416,13 +416,13 @@ def test_failed_op_rolls_back_everything(fixture_db):
     # NO_ASSET_BOOK has no asset id -> raises AFTER collection fetch but the
     # session context must roll back any bookkeeping.
     with pytest.raises(WriteError):
-        add_book_to_collection(FINANCE, NO_ASSET_BOOK, **_session_kwargs(fixture_db))
+        add_book_to_collection(SHELF_A, NO_ASSET_BOOK, **_session_kwargs(fixture_db))
     z_max_after = _q(
         fixture_db, "SELECT Z_MAX FROM Z_PRIMARYKEY WHERE Z_NAME = 'BKCollectionMember'"
     )[0][0]
     assert z_max_after == z_max_before
     assert _q(
-        fixture_db, "SELECT COUNT(*) FROM ZBKCOLLECTIONMEMBER WHERE ZCOLLECTION = ?", (FINANCE,)
+        fixture_db, "SELECT COUNT(*) FROM ZBKCOLLECTIONMEMBER WHERE ZCOLLECTION = ?", (SHELF_A,)
     )[0][0] == 0
 
 

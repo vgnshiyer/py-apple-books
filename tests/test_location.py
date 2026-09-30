@@ -50,29 +50,29 @@ class TestCfiParsing:
 
     def test_char_range_parsed(self):
         loc = Location(
-            "epubcfi(/6/8[item5]!/4/2[pgepubid00005]/18/1,:629,:691)"
+            "epubcfi(/6/10[item7]!/4/2[pgepubid00007]/16/1,:412,:478)"
         )
-        assert loc.char_range == (629, 691)
+        assert loc.char_range == (412, 478)
 
     def test_char_range_none_when_not_encoded(self):
         loc = Location("epubcfi(/6/8[item5]!/4/2/1:0)")
         assert loc.char_range is None
 
     def test_real_world_cfis(self):
-        """Spot-check a few CFIs lifted from a real Apple Books library
-        so parser regressions can't slip through."""
+        """Spot-check a few CFIs shaped like ones real Apple Books
+        libraries hold, so parser regressions can't slip through."""
         cases = [
             (
-                "epubcfi(/6/26[id134]!/4[text]/2[fm02]/2/2[calibre_pb_0]/2/2/1,:0,:1)",
-                {"chapter_id": "id134", "char_range": (0, 1)},
+                "epubcfi(/6/30[id211]!/4[text]/2[fm01]/2/2[calibre_pb_3]/2/2/1,:0,:1)",
+                {"chapter_id": "id211", "char_range": (0, 1)},
             ),
             (
-                "epubcfi(/6/14[x9780062457738-5]!/4[x9780062457738-5]/2[_idContainer008]/266/1,:4,:10)",
-                {"chapter_id": "x9780062457738-5", "char_range": (4, 10)},
+                "epubcfi(/6/16[x9780000000002-7]!/4[x9780000000002-7]/2[_idContainer012]/148/1,:7,:15)",
+                {"chapter_id": "x9780000000002-7", "char_range": (7, 15)},
             ),
             (
-                "epubcfi(/6/20[chapter003]!/4/2/2[hd-chapter003]/3,:0,:1)",
-                {"chapter_id": "chapter003", "char_range": (0, 1)},
+                "epubcfi(/6/58[chapter027]!/4/2/2[hd-chapter027]/3,:2,:9)",
+                {"chapter_id": "chapter027", "char_range": (2, 9)},
             ),
         ]
         for cfi, expected in cases:
