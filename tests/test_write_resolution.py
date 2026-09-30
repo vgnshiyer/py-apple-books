@@ -484,6 +484,44 @@ def test_reads_fallen_back_to_a_copy_refuse_writes(copy_beside, monkeypatch):
     assert titles(lib) == ["live shelf", "live second"]
 
 
+@pytest.mark.parametrize("default", [False, True])
+@pytest.mark.parametrize("read_first", [True, False])
+def test_lone_canonical_store_failing_validation_is_unreadable_not_missing(
+        make_library, clean_env, monkeypatch, default, read_first):
+    """The canonical store is there but fails validation, with no other
+    store next to it: the write says it can't be read, not that there is
+    no library."""
+    lib = make(make_library, "lib")
+    clean_env.setenv("HOME", str(lib.root))
+    api = PyAppleBooks() if default else PyAppleBooks(data_dir=lib.data_dir)
+    try:
+        if read_first:
+            assert [c.title for c in api.list_collections()] == ["lib shelf"]
+        fail_validation(monkeypatch, lib.library_path)
+        # Reads fall back to the canonical file (with a warning).
+        assert [c.title for c in api.list_collections()] == ["lib shelf"]
+        before = digest(lib.library_path)
+        with pytest.raises(AmbiguousStoreError, match="can't be read right now") as exc:
+            api.create_collection("New")
+        assert "No Apple Books library store found" not in str(exc.value)
+        if default:
+            with pytest.raises(AmbiguousStoreError, match="can't be read right now"):
+                collection_writer.create_collection("New")
+    finally:
+        api.close()
+    assert digest(lib.library_path) == before
+    assert not write_safety.BACKUP_DIR.exists()
+
+
+def test_missing_store_is_still_not_found(make_library, clean_env):
+    lib = make(make_library, "lib")
+    lib.library_path.unlink()
+    api = PyAppleBooks(data_dir=lib.data_dir)
+    with pytest.raises(DBConnectionError, match="No Apple Books library store found") as exc:
+        api.create_collection("Nope", backup=False)
+    assert not isinstance(exc.value, AmbiguousStoreError)
+
+
 @pytest.mark.parametrize("name", [COPY, "BKLibrary-1-091020131601.old.sqlite",
                                   "BKLibrary-1-091020131601-20260101-120000-000000.sqlite"])
 def test_lone_copy_refuses_writes(make_library, clean_env, name):

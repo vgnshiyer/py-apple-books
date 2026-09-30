@@ -43,12 +43,13 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from py_apple_books.db.client import AppleBooksDBClient, _store, find_sqlite_file
+from py_apple_books.db.client import AppleBooksDBClient, _store, default_data_dir, find_sqlite_file
 from py_apple_books.exceptions import (
     AmbiguousStoreError,
     BookNotFoundError,
     CollectionNotFoundError,
     LibraryBusyError,
+    LibraryNotFoundError,
     SchemaValidationError,
     SystemCollectionError,
     WriteError,
@@ -151,17 +152,29 @@ def _store_for_writes(db) -> Path:
     a file, must be the canonical one or, if there is no canonical file,
     a single store with Apple's generation-stamped name: a canonical file
     that fails validation for a moment (busy, say) doesn't send the write
-    to a copy, a ``.old`` file or a backup next to it. Otherwise
-    :class:`AmbiguousStoreError`, before anything is opened for writing.
+    to a copy, a ``.old`` file or a backup next to it, nor is it reported
+    as missing. Otherwise :class:`AmbiguousStoreError`, before anything is
+    opened for writing.
     """
-    path = db.library_path(strict=True)
     store = _store("library")
     folder = f"{store.subdir}/"
-    if db._source("library")[0] is None and path.name != store.canonical:
+    store_file, data_dir = db._source("library")
+    unreadable = (f"The Apple Books library store {store.canonical} in {folder} can't be read "
+                  "right now (busy or damaged)")
+    try:
+        path = db.library_path(strict=True)
+    except LibraryNotFoundError:
+        # Strict discovery treats a canonical file that fails validation
+        # as absent: with nothing else there, "no store found".
+        directory = (data_dir if data_dir is not None else default_data_dir()) / store.subdir
+        if store_file is None and os.path.lexists(directory / store.canonical):
+            raise AmbiguousStoreError(
+                f"{unreadable}. Nothing was changed; try again in a moment.") from None
+        raise
+    if store_file is None and path.name != store.canonical:
         if os.path.lexists(path.parent / store.canonical):
             raise AmbiguousStoreError(
-                f"The Apple Books library store {store.canonical} in {folder} can't be read "
-                f"right now (busy or damaged), so the write won't go to {path.name} instead. "
+                f"{unreadable}, so the write won't go to {path.name} instead. "
                 "Nothing was changed; try again in a moment.")
         if not store.generation.fullmatch(path.name):
             raise AmbiguousStoreError(
