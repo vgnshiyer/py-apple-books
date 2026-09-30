@@ -175,7 +175,7 @@ class TestParseNcxBytes:
         assert [c.id for c in chapters] == ["alpha", "beta"]
 
     def test_url_encoded_src_is_decoded(self):
-        # Real Steve Jobs EPUB has CR%21BJHPA831ES3B3F7WSRKZ17DMGSM7_split_002.html
+        # Some EPUBs percent-encode file names, e.g. part%21one_split_002.html
         ncx = _ncx(
             '<navPoint id="np-1"><navLabel><text>Ch</text></navLabel>'
             '  <content src="dir%2Fweird%21file.xhtml"/></navPoint>'
@@ -289,12 +289,12 @@ class TestExtractChapterText:
         assert out == "Hello"
 
     def test_image_only_body_returns_empty(self):
-        # Real Skin in the Game pattern: "Book 1 Introduction" is
+        # A real pattern: a part title page ("Part 1 Introduction") is
         # rendered as a single <img>. We can't extract text from that —
         # an empty return is correct.
         html = (
             b"<html><body><div>"
-            b'<img alt="Book 1" src="img.jpg"/>'
+            b'<img alt="Part 1" src="img.jpg"/>'
             b"</div></body></html>"
         )
         assert extract_chapter_text(html, None, set()) == ""

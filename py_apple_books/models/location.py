@@ -3,7 +3,7 @@
 An Apple Books annotation stores its position as an EPUB Canonical
 Fragment Identifier, e.g.::
 
-    epubcfi(/6/8[item5]!/4/2[pgepubid00005]/18/1,:629,:691)
+    epubcfi(/6/10[item7]!/4/2[pgepubid00007]/16/1,:412,:478)
 
 The :class:`Location` wraps a CFI and eagerly pulls out the pieces of
 information that are usefully derivable from the string alone —

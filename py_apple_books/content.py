@@ -524,9 +524,9 @@ class BookContent:
         2. **Any other spine entry** (sub-sections not in the ToC) —
            falls through to ebooklib's manifest lookup directly and
            returns the whole file's text. This handles EPUBs whose
-           spine is finer-grained than the ToC (e.g. Isaacson's *Elon
-           Musk*, where each chapter has a ``chXX_sub01`` fine-section
-           file that the ToC doesn't list).
+           spine is finer-grained than the ToC (e.g. a book where each
+           chapter has a ``chXX_sub01`` fine-section file that the ToC
+           doesn't list).
 
         HTML → plain text extraction is done with :mod:`bs4` using the
         stdlib ``html.parser`` backend.
