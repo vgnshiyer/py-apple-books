@@ -55,16 +55,11 @@ jobs:
             exit 1
           fi
           uv pip install -e . --group dev
-      - name: Run tests against stub Apple Books databases
-        # py_apple_books opens these at import time; empty files are valid
-        # SQLite databases. A throwaway HOME keeps the tests away from
-        # macOS's protected app containers.
+      - name: Run tests
+        # tests/conftest.py builds a synthetic library in a temporary HOME
+        # before anything imports py_apple_books; no Apple Books data needed.
         if: steps.venv.outputs.skip != 'true'
         run: |
-          export HOME="$RUNNER_TEMP/home"
-          d="$HOME/Library/Containers/com.apple.iBooksX/Data/Documents"
-          mkdir -p "$d/BKLibrary" "$d/AEAnnotation"
-          touch "$d/BKLibrary/BKLibrary-stub.sqlite" "$d/AEAnnotation/AEAnnotation-stub.sqlite"
           if [ "$PYTHON" = "3.13" ]; then
             .venv/bin/python -m coverage run --source=py_apple_books -m pytest -q
             .venv/bin/python -m coverage report
@@ -83,13 +78,8 @@ jobs:
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - name: Create the environment
         run: uv venv -p 3.10 && uv pip install --resolution lowest-direct -e . 'pytest>=8'
-      - name: Run tests against stub Apple Books databases
-        run: |
-          export HOME="$RUNNER_TEMP/home"
-          d="$HOME/Library/Containers/com.apple.iBooksX/Data/Documents"
-          mkdir -p "$d/BKLibrary" "$d/AEAnnotation"
-          touch "$d/BKLibrary/BKLibrary-stub.sqlite" "$d/AEAnnotation/AEAnnotation-stub.sqlite"
-          .venv/bin/python -m pytest -q
+      - name: Run tests
+        run: .venv/bin/python -m pytest -q
 
   dist:
     # Builds the sdist and wheel the way publish.yml does, checks their
@@ -121,10 +111,6 @@ jobs:
           venv="$RUNNER_TEMP/venv"
           uv venv -p "$PYTHON" "$venv"
           uv pip install -p "$venv" dist/*.whl --group dev
-          export HOME="$RUNNER_TEMP/home"
-          d="$HOME/Library/Containers/com.apple.iBooksX/Data/Documents"
-          mkdir -p "$d/BKLibrary" "$d/AEAnnotation"
-          touch "$d/BKLibrary/BKLibrary-stub.sqlite" "$d/AEAnnotation/AEAnnotation-stub.sqlite"
           # Only tests/ and the pytest config: nothing importable from the
           # source tree, so py_apple_books comes from the wheel.
           mkdir "$RUNNER_TEMP/wheel-tests"
@@ -176,6 +162,4 @@ jobs:
           name: dist
           path: dist/
       - name: Check apple-books-mcp against the wheel
-        run: |
-          if [ ! -f tests/mcp_compat/run.py ]; then echo 'mcp-compat runner not present yet'; exit 0; fi
-          python3 tests/mcp_compat/run.py --mcp-version "$MCP_VERSION" --uvx-python "$UVX_PYTHON" --lib dist/*.whl --check
+        run: python3 tests/mcp_compat/run.py --mcp-version "$MCP_VERSION" --uvx-python "$UVX_PYTHON" --lib dist/*.whl --check
