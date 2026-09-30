@@ -54,6 +54,11 @@ def seed(lib, name: str) -> dict:
     return {"book": book["id"], "shelf": shelf["id"]}
 
 
+def library_of(api) -> LibraryDB:
+    """The library ``api`` reads (None for the shared default one)."""
+    return api._PyAppleBooks__library
+
+
 @pytest.fixture
 def other(library, make_library):
     """A PyAppleBooks over a library of its own ('other'), while the
@@ -80,18 +85,18 @@ def test_construction_does_no_io(monkeypatch, tmp_path):
     missing = PyAppleBooks(data_dir=tmp_path / "nowhere")
     files = PyAppleBooks(library_db=tmp_path / "a.sqlite", annotation_db=tmp_path / "b.sqlite",
                          query_timeout=3)
-    assert default._db is None
-    assert isinstance(missing._db, LibraryDB) and isinstance(files._db, LibraryDB)
-    assert files._db.query_timeout == 3.0
+    assert library_of(default) is None
+    assert isinstance(library_of(missing), LibraryDB) and isinstance(library_of(files), LibraryDB)
+    assert library_of(files).query_timeout == 3.0
     monkeypatch.undo()
     with pytest.raises(LibraryNotFoundError):
         list(missing.list_books())
 
 
 def test_any_argument_makes_a_library_of_its_own(tmp_path):
-    assert PyAppleBooks()._db is None
-    assert PyAppleBooks(query_timeout=None)._db.query_timeout is None
-    assert PyAppleBooks(tmp_path)._db is not PyAppleBooks(tmp_path)._db
+    assert library_of(PyAppleBooks()) is None
+    assert library_of(PyAppleBooks(query_timeout=None)).query_timeout is None
+    assert library_of(PyAppleBooks(tmp_path)) is not library_of(PyAppleBooks(tmp_path))
     with pytest.raises(InvalidArgumentError):
         PyAppleBooks(query_timeout=-1)
 
@@ -116,6 +121,24 @@ def test_subclass_without_init_call_reads_the_default_library(library):
             self.mine = True
 
     assert [b.title for b in Mine().list_books()] == ["default book"]
+
+
+def test_subclass_attributes_are_its_own(library):
+    """A 1.9 subclass may keep anything in ``self._db`` (or any other
+    name): the inherited methods still read the library."""
+    seed(library, "default")
+
+    class Legacy(PyAppleBooks):
+        def __init__(self):
+            self._db = sqlite3.connect(":memory:")
+            self._library = "mine"
+
+    legacy = Legacy()
+    try:
+        assert [b.title for b in legacy.list_books()] == ["default book"]
+        assert legacy.count_annotations() == 3
+    finally:
+        legacy._db.close()
 
 
 def test_subclass_methods_read_the_instance_library(other):
@@ -175,7 +198,7 @@ def test_explicit_store_files(other, make_library):
 
 def test_default_instance_follows_use_library(other):
     """PyAppleBooks() reads the current library, as in wave 3."""
-    with use_library(other._db):
+    with use_library(library_of(other)):
         assert [b.title for b in PyAppleBooks().list_books()] == ["other book"]
     assert [b.title for b in PyAppleBooks().list_books()] == ["default book"]
 
@@ -206,11 +229,11 @@ def test_instances_in_threads_keep_their_results_apart(other):
 
 def test_close_then_a_call_reopens(other):
     list(other.list_books())
-    assert other._db._idle
+    assert library_of(other)._idle
     other.close()
-    assert other._db._idle == [] and other._db._paths is None
+    assert library_of(other)._idle == [] and library_of(other)._paths is None
     assert [b.title for b in other.list_books()] == ["other book"]
-    assert other._db._idle
+    assert library_of(other)._idle
 
 
 def test_close_of_the_default_instance_closes_the_default_library(library):
@@ -309,7 +332,7 @@ def test_recency_models_carry_the_instance_library(other):
     other.fixture.add_book("other second", last_opened=day(4))
     recent = other.get_recently_read_books()
     assert [b.title for b in recent] == ["other second", "other book"]
-    assert all(b.__dict__["_ab_db"] is other._db for b in recent)
+    assert all(b.__dict__["_ab_db"] is library_of(other) for b in recent)
     assert [a.selected_text for a in recent[1].annotations] == [f"other highlight {i}" for i in range(3)]
     assert recent.count() == len(recent) == 2
     # run_query() (a 1.9.1 attribute) returns the rows, in order.

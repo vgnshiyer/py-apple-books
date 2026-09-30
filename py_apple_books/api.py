@@ -226,15 +226,17 @@ class PyAppleBooks:
     """
 
     # The library an instance reads; None: the shared default one (and,
-    # inside a use_library() block, that block's library).
-    _db: Optional[LibraryDB] = None
+    # inside a use_library() block, that block's library). Name-mangled
+    # (_PyAppleBooks__library): 1.9 had no instance attributes, so a
+    # subclass may use any other name for its own.
+    __library: Optional[LibraryDB] = None
 
     def __init__(self, data_dir=None, *, library_db=None, annotation_db=None,
                  query_timeout=USE_DEFAULT):
         if (data_dir is not None or library_db is not None or annotation_db is not None
                 or query_timeout is not USE_DEFAULT):
-            self._db = LibraryDB(data_dir, library_db=library_db, annotation_db=annotation_db,
-                                 query_timeout=query_timeout)
+            self.__library = LibraryDB(data_dir, library_db=library_db, annotation_db=annotation_db,
+                                       query_timeout=query_timeout)
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -244,7 +246,7 @@ class PyAppleBooks:
         """Close the idle connections of the library this instance reads
         (the shared default one for ``PyAppleBooks()``). It stays usable:
         the next call connects again."""
-        (self._db or default_library()).close()
+        (self.__library or default_library()).close()
 
     def query_deadline(self, seconds: Optional[float]):
         """A context manager that stops every query in its block still
@@ -289,7 +291,7 @@ class PyAppleBooks:
         see ``collection_writer._store_for_writes``). None for the default
         library, which the writer resolves itself, the same way
         (``collection_writer._default_db_path``)."""
-        db = self._db if self._db is not None else current_library()
+        db = self.__library if self.__library is not None else current_library()
         if db is default_library():
             return None
         return collection_writer._store_for_writes(db)
@@ -878,10 +880,11 @@ class PyAppleBooks:
 
 
 def _in_library(method):
-    """``method``, run with its instance's library as the current one."""
+    """``method``, run with its instance's library as the current one
+    (``PyAppleBooks.__library``, mangled)."""
     @functools.wraps(method)
     def call(self, *args, **kwargs):
-        with use_library(self._db):
+        with use_library(self._PyAppleBooks__library):
             return method(self, *args, **kwargs)
     return call
 

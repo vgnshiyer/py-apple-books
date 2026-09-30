@@ -279,7 +279,7 @@ def test_default_instance_in_use_library_writes_that_library(make_library, clean
     api = PyAppleBooks()
     mine = PyAppleBooks(data_dir=other.data_dir)
     try:
-        with use_library(mine._db):
+        with use_library(mine._PyAppleBooks__library):
             assert api._write_path() == other.library_path
             assert api.create_collection("Here", backup=False).title == "Here"
     finally:
