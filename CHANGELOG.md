@@ -2,8 +2,8 @@
 
 ## 1.10.0 (unreleased)
 
-The release candidate is `1.10.0rc1`. Installers only pick a pre-release
-when asked for it by version (`pip install py-apple-books==1.10.0rc1`), so
+The release candidate is `1.10.0rc2`. Installers only pick a pre-release
+when asked for it by version (`pip install py-apple-books==1.10.0rc2`), so
 a requirement such as apple-books-mcp 0.8.2's `py-apple-books>=1.9.1,<2`
 keeps resolving 1.9.1 until 1.10.0 is out.
 
@@ -289,7 +289,9 @@ library.
 - Queries from another thread (`threading`, `anyio.to_thread`, mcp 2.x)
   failed with "SQLite objects created in a thread…". Connections are pooled
   per library and usable from any thread; one process holds far fewer
-  SQLite file handles.
+  SQLite file handles. Threads waiting for a connection are served first
+  come first served, so under heavy load none waits until its deadline
+  (new in rc2).
 - The store lookup took the first `*.sqlite` by name, so a stale copy could
   silently replace the live library for reads and collection writes.
 - A store file replaced while the process ran was read stale until
