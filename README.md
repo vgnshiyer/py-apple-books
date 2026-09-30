@@ -88,7 +88,11 @@ still readable. Collection writes go to the library store the instance reads
 | `APPLE_BOOKS_QUERY_TIMEOUT` | Seconds a query may run, for libraries built without `query_timeout`; `0`, `none` or `off` for no limit (default 30) |
 | `APPLE_BOOKS_MODEL_CHECK` | `warn` (default), `enforce` or `off`: see [Writes](#writes) |
 
-The variables are read when the library is used, never at import.
+The variables are read on first use, never at import. The default library
+keeps the stores and the timeout it found then for the rest of the process
+(it finds the stores again only when a store file is replaced), so set the
+variables before the first query. A `PyAppleBooks(query_timeout=...)`
+built later reads them again.
 
 ### Query timeout
 
@@ -392,7 +396,9 @@ for book in api.get_recently_read_books(limit=1):
 Every exception derives from `py_apple_books.exceptions.AppleBooksError`.
 The new ones keep the built-in base 1.9 raised, so `except IndexError`,
 `except KeyError` and `except sqlite3.OperationalError` handlers written for
-1.9 still work.
+1.9 still work. One exception: a write to a read-only store raised
+`sqlite3.OperationalError` in 1.9 and now raises `WriteError`, which is not
+a `sqlite3` error.
 
 | Exception | Also a | When |
 |-----------|--------|------|
@@ -515,10 +521,16 @@ snapshot = restore_library(backups[0])
 ```
 
 Without `db_path` both follow the default library (the location variables,
-else the current user's store). To restore over a damaged library, pass
-`force=True`: the target is then the canonical store file even if it can't
-be read. For another store, pass `db_path=`; its backups are looked up in
-its own folder.
+else the current user's store). For another store, pass `db_path=`; its
+backups are looked up in its own folder.
+
+To restore over a damaged library, pass `force=True`: it skips the backup
+check, and the target is the canonical store file even when that file fails
+the check for a readable Books store (damaged metadata or pages).
+`snapshot=False` skips the pre-restore snapshot when it can't be taken; the
+restore then can't be undone. The restore goes through SQLite, so a file
+SQLite rejects outright (overwritten or truncated) can't be restored over
+this way; it has to be replaced by hand while Books is quit.
 
 ## Examples
 
@@ -665,6 +677,9 @@ Stricter already in 1.10:
   manager filter goes through, rejects one outside
   `py_apple_books.db.clause.OPERATORS` with `ValueError` (`BETWEEN`
   included: use `__gte`/`__lte`). `IN` with a string raises `TypeError`.
+- `__in` binds one parameter per item, so a list longer than SQLite's
+  bound-variable limit (32,766 by default since SQLite 3.32, 999 before)
+  raises `DBQueryError`. Pass a `Subquery` for large id sets.
 - `manager.compiler` is still an assignable attribute, and every model
   statement runs through it, but its `execute` now receives `(sql, params)`
   instead of literal SQL.

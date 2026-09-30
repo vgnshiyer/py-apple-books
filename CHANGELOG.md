@@ -112,7 +112,7 @@ library.
   `get_books_by_genre`. `include_deleted=` on `list_annotations`,
   `get_annotations_by_color`, the three annotation text searches and
   `get_annotations_by_date_range`. All keyword-only.
-- Environment variables, read when the library is used, never at import:
+- Environment variables, read on first use, never at import:
   `APPLE_BOOKS_DATA_DIR`, `APPLE_BOOKS_LIBRARY_DB`,
   `APPLE_BOOKS_ANNOTATION_DB` (which stores `PyAppleBooks()` reads),
   `APPLE_BOOKS_QUERY_TIMEOUT` and `APPLE_BOOKS_MODEL_CHECK`. Precedence:
@@ -120,7 +120,9 @@ library.
   to a library built without `data_dir`, `library_db` and `annotation_db`
   (`PyAppleBooks()`, and the collection writes and `write_safety` defaults
   that go with it). `APPLE_BOOKS_QUERY_TIMEOUT` applies to any library built
-  without `query_timeout`.
+  without `query_timeout`. The default library keeps the stores and the
+  timeout it found on first use for the rest of the process (it finds the
+  stores again only when a store file is replaced).
 - `ModelIterable`: `count()`, `exists()`, `first()`, `count_by(field)`,
   slicing (returns a list), `bool()`, a `repr()`, and typing as
   `ModelIterable[Book]` and so on. `Model.manager` gains `count(**filters)`,
@@ -146,8 +148,11 @@ library.
   `db.metadata`: `read_store_metadata`, `StoreMetadata` and
   `read_only_uri`.
 - `py_apple_books.text.fold_for_match`, the fold the searches use.
-- Exceptions: `NotFoundError`, `BookNotFoundError`, `CollectionNotFoundError`
-  and `AnnotationNotFoundError` (still `IndexError`s), `ChapterNotFoundError`,
+- Exceptions: `NotFoundError`, the new base of `BookNotFoundError` and
+  `CollectionNotFoundError` (both in 1.9, raised by the writes;
+  `get_book_by_id` and `count_annotations(book_id)` now raise
+  `BookNotFoundError` too). Also `AnnotationNotFoundError` (an
+  `IndexError`, like those two), `ChapterNotFoundError`,
   `InvalidArgumentError` (a `ValueError`), `InvalidChoiceError` (a
   `KeyError`), `UnknownFieldError`, `NotInLibraryError`,
   `LibraryNotFoundError`, `AnnotationStoreNotFoundError`,
@@ -204,7 +209,11 @@ library.
   compile through `to_sql()`.
 - **Stricter: `__in` with a string** raises `TypeError` when the query
   compiles; 1.9 pasted the string into the SQL. Pass a list or a
-  `Subquery`.
+  `Subquery`. `__in` binds one parameter per item, so a list longer than
+  SQLite's bound-variable limit (32,766 by default since SQLite 3.32, 999
+  before; some builds allow more) raises `DBQueryError` ("too many SQL
+  variables"); 1.9 wrote the items into the SQL. Pass a `Subquery` for
+  large id sets. The library's own relations stay under the limit.
 - **Stricter arguments.** An unknown field in a filter, `order_by`, `only=`
   or `has_fields` raises `UnknownFieldError` (a `KeyError`, as 1.9 raised,
   and a `ValueError`). A `limit` that isn't integral raises
@@ -212,9 +221,10 @@ library.
   `DBQueryError`. Numeric strings (`'3'`) and integral floats are still
   accepted as a `limit`. An `offset` that isn't an `int`, or a negative
   one, raises `InvalidArgumentError` too. A `date` filter value raises
-  `DBQueryError`, as a `datetime` already did (1.9 matched every row for a
-  `date`); pass Core Data seconds, as `get_annotations_by_date_range`
-  does.
+  `DBQueryError`, as a `datetime` already did. 1.9 wrote a `date` into the
+  SQL as arithmetic (`2000-01-01` became 1998), so such a filter matched
+  every row or none. Pass Core Data seconds, as
+  `get_annotations_by_date_range` does.
 - **`manager.compiler.execute`** receives `(sql, params)`; it received
   literal SQL. `manager.compiler` is still an assignable attribute, and every
   model statement goes through it.
@@ -245,7 +255,10 @@ library.
   `force=True`. It snapshots the current library, and the snapshot is never
   reused as a pre-write backup. It prunes old backups but keeps the one
   restored. Over a damaged library, `force=True` or `snapshot=False` without
-  `db_path` targets the canonical store file even if it can't be read.
+  `db_path` targets the canonical store file even if it can't be read. The
+  restore goes through SQLite, so a file SQLite rejects outright
+  (overwritten or truncated) still has to be replaced by hand while Books
+  is quit.
 - **Packaging.** Builds from `pyproject.toml` (PEP 621 and PEP 639), with
   `License-Expression: MIT` and the `Programming Language :: Python :: 3 ::
   Only` classifier. The runtime dependencies are unchanged. The `[dev]`
@@ -285,8 +298,9 @@ library.
 - **(MCP)** The ORM loaded relations eagerly, one or two statements per row,
   so MCP 0.8.2's `get_library_stats`, `describe_book` and annotation lists
   ran about two statements per annotation. `get_library_stats` now runs
-  three statements and `describe_book` two, and `annotation.book` loads the
-  books of a whole result at once.
+  three statements (one more per 500 books the annotations point to) and
+  `describe_book` two, and `annotation.book` loads the books of a whole
+  result at once.
 - `ModelIterable` slicing raised `TypeError`, `only=` raised, and `list()`
   ran the query twice.
 - The write schema check couldn't detect Core Data model drift (Apple's
@@ -347,9 +361,14 @@ Most code needs no change. Check these:
 - `limit` ≤ 0 warns; pass `None` for all rows.
 - Custom `manager.compiler` replacements receive `(sql, params)`.
 - Filters with a `date` value, a string for `__in`, or a `Where` operator
-  outside `OPERATORS` now raise; 1.9 matched every row for a `date` and
-  wrote the others into the SQL. A `limit` that isn't integral raises
-  `InvalidArgumentError` instead of `DBQueryError`.
+  outside `OPERATORS` now raise; 1.9 wrote them into the SQL, where a
+  `date` became arithmetic and matched every row or none. An `__in` list
+  longer than SQLite's bound-variable limit (32,766 since SQLite 3.32, 999
+  before) raises `DBQueryError`; pass a `Subquery` for large id sets. A
+  `limit` that isn't integral raises `InvalidArgumentError` instead of
+  `DBQueryError`.
+- Set the location and timeout variables before the first query: the
+  default library keeps what it found then.
 - Long queries stop after 30 s; set `query_timeout=None` or
   `APPLE_BOOKS_QUERY_TIMEOUT=0` for batch jobs that need longer.
 - Errors surface on first use instead of at import.
