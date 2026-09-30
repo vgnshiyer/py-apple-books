@@ -9,6 +9,10 @@
   the canonical store file even if it can't be read, for ``force=True``
   or ``snapshot=False`` (and ``list_backups()``); several candidate
   stores still refuse.
+- ``WriteSession`` opens the store ``mode=rw`` (never creates it), maps
+  lock and read-only failures at ``BEGIN``, in the transaction and at
+  ``COMMIT`` to typed errors, and checks for Books again once it holds
+  the write lock.
 
 Synthetic libraries only; Books.app is never checked for real.
 """
@@ -21,11 +25,16 @@ import sqlite3
 import pytest
 
 from py_apple_books import PyAppleBooks, api, collection_writer, write_safety
+from py_apple_books.collection_writer import WriteSession
 from py_apple_books.db import client
 from py_apple_books.db.metadata import read_only_uri
 from py_apple_books.exceptions import (
     AmbiguousStoreError,
     BackupValidationError,
+    BooksAppRunningError,
+    LibraryBusyError,
+    SchemaValidationError,
+    WriteError,
 )
 from py_apple_books.testing import FixtureLibrary
 
@@ -72,6 +81,19 @@ def library(path, title, **kwargs) -> FixtureLibrary:
     lib = FixtureLibrary.create(path, **kwargs)
     lib.add_collection(title)
     return lib
+
+
+def unlocked(path) -> bool:
+    """Whether another connection can take the write lock at once."""
+    conn = sqlite3.connect(path, timeout=0, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("ROLLBACK")
+        return True
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
 
 
 # -- backups per store ----------------------------------------------------------
@@ -306,3 +328,127 @@ def test_live_unreadable_message_names_db_path(tmp_path):
         write_safety.verify_backup(backup, lib.library_path)
     assert exc.value.reason == BackupValidationError.LIVE_UNREADABLE
     assert "force=True" in str(exc.value)
+
+
+# -- WriteSession ----------------------------------------------------------------
+
+
+@pytest.fixture
+def lib(tmp_path):
+    return library(tmp_path / "lib", "shelf")
+
+
+def counts(path):
+    """The collection titles and the primary-key counters. Read through a
+    connection that can write, so a WAL store keeps no -wal or -shm file
+    after it closes."""
+    conn = sqlite3.connect(path)
+    try:
+        return (conn.execute("SELECT ZTITLE FROM ZBKCOLLECTION ORDER BY Z_PK").fetchall(),
+                conn.execute("SELECT Z_MAX FROM Z_PRIMARYKEY ORDER BY Z_ENT").fetchall())
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("via", ["writer", "default"])
+def test_store_gone_at_connect_is_not_created(lib, tmp_path, clean_env, monkeypatch, via):
+    """The store is moved away between its backup and the connect: the
+    write fails instead of creating an empty file under its name."""
+    path = lib.library_path
+    moved = path.with_name("moved-away.sqlite")
+    real = collection_writer.backup_library
+
+    def backup_then_move(*args, **kwargs):
+        made = real(*args, **kwargs)
+        path.rename(moved)
+        return made
+
+    monkeypatch.setattr(collection_writer, "backup_library", backup_then_move)
+    clean_env.setenv("HOME", str(lib.root))
+    with pytest.raises(WriteError, match="isn't there any more") as exc:
+        if via == "writer":
+            collection_writer.create_collection("Nope", db_path=path, backup_dir=tmp_path / "b")
+        else:
+            PyAppleBooks().create_collection("Nope")
+    assert not isinstance(exc.value, SchemaValidationError)
+    assert not os.path.lexists(path)
+    assert titles(moved) == ["shelf"]
+
+
+def test_missing_db_path_without_backup_is_not_created(tmp_path):
+    missing = tmp_path / "BKLibrary-1-091020131601.sqlite"
+    with pytest.raises(WriteError, match="isn't there any more"):
+        collection_writer.create_collection("Nope", db_path=missing, backup=False)
+    assert not os.path.lexists(missing)
+
+
+def test_commit_blocked_by_a_reader_is_busy(tmp_path, monkeypatch):
+    """A rollback-journal store with another connection's read transaction
+    open: the commit can't take the exclusive lock."""
+    lib = library(tmp_path / "lib", "shelf", journal_mode="DELETE")
+    path = lib.library_path
+    monkeypatch.setattr(collection_writer, "BUSY_TIMEOUT", 0.05)
+    before = counts(path)
+    reader = sqlite3.connect(path, isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM ZBKCOLLECTION").fetchone()
+    session = WriteSession(path, backup=False)
+    body_ran = False
+    try:
+        with pytest.raises(LibraryBusyError, match="nothing was changed") as exc:
+            with session:
+                collection_writer._allocate_pk(session.conn.cursor(), "BKCollection", "ZBKCOLLECTION")
+                body_ran = True
+        assert body_ran and session.conn is None
+        assert isinstance(exc.value, sqlite3.OperationalError)
+        assert isinstance(exc.value.__cause__, sqlite3.OperationalError)
+        with pytest.raises(LibraryBusyError):
+            collection_writer.create_collection("Busy", db_path=path, backup=False)
+    finally:
+        reader.execute("ROLLBACK")
+        reader.close()
+    assert counts(path) == before and unlocked(path)
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores permissions")
+@pytest.mark.parametrize("journal, read_only", [("DELETE", "file"), ("WAL", "file"), ("WAL", "folder")])
+def test_read_only_store_is_a_write_error(tmp_path, journal, read_only):
+    """A store file SQLite can only open read-only refuses at the first
+    statement that writes; a WAL store in a read-only folder at BEGIN."""
+    lib = library(tmp_path / "lib", "shelf", journal_mode=journal)
+    path = lib.library_path
+    before = counts(path)
+    target = path if read_only == "file" else path.parent
+    mode = os.stat(target).st_mode
+    os.chmod(target, 0o444 if read_only == "file" else 0o555)
+    try:
+        with pytest.raises(WriteError, match="readonly") as exc:
+            collection_writer.create_collection("Nope", db_path=path, backup=False)
+        assert not isinstance(exc.value, sqlite3.Error)
+    finally:
+        os.chmod(target, mode)
+        # SQLite gives the -wal and -shm files it creates the store's mode.
+        for sidecar in ("-wal", "-shm"):
+            if os.path.exists(f"{path}{sidecar}"):
+                os.chmod(f"{path}{sidecar}", 0o644)
+    assert counts(path) == before and unlocked(path)
+
+
+def test_books_opened_during_the_backup_rolls_back(lib, tmp_path, monkeypatch):
+    path = lib.library_path
+    answers = iter([False, True])
+    monkeypatch.setattr(write_safety, "books_is_running", lambda: next(answers))
+    before = counts(path)
+    with pytest.raises(BooksAppRunningError):
+        collection_writer.create_collection("Nope", db_path=path, backup_dir=tmp_path / "b")
+    assert counts(path) == before and unlocked(path)
+    assert len(write_safety.list_backups(path, tmp_path / "b")) == 1
+    assert next(answers, None) is None  # checked twice
+
+
+def test_books_is_not_checked_with_the_guard_off(lib, monkeypatch):
+    calls = []
+    monkeypatch.setattr(write_safety, "books_is_running", lambda: calls.append(1) or False)
+    collection_writer.create_collection("Written", db_path=lib.library_path, backup=False,
+                                        require_books_closed=False)
+    assert calls == [] and titles(lib.library_path) == ["shelf", "Written"]
