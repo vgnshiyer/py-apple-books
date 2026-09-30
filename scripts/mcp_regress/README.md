@@ -26,7 +26,7 @@ title. The per-tool table counts calls and characters, so it gives the size of
 the library. `odd_args.py` stores result classes, but its outputs also hold
 the `lib` path, and `len=<n>` is the length of private output.
 
-For PRs and committed `changes/*.md` notes, report only:
+For PR descriptions, the CHANGELOG and release notes, report only:
 - the `compare.py` exit status;
 - the UNEXPECTED, NEW EXCEPTION and MISSING totals;
 - the `odd_args.py` verdict counts (`same`, `FIXED`, `REGRESSION ...`).
