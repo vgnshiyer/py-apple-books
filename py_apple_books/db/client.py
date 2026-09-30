@@ -12,6 +12,7 @@ which uses the library of the enclosing :func:`use_library` block, or
 else the process-wide :func:`default_library`.
 """
 
+import collections
 import contextlib
 import contextvars
 import logging
@@ -443,6 +444,65 @@ class _Pooled:
         self.busy = busy
 
 
+class _Slots:
+    """The pool's connection slots: a semaphore that serves waiters in
+    the order they came.
+
+    A released slot goes straight to the longest waiting thread, so the
+    thread that released it can't take it back before that one wakes up
+    (``threading.Semaphore`` lets it, starving waiters under load).
+    """
+
+    __slots__ = ("_lock", "_size", "_free", "_waiters")
+
+    def __init__(self, size: int):
+        self._lock = threading.Lock()
+        self._size = self._free = size
+        # One locked lock per waiting thread, oldest first; a slot is
+        # handed over by releasing it.
+        self._waiters: collections.deque = collections.deque()
+
+    def acquire(self, timeout: Optional[float] = None) -> bool:
+        """Take a slot, waiting at most ``timeout`` seconds (None: as long
+        as it takes). Whether one was taken."""
+        with self._lock:
+            if self._free and not self._waiters:
+                self._free -= 1
+                return True
+            if timeout is not None and timeout <= 0:
+                return False
+            waiter = threading.Lock()
+            waiter.acquire()
+            self._waiters.append(waiter)
+        got = False
+        try:
+            got = waiter.acquire(timeout=-1 if timeout is None else min(timeout, threading.TIMEOUT_MAX))
+        finally:
+            if not got:
+                with self._lock:
+                    try:
+                        self._waiters.remove(waiter)
+                    except ValueError:
+                        # Handed a slot as the wait ended (or was
+                        # interrupted): pass it on.
+                        self._hand_off()
+        return got
+
+    def release(self) -> None:
+        with self._lock:
+            self._hand_off()
+
+    def _hand_off(self) -> None:
+        """Give a slot to the longest waiting thread, or free it. Called
+        with the lock held."""
+        if self._waiters:
+            self._waiters.popleft().release()
+        elif self._free < self._size:
+            self._free += 1
+        else:
+            raise ValueError("connection slot released too many times")
+
+
 class _Schema(NamedTuple):
     #: (identity, schema_version of each attached store)
     key: tuple
@@ -468,8 +528,9 @@ class LibraryDB:
         limit. :data:`USE_DEFAULT` reads ``APPLE_BOOKS_QUERY_TIMEOUT``
         (default :data:`DEFAULT_QUERY_TIMEOUT`).
     :param max_idle: idle connections kept open.
-    :param max_connections: connections open at once; a caller waits
-        for one (within its deadline) beyond that.
+    :param max_connections: connections open at once; beyond that,
+        callers wait for one (within their deadline), first come first
+        served.
 
     Where the stores are: a store given as a file is used as is. The
     rest are found by :func:`locate_store` in ``data_dir``, or in the
@@ -513,7 +574,7 @@ class LibraryDB:
         self._clock = time.monotonic
         self._pid = os.getpid()
         self._lock = threading.RLock()
-        self._slots = threading.BoundedSemaphore(max_connections)
+        self._slots = _Slots(max_connections)
         self._idle: List[_Pooled] = []
         # Idle connections a forked child got from its parents: never
         # used, and kept referenced so garbage collection doesn't close
@@ -673,7 +734,7 @@ class LibraryDB:
             self._inherited = self._inherited + self._idle
             self._idle = []
             self._lock = threading.RLock()
-            self._slots = threading.BoundedSemaphore(self.max_connections)
+            self._slots = _Slots(self.max_connections)
             self._generation += 1
 
     def _connect(self, paths: StorePaths, check_same_thread: bool,
@@ -838,7 +899,7 @@ class LibraryDB:
             pooled.conn.execute(f"PRAGMA busy_timeout = {round(busy * 1000)}")
             pooled.busy = busy
 
-    def _release(self, pooled: _Pooled, slots: threading.BoundedSemaphore) -> None:
+    def _release(self, pooled: _Pooled, slots: _Slots) -> None:
         try:
             self._give_back(pooled)
         finally:

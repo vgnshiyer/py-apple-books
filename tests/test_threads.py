@@ -72,6 +72,33 @@ def test_threads_match_single_threaded(seeded):
     assert len(seeded._idle) <= seeded.max_idle
 
 
+def test_more_threads_than_connections(seeded):
+    """32 threads on a pool of 2 (F-G8): the waits are shared fairly, so
+    no call runs out of time, and every slot is free afterwards."""
+    db = LibraryDB(data_dir=seeded.fixture.data_dir, max_connections=2, max_idle=1)
+    expected = {t: _run_calls(seeded, t) for t in range(32)}
+    results, errors = {}, []
+    barrier = threading.Barrier(32)
+
+    def worker(t):
+        try:
+            barrier.wait()
+            results[t] = _run_calls(db, t)
+        except BaseException as e:  # reported below
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(32)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert results == expected
+    assert (db._slots._free, len(db._slots._waiters)) == (2, 0)
+    assert len(db._idle) <= 1
+    db.close()
+
+
 def test_default_library_from_threads(api, library):
     library.add_book("Synthetic Book")
     with ThreadPoolExecutor(4) as pool:
