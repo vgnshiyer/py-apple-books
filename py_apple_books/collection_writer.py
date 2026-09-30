@@ -212,7 +212,11 @@ class WriteSession:
         a library of its own passes that library's store.
     :param backup: Take a pre-write backup. On by default; only tests
         should turn this off.
-    :param backup_dir: Override the backup directory.
+    :param backup_dir: Override the backup directory. By default the
+        current user's library backs up into
+        :data:`~py_apple_books.write_safety.BACKUP_DIR` and any other
+        store into a folder of its own under it (see
+        :func:`~py_apple_books.write_safety.backup_library`).
     :param require_books_closed: Refuse when Books.app is running. On
         by default; only tests against fixture databases turn this off.
     :param model_check: ``'warn'``, ``'enforce'`` or ``'off'``: what an

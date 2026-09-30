@@ -10,7 +10,9 @@ Feature-agnostic safety utilities shared by any write path (today:
 * :func:`backup_library` / :func:`list_backups` — timestamped,
   WAL-inclusive backups via the SQLite backup API. A bare file copy of
   a live WAL database misses un-checkpointed data and can itself be
-  corrupt; the backup API is the documented-safe route.
+  corrupt; the backup API is the documented-safe route. The current
+  user's library backs up into :data:`BACKUP_DIR`, any other store into
+  a folder of its own under it.
 * :func:`verify_backup` / :func:`restore_library` — restore a backup
   over the live database *through SQLite* (the backup API in reverse,
   never a file copy), after checking that the backup is intact, is a
@@ -32,8 +34,10 @@ Feature-agnostic safety utilities shared by any write path (today:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -42,6 +46,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Mapping, Optional
 
+from py_apple_books.db.client import _store, default_data_dir
 from py_apple_books.db.metadata import (  # noqa: F401  (re-exported)
     StoreMetadata,
     read_only_uri,
@@ -56,7 +61,9 @@ from py_apple_books.exceptions import (
 
 logger = logging.getLogger(__name__)
 
-#: Default location for pre-write backups.
+#: Default location for pre-write backups of the current user's library
+#: (the store in the Apple Books container). Any other store's backups
+#: go to a folder of their own under ``libraries/`` in it.
 BACKUP_DIR = Path.home() / ".py_apple_books" / "backups"
 
 #: How many backups to retain per database (oldest pruned first).
@@ -77,6 +84,14 @@ BACKUP_PART_STALE_AFTER = 600.0
 #: overwriting the library. Such a snapshot is never reused as a
 #: pre-write backup: it holds the state from *before* the restore.
 SNAPSHOT_SUFFIX = "-pre-restore"
+
+# A backup of the store ``<stem>.sqlite`` is named
+# ``<stem>-<stamp>[<SNAPSHOT_SUFFIX>].sqlite``. Its series is matched on
+# the whole name: a glob ``<stem>-*`` also matches the backups of a store
+# whose name extends the stem (``BKLibrary-1`` and
+# ``BKLibrary-1-091020131601``).
+_STAMP_FORMAT = "%Y%m%d-%H%M%S-%f"
+_STAMP_PATTERN = r"[0-9]{8}-[0-9]{6}-[0-9]{6}"
 
 #: Environment variable choosing what the writer does about schema
 #: drift it can't vouch for: ``warn`` (the default: log an unknown Core
@@ -152,15 +167,92 @@ def ensure_books_not_running() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _backup_dir(backup_dir: Optional[Path]) -> Path:
-    """``backup_dir``, else :data:`BACKUP_DIR` (read at call time)."""
-    return Path(backup_dir) if backup_dir else BACKUP_DIR
+def _is_home_store(store_file: Optional[Path], data_dir: Optional[Path]) -> bool:
+    """Whether the library store looked up as ``(store file, data dir)``
+    (as :meth:`LibraryDB._source <py_apple_books.db.LibraryDB._source>`
+    gives them; a None data dir is the default one) is the current
+    user's: one named like Apple Books' stores in the ``BKLibrary``
+    folder of the Apple Books container. Told without finding the store:
+    a store found in a folder is only written if it has such a name
+    (``collection_writer._store_for_writes``)."""
+    store = _store("library")
+    home = default_data_dir() / store.subdir
+    if store_file is None:
+        folder = home if data_dir is None else Path(data_dir) / store.subdir
+    elif store.generation.fullmatch(Path(store_file).name):
+        folder = Path(store_file).parent
+    else:
+        return False
+    if folder == home:
+        return True
+    try:
+        return os.path.samefile(folder, home)
+    except OSError:
+        return False
+
+
+def _writes_home_store(db) -> bool:
+    """Whether the library store ``db`` (a
+    :class:`~py_apple_books.db.LibraryDB`) writes is the current user's
+    (see :func:`_is_home_store`), however ``db`` names it (no argument,
+    the location variables or its own)."""
+    return _is_home_store(*db._source("library"))
+
+
+def _own_backup_dir(path) -> Path:
+    """A folder of its own, under :data:`BACKUP_DIR` (read at call
+    time), for the backups of the library store ``path``."""
+    key = hashlib.sha256(os.fsencode(Path(path).resolve())).hexdigest()[:16]
+    return BACKUP_DIR / "libraries" / key
+
+
+def _backup_dir_for(db, path) -> Path:
+    """The folder the pre-write backups of ``db``'s library store
+    ``path`` go to.
+
+    :data:`BACKUP_DIR` for the current user's store (see
+    :func:`_writes_home_store`), where ``PyAppleBooks()`` has always put
+    them; for any other store, a folder of its own under it. Backups are
+    told apart by the store's file name, which every copy of a library
+    shares, so a folder per store keeps one library's backups from being
+    reused or pruned as another's, whether the copy is read through an
+    instance or through the location variables.
+    """
+    return BACKUP_DIR if _writes_home_store(db) else _own_backup_dir(path)
+
+
+def _store_backup_dir(db_path) -> Path:
+    """:func:`_backup_dir_for` the library store file ``db_path``: the
+    folder its backups go to when no ``backup_dir`` is given."""
+    db_path = Path(db_path)
+    return BACKUP_DIR if _is_home_store(db_path, None) else _own_backup_dir(db_path)
+
+
+def _backup_dir(backup_dir: Optional[Path], db_path: Path) -> Path:
+    """``backup_dir``, else the folder ``db_path``'s backups go to
+    (:func:`_store_backup_dir`; :data:`BACKUP_DIR` is read at call
+    time)."""
+    return Path(backup_dir) if backup_dir else _store_backup_dir(db_path)
+
+
+def _series(db_path: Path, backup_dir: Path, extension: str = ".sqlite") -> list[Path]:
+    """The files of ``db_path``'s backup series in ``backup_dir`` whose
+    names end in ``extension``, by name (the timestamped names sort
+    chronologically)."""
+    pattern = re.compile(
+        f"{re.escape(Path(db_path).stem)}-{_STAMP_PATTERN}"
+        f"(?:{re.escape(SNAPSHOT_SUFFIX)})?{re.escape(extension)}"
+    )
+    try:
+        names = os.listdir(backup_dir)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    return sorted(Path(backup_dir) / name for name in names if pattern.fullmatch(name))
 
 
 def _backups_for(db_path: Path, backup_dir: Path) -> list[Path]:
-    """Completed backups of ``db_path`` in ``backup_dir``, oldest first
-    (the timestamped names sort chronologically)."""
-    return sorted(backup_dir.glob(f"{db_path.stem}-*.sqlite"))
+    """Completed backups of ``db_path`` in ``backup_dir``, oldest first."""
+    return _series(db_path, backup_dir)
 
 
 def _take_backup(db_path: Path, backup_dir: Path, *, suffix: str = "") -> Path:
@@ -168,6 +260,8 @@ def _take_backup(db_path: Path, backup_dir: Path, *, suffix: str = "") -> Path:
 
     The copy lands under a ``.part`` name and is renamed only on
     success, so a failed backup can never masquerade as a valid one.
+    ``suffix`` is ``''`` or :data:`SNAPSHOT_SUFFIX`, the names a
+    store's backup series is matched by.
     """
     db_path = Path(db_path)
     backup_dir = Path(backup_dir)
@@ -175,7 +269,7 @@ def _take_backup(db_path: Path, backup_dir: Path, *, suffix: str = "") -> Path:
         backup_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         raise WriteError(f"Backup failed, aborting write: {e}") from e
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    stamp = datetime.now().strftime(_STAMP_FORMAT)
     dest = backup_dir / f"{db_path.stem}-{stamp}{suffix}.sqlite"
     part = dest.with_name(dest.name + ".part")
 
@@ -211,7 +305,7 @@ def _prune_backups(
     db_path = Path(db_path)
     backup_dir = Path(backup_dir)
     now = time.time()
-    for stray in backup_dir.glob(f"{db_path.stem}-*.sqlite.part"):
+    for stray in _series(db_path, backup_dir, ".sqlite.part"):
         try:
             if now - stray.stat().st_mtime > BACKUP_PART_STALE_AFTER:
                 stray.unlink()
@@ -241,13 +335,17 @@ def backup_library(
     only on success, so a failed backup can never masquerade as a
     valid one. Returns the backup file's path.
 
+    :param backup_dir: Where the backup goes. By default
+        :data:`BACKUP_DIR` for the current user's library (the store in
+        the Apple Books container), and a folder of its own under it
+        for any other store.
     :param min_interval: If the newest existing backup is younger than
         this many seconds, reuse it instead of taking another. Zero
         (the default) always takes a fresh backup. A pre-restore
         snapshot is never reused.
     """
     db_path = Path(db_path)
-    backup_dir = _backup_dir(backup_dir)
+    backup_dir = _backup_dir(backup_dir, db_path)
     backup_dir.mkdir(parents=True, exist_ok=True)
 
     existing = _backups_for(db_path, backup_dir)
@@ -269,15 +367,17 @@ def list_backups(
 ) -> list[Path]:
     """Backups of the library database, newest first.
 
-    ``db_path`` defaults to the Books library; ``backup_dir`` to
-    :data:`BACKUP_DIR`. The first entry is the restore point for the
-    most recent write (writes within :data:`BACKUP_MIN_INTERVAL` of
-    each other share the backup taken before the first of them) or,
-    right after a restore, the snapshot that undoes it. Returns ``[]``
-    if the directory doesn't exist.
+    ``db_path`` defaults to the Books library (the store the location
+    variables name, else the current user's). ``backup_dir`` defaults to
+    where that store's backups go (see :func:`backup_library`). The
+    first entry is the restore point for the most recent write (writes
+    within :data:`BACKUP_MIN_INTERVAL` of each other share the backup
+    taken before the first of them) or, right after a restore, the
+    snapshot that undoes it. Returns ``[]`` if the directory doesn't
+    exist.
     """
     db_path = Path(db_path) if db_path else _default_library_path()
-    backup_dir = _backup_dir(backup_dir)
+    backup_dir = _backup_dir(backup_dir, db_path)
     if not backup_dir.is_dir():
         return []
     return _backups_for(db_path, backup_dir)[::-1]
@@ -398,13 +498,14 @@ def restore_library(
     returned snapshot.
 
     :param db_path: The library database to overwrite; defaults to the
-        Books library.
+        Books library (the store the location variables name, else the
+        current user's), found as for a write.
     :param force: Skip :func:`verify_backup`, e.g. to restore over a
         damaged library or across a Books data-model change.
     :param snapshot: Snapshot the current library first. Turn it off
         only when the live file can't be read at all.
-    :param backup_dir: Where the snapshot goes; defaults to
-        :data:`BACKUP_DIR`.
+    :param backup_dir: Where the snapshot goes; defaults to where the
+        library's backups go (see :func:`backup_library`).
     :return: The snapshot's path, or None with ``snapshot=False``.
     :raises BackupValidationError: a pre-restore check failed; nothing
         was changed.
@@ -427,7 +528,7 @@ def restore_library(
     if not force:
         verify_backup(backup_path, db_path)
 
-    backup_dir = _backup_dir(backup_dir)
+    backup_dir = _backup_dir(backup_dir, db_path)
     snap = None
     if snapshot:
         try:

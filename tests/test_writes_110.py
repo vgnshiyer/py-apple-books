@@ -556,12 +556,19 @@ def test_list_backups_newest_first(fixture_db, tmp_path):
     assert write_safety.list_backups(fixture_db, tmp_path / "missing") == []
 
 
-def test_list_backups_default_dir_is_read_at_call_time(fixture_db, tmp_path, monkeypatch):
+def test_list_backups_default_dir_is_read_at_call_time(fixture_lib, tmp_path, monkeypatch):
+    """The current user's store backs up into BACKUP_DIR, any other store
+    into a folder of its own under it; BACKUP_DIR is read at call time."""
     elsewhere = tmp_path / "elsewhere"
     monkeypatch.setattr(write_safety, "BACKUP_DIR", elsewhere)
-    made = write_safety.backup_library(fixture_db)
-    assert made.parent == elsewhere
-    assert write_safety.list_backups(fixture_db) == [made]
+    db = fixture_lib.library_path
+    made = write_safety.backup_library(db)
+    assert made.parent.parent == elsewhere / "libraries"
+    assert write_safety.list_backups(db) == [made]
+    monkeypatch.setenv("HOME", str(fixture_lib.root))
+    home_made = write_safety.backup_library(db)
+    assert home_made.parent == elsewhere
+    assert write_safety.list_backups(db) == [home_made]
 
 
 def test_prune_removes_sidecars_and_spares_protected(fixture_db, tmp_path):

@@ -1,22 +1,18 @@
 import functools
-import hashlib
 import inspect
-import os
 import pathlib
 import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
-from py_apple_books import collection_writer, write_safety
+from py_apple_books import collection_writer
 from py_apple_books.content import BookContent, Chapter
 from py_apple_books.db.clause import Q
 from py_apple_books.db.client import (
     USE_DEFAULT,
     LibraryDB,
-    _store,
     current_library,
-    default_data_dir,
     default_library,
     query_deadline as _query_deadline,
     use_library,
@@ -43,6 +39,7 @@ from py_apple_books.models import (
 from py_apple_books.models.book import CONTENT_TYPE_SERIES_CONTAINER, SERIES_DATA_SOURCE
 from py_apple_books.models.manager import ModelIterable, normalize_limit, normalize_offset
 from py_apple_books.utils import APPLE_EPOCH_OFFSET, snap_window
+from py_apple_books.write_safety import _backup_dir_for, _own_backup_dir, _writes_home_store
 
 
 # Apple Books' ``ZANNOTATIONTYPE`` value for the automatic "current reading
@@ -132,52 +129,6 @@ _RECENCY_ORDERS = {"-last_read_date": True, "last_read_date": False}
 
 # The models store_info() checks the mapped columns of.
 _MODELS = (Book, Annotation, Collection)
-
-
-def _writes_home_store(db: LibraryDB) -> bool:
-    """Whether the library store ``db`` writes is the current user's:
-    one named like Apple Books' stores in the ``BKLibrary`` folder of
-    the Apple Books container, however ``db`` names it (no argument, the
-    location variables or its own). Told from where ``db`` looks for the
-    store, without finding it: a store found in a folder is only written
-    if it has such a name (``collection_writer._store_for_writes``)."""
-    store = _store("library")
-    store_file, data_dir = db._source("library")
-    home = default_data_dir() / store.subdir
-    if store_file is None:
-        folder = home if data_dir is None else data_dir / store.subdir
-    elif store.generation.fullmatch(store_file.name):
-        folder = store_file.parent
-    else:
-        return False
-    if folder == home:
-        return True
-    try:
-        return os.path.samefile(folder, home)
-    except OSError:
-        return False
-
-
-def _own_backup_dir(path) -> pathlib.Path:
-    """A folder of its own, under :data:`write_safety.BACKUP_DIR` (read
-    at call time), for the backups of the library store ``path``."""
-    key = hashlib.sha256(os.fsencode(pathlib.Path(path).resolve())).hexdigest()[:16]
-    return write_safety.BACKUP_DIR / "libraries" / key
-
-
-def _backup_dir_for(db: LibraryDB, path) -> pathlib.Path:
-    """The folder the pre-write backups of ``db``'s library store
-    ``path`` go to.
-
-    :data:`write_safety.BACKUP_DIR` for the current user's store (see
-    :func:`_writes_home_store`), where ``PyAppleBooks()`` has always put
-    them; for any other store, a folder of its own under it. Backups are
-    told apart by the store's file name, which every copy of a library
-    shares, so a folder per store keeps one library's backups from being
-    reused or pruned as another's, whether the copy is read through an
-    instance or through the location variables.
-    """
-    return write_safety.BACKUP_DIR if _writes_home_store(db) else _own_backup_dir(path)
 
 
 @dataclass(frozen=True)
