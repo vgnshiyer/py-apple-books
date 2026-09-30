@@ -373,10 +373,10 @@ def list_backups(
     variables name, else the current user's; its canonical file when
     present, even if damaged). ``backup_dir`` defaults to where that
     store's backups go (see :func:`backup_library`). The first entry is
-    the restore point for the most recent write (writes within
-    :data:`BACKUP_MIN_INTERVAL` of each other share the backup taken
-    before the first of them) or, right after a restore, the snapshot
-    that undoes it. Returns ``[]`` if the directory doesn't exist.
+    the restore point for the most recent write (a write reuses the
+    newest backup while it is younger than :data:`BACKUP_MIN_INTERVAL`,
+    so a burst of writes shares the backup taken before its first
+    write) or, right after a restore, the snapshot that undoes it. Returns ``[]`` if the directory doesn't exist.
 
     :raises AmbiguousStoreError: no ``db_path``, and the Books library
         can't be told for sure (several candidate stores).

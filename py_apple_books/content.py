@@ -375,7 +375,7 @@ class Chapter:
     """A single navigable entry in an EPUB's table of contents.
 
     :param id: Stable identifier suitable for round-trip to
-        :meth:`BookContent.get_chapter_content`. Prefers the manifest
+        :meth:`BookContent.get_chapter`. Prefers the manifest
         item id; falls back to the 1-based :attr:`order` as a string
         when the item id is ambiguous or missing.
     :param title: Human-readable chapter title from the navigation doc
