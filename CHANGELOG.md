@@ -1,11 +1,6 @@
 # Changelog
 
-## 1.10.0 (unreleased)
-
-The release candidate is `1.10.0rc2`. Installers only pick a pre-release
-when asked for it by version (`pip install py-apple-books==1.10.0rc2`), so
-a requirement such as apple-books-mcp 0.8.2's `py-apple-books>=1.9.1,<2`
-keeps resolving 1.9.1 until 1.10.0 is out.
+## 1.10.0 (2026-09-30)
 
 1.10 rebuilds the read path. Queries bind their values as SQL parameters.
 The library is found on first use and read through a pool of read-only
@@ -270,7 +265,7 @@ library.
   authenticate with PyPI Trusted Publishing (OIDC) and attach PEP 740
   attestations. Until the maintainer registers the publisher on pypi.org and
   deletes the `PYPI_API_TOKEN` secret, uploads keep using the token. The
-  release tag must be `v` + `__version__` (for example `v1.10.0rc1`).
+  release tag must be `v` + `__version__` (for example `v1.10.0`).
 - **CI.** Tests on macOS with Python 3.10 to 3.14 (all blocking), plus the
   newest 3.15 pre-release for information. Also a lowest-dependency run,
   wheel and sdist checks against 1.9.1, a workflow security lint, and
@@ -290,8 +285,7 @@ library.
   failed with "SQLite objects created in a thread…". Connections are pooled
   per library and usable from any thread; one process holds far fewer
   SQLite file handles. Threads waiting for a connection are served first
-  come first served, so under heavy load none waits until its deadline
-  (new in rc2).
+  come first served, so under heavy load none waits until its deadline.
 - The store lookup took the first `*.sqlite` by name, so a stale copy could
   silently replace the live library for reads and collection writes.
 - A store file replaced while the process ran was read stale until
