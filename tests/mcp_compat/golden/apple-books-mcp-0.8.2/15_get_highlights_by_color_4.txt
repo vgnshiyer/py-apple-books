@@ -1,0 +1,2 @@
+# get_highlights_by_color {"color": "orange"} isError=True
+Error executing tool get_highlights_by_color: Unknown highlight color 'orange'. Valid colors: green, blue, yellow, pink, purple.

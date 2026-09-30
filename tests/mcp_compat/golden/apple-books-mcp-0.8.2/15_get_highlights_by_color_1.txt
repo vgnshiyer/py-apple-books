@@ -1,0 +1,6 @@
+# get_highlights_by_color {"color": "yellow"} isError=False
+Synthetic Book (Test Author) — 1 yellow highlight:
+  [1] a synthetic highlight — Chapter 1 (ch=chap1)
+
+Unassigned (book no longer in library):
+  [7] orphan synthetic highlight

@@ -1,0 +1,3 @@
+# search_annotations {"limit": 1, "text": "synthetic"} isError=False
+Synthetic Book (Test Author):
+  [2] Opening words. — Chapter 2 (ch=chap2)

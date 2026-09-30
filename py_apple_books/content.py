@@ -39,7 +39,11 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from ebooklib import epub
 
-from py_apple_books.exceptions import AppleBooksError, UnsafeEpubEntryError
+from py_apple_books.exceptions import (
+    AppleBooksError,
+    ChapterNotFoundError,
+    UnsafeEpubEntryError,
+)
 from py_apple_books.utils import extract_chapter_text
 
 PathLike = Union[str, pathlib.Path]
@@ -371,7 +375,7 @@ class Chapter:
     """A single navigable entry in an EPUB's table of contents.
 
     :param id: Stable identifier suitable for round-trip to
-        :meth:`BookContent.get_chapter_content`. Prefers the manifest
+        :meth:`BookContent.get_chapter`. Prefers the manifest
         item id; falls back to the 1-based :attr:`order` as a string
         when the item id is ambiguous or missing.
     :param title: Human-readable chapter title from the navigation doc
@@ -531,8 +535,10 @@ class BookContent:
             or from a :class:`~py_apple_books.models.location.Location`.
         :return: Plain text of the chapter, with paragraph breaks
             preserved.
-        :raises AppleBooksError: if the book is not an EPUB or no spine
-            entry matches ``chapter_id``.
+        :raises ChapterNotFoundError: if no ToC chapter or spine entry
+            matches ``chapter_id`` (an :class:`AppleBooksError`).
+        :raises AppleBooksError: if the book is not an EPUB or the
+            chapter can't be read.
         """
         self._require_epub()
 
@@ -574,16 +580,20 @@ class BookContent:
         with no ToC fragment scoping — :meth:`get_chapter`'s path 2, also
         used to locate annotations by their CFI's manifest id.
 
-        :raises AppleBooksError: if the book is not an EPUB, no manifest
-            item has that id, or its content can't be read.
+        :raises ChapterNotFoundError: if no manifest item has that id.
+        :raises AppleBooksError: if the book is not an EPUB or the item's
+            content can't be read.
         """
         self._require_epub()
         book = self._load_book()
         item = book.get_item_with_id(item_id)
         if item is None:
-            raise AppleBooksError(
-                f"No chapter or spine entry with id {item_id!r}. "
-                f"Use list_chapters() to see available ids."
+            # No method names: the text reaches MCP clients, whose tools
+            # are named differently.
+            raise ChapterNotFoundError(
+                f"No chapter or spine entry with id {item_id!r} in this "
+                f"book. Pass an id from the book's table of contents, or "
+                f"a chapter's 1-based order (e.g. \"5\")."
             )
         try:
             html_bytes = item.get_content()

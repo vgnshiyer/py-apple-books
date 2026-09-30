@@ -1,0 +1,11 @@
+# describe_annotation {"annotation_id": "2"} isError=False
+Annotation 2
+  Book:     Synthetic Book (Test Author)
+  Chapter:  Chapter 2 (ch=chap2)
+  Created:  2026-09-22 12:00
+  Color:    GREEN
+
+  Highlighted: "Opening words."
+  Note:        my synthetic note
+
+  CFI: epubcfi(/6/6[chap2]!/4/4,/1:0,/1:21)

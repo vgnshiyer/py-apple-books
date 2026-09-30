@@ -1,0 +1,10 @@
+# describe_annotation {"annotation_id": "1"} isError=False
+Annotation 1
+  Book:     Synthetic Book (Test Author)
+  Chapter:  Chapter 1 (ch=chap1)
+  Created:  2026-09-21 12:00
+  Color:    YELLOW
+
+  Highlighted: "a synthetic highlight"
+
+  CFI: epubcfi(/6/4[chap1]!/4/4,/1:0,/1:21)

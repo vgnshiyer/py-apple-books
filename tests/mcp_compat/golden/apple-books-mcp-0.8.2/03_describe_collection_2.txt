@@ -1,0 +1,2 @@
+# describe_collection {"collection_id": "999999"} isError=False
+No collection found with id 999999.

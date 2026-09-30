@@ -1,0 +1,8 @@
+# resources/read {"uri": "apple-books://currently-reading"} isError=False
+Currently Reading: Synthetic Book by Test Author
+  Book id: 1
+  Progress: In Progress (42.0%) | Last Read: 2026-09-20
+
+Current chapter: [1/2] Chapter 1  (use get_chapter_content(1, "chap1") for the text)
+
+Highlights in this book: 5  (use list_annotations(1) to browse)

@@ -1,0 +1,8 @@
+# get_chapter_content {"book_id": 1, "chapter_id": "chap1"} isError=False
+Chapter 1
+
+Opening words. a synthetic highlight sits here in chapter 1. Closing words.
+
+A removed synthetic highlight was here once.
+
+(full chapter returned: 132 chars.)

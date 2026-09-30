@@ -1,0 +1,2 @@
+# get_current_reading_position {"book_id": 6} isError=False
+No reading position and no highlights yet — open the book to a chapter and read or highlight something, then try again.

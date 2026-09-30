@@ -1,0 +1,13 @@
+# list_all_annotations {} isError=False
+Synthetic Book (Test Author):
+  [3] Closing words. — Chapter 1 (ch=chap1)
+  [2] Opening words. — Chapter 2 (ch=chap2)
+  [1] a synthetic highlight — Chapter 1 (ch=chap1)
+  [9] Don't panic, it's 100% fine. — Chapter 2 (ch=chap2)
+  [10] don’t touch snake_case names — Chapter 2 (ch=chap2)
+
+Don't Panic (Second Author):
+  [8] towel day
+
+Unassigned (book no longer in library):
+  [7] orphan synthetic highlight

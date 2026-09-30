@@ -1,5 +1,12 @@
-from .api import PyAppleBooks
+import logging
 
-__all__ = ['PyAppleBooks']
+from .api import PyAppleBooks, LibraryStats
 
-__version__ = '1.9.1'
+__all__ = ['PyAppleBooks', 'LibraryStats']
+
+__version__ = '1.10.0rc1'
+
+# Library convention: emit records, let the application configure
+# handlers. Without this, warnings would reach stderr through logging's
+# last-resort handler in apps that never configure logging.
+logging.getLogger('py_apple_books').addHandler(logging.NullHandler())

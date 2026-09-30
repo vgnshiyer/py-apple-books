@@ -1,0 +1,44 @@
+{
+  "books": "8.5",
+  "books_build": "6570",
+  "macos": "26.7",
+  "macos_build": "25G229",
+  "stores": {
+    "AEAnnotation": {
+      "entities": {
+        "AEAnnotation": "e805b4d8963da6b0da5e26c626a02d4e3ac6b9a5f89f59eae2a6511c9a53b356",
+        "BCCloudSyncVersions": "0c6f400a07f4c8a87cfc57cdabd8bc3b2ba3f60fc4c1b3c7372f9e3de0ec0785"
+      },
+      "file": "AEAnnotation_v10312011_1727_local.sqlite",
+      "framework_version": 1526,
+      "tables": {
+        "ZAEANNOTATION": 33,
+        "ZBCCLOUDSYNCVERSIONS": 9,
+        "Z_METADATA": 3,
+        "Z_MODELCACHE": 1,
+        "Z_PRIMARYKEY": 4
+      }
+    },
+    "BKLibrary": {
+      "entities": {
+        "BCCloudSyncVersions": "0c6f400a07f4c8a87cfc57cdabd8bc3b2ba3f60fc4c1b3c7372f9e3de0ec0785",
+        "BKCollection": "48d645aedf6fb4fece1f0c6976042f8c6d1a0d00a371a3ca32f578c62d9fe306",
+        "BKCollectionMember": "8b288ede01eb415008db5231c15f02a768ec9956d65408b1348e3f749acb3e77",
+        "BKJaliscoStatus": "a8669ad8ec015abf7cdc52397a0f8ea2c13d20b4140061b894481b7f14797499",
+        "BKLibraryAsset": "b6ba529371d01a650a081e7b91e5faf87e69ad48fa3791908fc72e0059b255b8"
+      },
+      "file": "BKLibrary-1-091020131601.sqlite",
+      "framework_version": 1526,
+      "tables": {
+        "ZBCCLOUDSYNCVERSIONS": 9,
+        "ZBKCOLLECTION": 14,
+        "ZBKCOLLECTIONMEMBER": 9,
+        "ZBKJALISCOSTATUS": 6,
+        "ZBKLIBRARYASSET": 108,
+        "Z_METADATA": 3,
+        "Z_MODELCACHE": 1,
+        "Z_PRIMARYKEY": 4
+      }
+    }
+  }
+}

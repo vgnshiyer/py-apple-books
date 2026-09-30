@@ -2,8 +2,10 @@ from typing import Any
 import functools
 import pathlib
 import configparser
-from py_apple_books.models.manager import ModelManager
-from py_apple_books.models.relations import OneToMany, OneToOne, ManyToMany
+from py_apple_books.models.manager import ModelIterable, ModelManager
+from py_apple_books.models.relations import (
+    _TO_ONE_NAMES, ManyToMany, OneToMany, OneToOne, ReverseManyToMany, ReverseToOne,
+)
 
 
 @functools.cache
@@ -19,6 +21,12 @@ def _load_mappings() -> dict[str, dict[str, str]]:
     config = configparser.ConfigParser()
     config.read(mappings_path)
     return {section: dict(config.items(section)) for section in config.sections()}
+
+
+@functools.cache
+def _field_names(section: str) -> tuple:
+    """The field names of a mappings.ini section, in file order."""
+    return tuple(_load_mappings()[section])
 
 
 class ModelBase(type):
@@ -52,6 +60,7 @@ class ModelBase(type):
                     'extra_filters': {},
                 }
                 related_model.relations.append(backward_relation)
+                setattr(related_model, value.related_name, ReverseToOne(value, cls))
 
             elif isinstance(value, ManyToMany):
                 relation_type = value.__class__.__name__
@@ -79,7 +88,10 @@ class ModelBase(type):
                     'extra_filters': {},
                 }
                 related_model.relations.append(backward_relation)
+                setattr(related_model, value.related_name, ReverseManyToMany(value, cls))
 
+        # A new class can add a to-one relation to an existing one.
+        _TO_ONE_NAMES.clear()
         return cls
 
 
@@ -96,11 +108,22 @@ class Model(metaclass=ModelBase):
         return {key: mappings[key] for key in keys}
 
     @classmethod
-    def from_db(cls, db_data: list[Any]) -> 'Model':
-        fields_len = len(cls._get_mappings(cls.__name__))
-        obj = cls(**dict(zip(cls._get_mappings(cls.__name__).keys(), db_data[:fields_len])))
-        cls.manager.handle_relations(obj)
+    def from_db(cls, db_data: list[Any], db=None) -> 'Model':
+        """The model for a row of its mapped columns, in mappings.ini
+        order. ``db`` is the library the row came from, which its
+        relations read. Loads no relation: they load on first access."""
+        keys = _field_names(cls.__name__)
+        obj = cls(**dict(zip(keys, db_data[:len(keys)])))
+        obj.__dict__['_ab_db'] = db
         return obj
+
+    def __getstate__(self):
+        # For pickle and copy: the library and the sibling list are not
+        # part of a model's data, nor is a to-many relation's result.
+        # Iterates a copy: loading a sibling's relation (in another
+        # thread) writes into this __dict__.
+        return {key: value for key, value in self.__dict__.copy().items()
+                if not key.startswith('_ab_') and not isinstance(value, ModelIterable)}
 
     @classmethod
     def to_db(cls) -> dict:

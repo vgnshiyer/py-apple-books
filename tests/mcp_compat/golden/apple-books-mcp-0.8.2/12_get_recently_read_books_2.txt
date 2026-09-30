@@ -1,0 +1,5 @@
+# get_recently_read_books {"limit": 2} isError=False
+[1] Synthetic Book by Test Author
+  Progress: In Progress (42.0%) | Last Read: 2026-09-20
+[7] Locked Store Book by Store Author
+  Progress: In Progress (25.0%) | Last Read: 2026-09-12

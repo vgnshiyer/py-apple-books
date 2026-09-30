@@ -5,10 +5,18 @@ dictionary, no Shortcuts action), so the only path is writing directly
 to the library's Core Data SQLite store. That demands discipline; every
 operation here runs inside a :class:`WriteSession` that:
 
-1. refuses while the Books app is running,
+1. refuses while the Books app is running (checked again once the
+   write lock is held),
 2. takes a WAL-inclusive backup (on by default),
-3. validates the schema and aborts on drift,
-4. wraps all statements in one ``BEGIN IMMEDIATE`` transaction, and
+3. wraps all statements in one ``BEGIN IMMEDIATE`` transaction (a
+   write lock held elsewhere past :data:`BUSY_TIMEOUT` raises
+   :class:`LibraryBusyError`; so does a commit blocked that long),
+4. inside that transaction, validates the schema and aborts on drift:
+   the collection and membership tables must have exactly the verified
+   columns and types, the tables it reads must have the columns it
+   reads, and the Core Data model hashes are compared with the
+   verified ones (``APPLE_BOOKS_MODEL_CHECK``; see
+   :mod:`py_apple_books.write_safety`), and
 5. maintains Core Data's bookkeeping invariants — primary keys are
    allocated through ``Z_PRIMARYKEY`` (skipping this breaks Books' own
    next insert), ``Z_ENT``/``Z_OPT`` are set the way Books sets them,
@@ -29,23 +37,32 @@ reverted by a cloud re-sync. Callers should surface that caveat.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 import uuid
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
-from py_apple_books.db.client import AppleBooksDBClient, find_sqlite_file
+from py_apple_books.db.client import AppleBooksDBClient, _store, default_data_dir, find_sqlite_file
 from py_apple_books.exceptions import (
+    AmbiguousStoreError,
     BookNotFoundError,
     CollectionNotFoundError,
+    LibraryBusyError,
+    LibraryNotFoundError,
+    SchemaValidationError,
     SystemCollectionError,
     WriteError,
 )
 from py_apple_books.utils import APPLE_EPOCH_OFFSET
 from py_apple_books.write_safety import (
     backup_library,
+    check_model_hashes,
     ensure_books_not_running,
+    resolve_model_check,
+    validate_table_columns,
     validate_table_schema,
 )
 
@@ -56,6 +73,17 @@ _PK_TABLE = "Z_PRIMARYKEY"
 
 _COLLECTION_ENTITY = "BKCollection"
 _MEMBER_ENTITY = "BKCollectionMember"
+
+#: SQLite busy timeout, in seconds, for taking the write lock (and, on
+#: a rollback-journal store, for committing). If another program holds
+#: the database longer, the write gives up with :class:`LibraryBusyError`
+#: and changes nothing.
+BUSY_TIMEOUT = 5.0
+
+_BUSY_MESSAGE = (
+    "The Books library database is busy (another program is {} it); "
+    "nothing was changed. Try again in a moment."
+)
 
 #: Books assigns sidebar / in-collection order in multiples of 10000.
 SORT_KEY_STEP = 10000
@@ -81,16 +109,40 @@ SYSTEM_COLLECTION_IDS = frozenset(
 #: Built-in collections whose *membership* the user edits in the app UI.
 MEMBERSHIP_EDITABLE_SYSTEM_IDS = frozenset({"Want_To_Read_Collection_ID"})
 
-# Columns each write populates / requires. Used both to build INSERTs
-# and to validate the live schema before any write.
-_COLLECTION_COLUMNS = {
-    "Z_PK", "Z_ENT", "Z_OPT", "ZDELETEDFLAG", "ZHIDDEN", "ZPLACEHOLDER",
-    "ZSORTKEY", "ZSORTMODE", "ZVIEWMODE", "ZLASTMODIFICATION",
-    "ZLOCALMODDATE", "ZCOLLECTIONID", "ZDETAILS", "ZTITLE",
+# Exact schema (column -> declared type, as ``PRAGMA table_info``
+# reports it) of the tables the writer inserts into, verified on macOS
+# 26.7 / Books 8.5. Every INSERT populates every one of these columns;
+# any other column is an attribute the writer would leave NULL, so the
+# live tables must match exactly before any write.
+_COLLECTION_SCHEMA = {
+    "Z_PK": "INTEGER", "Z_ENT": "INTEGER", "Z_OPT": "INTEGER",
+    "ZDELETEDFLAG": "INTEGER", "ZHIDDEN": "INTEGER", "ZPLACEHOLDER": "INTEGER",
+    "ZSORTKEY": "INTEGER", "ZSORTMODE": "INTEGER", "ZVIEWMODE": "INTEGER",
+    "ZLASTMODIFICATION": "TIMESTAMP", "ZLOCALMODDATE": "TIMESTAMP",
+    "ZCOLLECTIONID": "VARCHAR", "ZDETAILS": "VARCHAR", "ZTITLE": "VARCHAR",
 }
-_MEMBER_COLUMNS = {
-    "Z_PK", "Z_ENT", "Z_OPT", "ZSORTKEY", "ZASSET", "ZCOLLECTION",
-    "ZLOCALMODDATE", "ZASSETID", "ZTEMPORARYASSETID",
+_MEMBER_SCHEMA = {
+    "Z_PK": "INTEGER", "Z_ENT": "INTEGER", "Z_OPT": "INTEGER",
+    "ZSORTKEY": "INTEGER", "ZASSET": "INTEGER", "ZCOLLECTION": "INTEGER",
+    "ZLOCALMODDATE": "TIMESTAMP", "ZASSETID": "VARCHAR",
+    "ZTEMPORARYASSETID": "VARCHAR",
+}
+_COLLECTION_COLUMNS = frozenset(_COLLECTION_SCHEMA)
+_MEMBER_COLUMNS = frozenset(_MEMBER_SCHEMA)
+
+# Tables the writer only reads (or bumps a counter in): the columns it
+# uses must exist; other columns are fine.
+_ASSET_READ_COLUMNS = frozenset({"Z_PK", "ZASSETID"})
+_PK_COLUMNS = frozenset({"Z_ENT", "Z_NAME", "Z_MAX"})
+
+#: Core Data ``NSStoreModelVersionHashes`` (base64) the writer was
+#: verified against, for the entities it inserts into or updates.
+#: BKLibraryAsset isn't pinned: it changes with most Books releases and
+#: the writer only reads Z_PK and ZASSETID from it. Observed on macOS
+#: 26.7 / Books 8.5 (NSPersistenceFrameworkVersion 1526).
+_VERIFIED_MODEL_HASHES = {
+    _COLLECTION_ENTITY: frozenset({"SNZFrt9vtP7OHwxpdgQvjG0aDQCjcaPKMvV4xi2f4wY="}),
+    _MEMBER_ENTITY: frozenset({"iyiO3gHrQVAI21IxwV8Cp2jsmVbWVAixNI4/dJrLPnc="}),
 }
 
 
@@ -99,8 +151,91 @@ def _cd_now() -> float:
     return time.time() - APPLE_EPOCH_OFFSET
 
 
-def _default_db_path() -> Path:
-    return find_sqlite_file(AppleBooksDBClient.book_lib_db[1])
+def _is_busy(e: sqlite3.Error) -> bool:
+    """Whether ``e`` is SQLite giving up on a lock (``SQLITE_BUSY`` or
+    ``SQLITE_LOCKED``)."""
+    code = getattr(e, "sqlite_errorcode", None)  # Python 3.11+
+    if code is not None:
+        return (code & 0xFF) in (5, 6)  # SQLITE_BUSY, SQLITE_LOCKED
+    message = str(e).lower()
+    return "locked" in message or "busy" in message
+
+
+def _is_read_only(e: sqlite3.Error) -> bool:
+    """Whether ``e`` is ``SQLITE_READONLY``: SQLite opened the store
+    read-only (the file isn't writable) or it was moved while open."""
+    code = getattr(e, "sqlite_errorcode", None)  # Python 3.11+
+    if code is not None:
+        return (code & 0xFF) == 8  # SQLITE_READONLY
+    return "readonly" in str(e).lower()
+
+
+def _store_for_writes(db, *, unreadable_ok: bool = False) -> Path:
+    """The library store file the writes to ``db`` (a
+    :class:`~py_apple_books.db.LibraryDB`) go to.
+
+    Found strictly (:meth:`LibraryDB.library_path`), and only if it is
+    the file ``db``'s reads use. A store found in a folder, not given as
+    a file, must be the canonical one or, if there is no canonical file,
+    a single store with Apple's generation-stamped name: a canonical file
+    that fails validation for a moment (busy, say) doesn't send the write
+    to a copy, a ``.old`` file or a backup next to it, nor is it reported
+    as missing. Otherwise :class:`AmbiguousStoreError`, before anything is
+    opened for writing.
+
+    ``unreadable_ok`` (restoring over a damaged library, listing its
+    backups): a canonical file that is present but fails validation is
+    the store, unless strict discovery found several other candidates.
+    """
+    store = _store("library")
+    folder = f"{store.subdir}/"
+    store_file, data_dir = db._source("library")
+    unreadable = (f"The Apple Books library store {store.canonical} in {folder} can't be read "
+                  "right now (busy or damaged)")
+    try:
+        path = db.library_path(strict=True)
+    except LibraryNotFoundError:
+        # Strict discovery treats a canonical file that fails validation
+        # as absent: with nothing else there, "no store found".
+        directory = (data_dir if data_dir is not None else default_data_dir()) / store.subdir
+        canonical = directory / store.canonical
+        if store_file is None and os.path.lexists(canonical):
+            if unreadable_ok and os.path.isfile(canonical):
+                return canonical
+            raise AmbiguousStoreError(
+                f"{unreadable}. Nothing was changed; try again in a moment.") from None
+        raise
+    if store_file is None and path.name != store.canonical:
+        canonical = path.parent / store.canonical
+        if os.path.lexists(canonical):
+            if unreadable_ok and os.path.isfile(canonical):
+                return canonical
+            raise AmbiguousStoreError(
+                f"{unreadable}, so the write won't go to {path.name} instead. "
+                "Nothing was changed; try again in a moment.")
+        if not store.generation.fullmatch(path.name):
+            raise AmbiguousStoreError(
+                f"The only library store in {folder} is {path.name}, which isn't named like "
+                "the store Apple Books uses (a copy or a backup?); refusing to write to it.")
+    read = db.paths().library
+    try:
+        same = os.path.samefile(path, read)
+    except OSError:
+        same = False
+    if not same:
+        raise AmbiguousStoreError(
+            f"The library store found for this write ({path.name}) isn't the file being read "
+            f"({read.name}): the store's location changed while in use. Nothing was changed.")
+    return path
+
+
+def _default_db_path(*, unreadable_ok: bool = False) -> Path:
+    """The default library's store file (:func:`default_library`, which
+    honours ``APPLE_BOOKS_LIBRARY_DB`` and then ``APPLE_BOOKS_DATA_DIR``),
+    found strictly (see :func:`_store_for_writes`): several candidate
+    stores raise :class:`AmbiguousStoreError` instead of a guess."""
+    from py_apple_books.db.client import default_library
+    return _store_for_writes(default_library(), unreadable_ok=unreadable_ok)
 
 
 class WriteSession:
@@ -109,13 +244,35 @@ class WriteSession:
     Context manager: guards run on ``__enter__``, the transaction
     commits on clean exit and rolls back on any exception.
 
-    :param db_path: Override the library database path (tests point
-        this at a fixture copy; production leaves it None).
+    :param db_path: The library database to write. None means the
+        default library's (``PyAppleBooks()``); a ``PyAppleBooks`` with
+        a library of its own passes that library's store. It must
+        exist: it is opened for writing, never created.
     :param backup: Take a pre-write backup. On by default; only tests
         should turn this off.
-    :param backup_dir: Override the backup directory.
-    :param require_books_closed: Refuse when Books.app is running. On
+    :param backup_dir: Override the backup directory. By default the
+        current user's library backs up into
+        :data:`~py_apple_books.write_safety.BACKUP_DIR` and any other
+        store into a folder of its own under it (see
+        :func:`~py_apple_books.write_safety.backup_library`).
+    :param require_books_closed: Refuse when Books.app is running,
+        before the backup and again once the write lock is held. On
         by default; only tests against fixture databases turn this off.
+    :param model_check: ``'warn'``, ``'enforce'`` or ``'off'``: what an
+        unverified Core Data model hash does, and (``'off'``) whether
+        unknown nullable columns are allowed. None reads
+        ``APPLE_BOOKS_MODEL_CHECK`` (default ``'warn'``); see
+        :func:`py_apple_books.write_safety.resolve_model_check`.
+
+    After ``__enter__``, ``model_hashes`` holds the store's model hashes
+    for the verified entities (``{}`` when the model check is off).
+
+    Entering raises :class:`BooksAppRunningError`,
+    :class:`LibraryBusyError`, :class:`SchemaValidationError`, or
+    :class:`WriteError` when the store can't be opened or written (gone,
+    read-only); a commit that fails raises :class:`LibraryBusyError`
+    (blocked past :data:`BUSY_TIMEOUT`) or :class:`WriteError`. In each
+    case nothing was changed.
     """
 
     def __init__(
@@ -124,12 +281,15 @@ class WriteSession:
         backup: bool = True,
         backup_dir: Optional[Path] = None,
         require_books_closed: bool = True,
+        model_check: Optional[str] = None,
     ):
         self.db_path = Path(db_path) if db_path else _default_db_path()
         self.backup = backup
         self.backup_dir = backup_dir
         self.require_books_closed = require_books_closed
+        self.model_check = model_check
         self.backup_path: Optional[Path] = None
+        self.model_hashes: dict = {}
         self.conn: Optional[sqlite3.Connection] = None
 
     def __enter__(self) -> "WriteSession":
@@ -141,37 +301,112 @@ class WriteSession:
                 self.db_path, self.backup_dir, min_interval=BACKUP_MIN_INTERVAL
             )
 
-        # isolation_level=None -> autocommit off our hands; we control
-        # the transaction explicitly. timeout is SQLite's busy timeout:
-        # either we get the write lock promptly or we abort.
-        self.conn = sqlite3.connect(self.db_path, timeout=5.0, isolation_level=None)
+        self.conn = self._connect()
         try:
-            validate_table_schema(
-                self.conn, _COLLECTION_TABLE,
-                required_columns=_COLLECTION_COLUMNS,
-                writable_columns=_COLLECTION_COLUMNS,
-            )
-            validate_table_schema(
-                self.conn, _MEMBER_TABLE,
-                required_columns=_MEMBER_COLUMNS,
-                writable_columns=_MEMBER_COLUMNS,
-            )
-            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.Error as e:
+                raise self._store_error(e, holder="writing to") from e
+            # Books may have been opened while the backup was taken.
+            if self.require_books_closed:
+                ensure_books_not_running()
+            # Validate under the write lock, so the schema can't change
+            # between the check and the write.
+            self._validate_schema()
         except BaseException:
-            self.conn.close()
-            self.conn = None
+            self._close(rollback=True)
             raise
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def _connect(self) -> sqlite3.Connection:
+        """Open the store for writing. ``mode=rw``: a store that is gone
+        (moved or removed since it was found) fails here instead of
+        being created empty under its name."""
+        # isolation_level=None -> autocommit off our hands; we control
+        # the transaction explicitly. timeout is SQLite's busy timeout:
+        # either we get the write lock promptly or we abort.
         try:
-            if exc_type is None:
-                self.conn.execute("COMMIT")
-            else:
-                self.conn.execute("ROLLBACK")
+            return sqlite3.connect(
+                f"file:{quote(str(self.db_path))}?mode=rw", uri=True,
+                timeout=BUSY_TIMEOUT, isolation_level=None,
+            )
+        except sqlite3.Error as e:
+            reason = str(e) if os.path.lexists(self.db_path) else "it isn't there any more"
+            raise WriteError(
+                f"Can't open the library store {self.db_path.name} for writing "
+                f"({reason}); nothing was changed."
+            ) from e
+
+    def _store_error(self, e: sqlite3.Error, holder: str = "reading") -> WriteError:
+        """The error to raise for SQLite refusing the write for the
+        store's sake: :class:`LibraryBusyError` for a lock held elsewhere
+        (``holder``: what the program holding it is doing, for the
+        message), else :class:`WriteError` (a read-only store, say)."""
+        if _is_busy(e):
+            return LibraryBusyError(_BUSY_MESSAGE.format(holder), cause=e)
+        return WriteError(
+            f"Can't write to the library store {self.db_path.name} ({e}); "
+            "nothing was changed."
+        )
+
+    def _close(self, rollback: bool) -> None:
+        """Close the connection, rolling back an open transaction first
+        if ``rollback``."""
+        conn, self.conn = self.conn, None
+        try:
+            if rollback and conn.in_transaction:
+                conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass  # closing the connection rolls back as well
         finally:
-            self.conn.close()
-            self.conn = None
+            conn.close()
+
+    def _validate_schema(self) -> None:
+        conn = self.conn
+        mode = resolve_model_check(self.model_check)
+        relaxed = mode == "off"
+        validate_table_columns(
+            conn, _COLLECTION_TABLE, _COLLECTION_SCHEMA, allow_extra_nullable=relaxed
+        )
+        validate_table_columns(
+            conn, _MEMBER_TABLE, _MEMBER_SCHEMA, allow_extra_nullable=relaxed
+        )
+        validate_table_schema(conn, _ASSET_TABLE, _ASSET_READ_COLUMNS)
+        validate_table_schema(conn, _PK_TABLE, _PK_COLUMNS)
+
+        entities = (_COLLECTION_ENTITY, _MEMBER_ENTITY)
+        present = {
+            row[0] for row in conn.execute(
+                f"SELECT Z_NAME FROM {_PK_TABLE} WHERE Z_NAME IN (?, ?)", entities
+            )
+        }
+        missing = [entity for entity in entities if entity not in present]
+        if missing:
+            raise SchemaValidationError(
+                f"Z_PRIMARYKEY has no entry for entity(ies) {missing} — "
+                "the schema has changed and writes are not safe."
+            )
+
+        self.model_hashes = check_model_hashes(conn, _VERIFIED_MODEL_HASHES, mode=mode)
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is not None:
+            self._close(rollback=True)
+            # A store opened read-only (the file isn't writable) only
+            # refuses at the first statement that writes.
+            if (isinstance(exc, sqlite3.OperationalError) and not isinstance(exc, WriteError)
+                    and (_is_busy(exc) or _is_read_only(exc))):
+                raise self._store_error(exc) from exc
+            return
+        try:
+            self.conn.execute("COMMIT")
+        except sqlite3.Error as e:
+            # A failed COMMIT leaves the transaction open: roll it back.
+            # (On a rollback-journal store, another connection's open
+            # read transaction makes it busy.)
+            self._close(rollback=True)
+            raise self._store_error(e) from e
+        self._close(rollback=False)
 
 
 def _allocate_pk(cur: sqlite3.Cursor, entity_name: str, table: str) -> tuple[int, int]:
@@ -186,7 +421,7 @@ def _allocate_pk(cur: sqlite3.Cursor, entity_name: str, table: str) -> tuple[int
         f"SELECT Z_ENT, Z_MAX FROM {_PK_TABLE} WHERE Z_NAME = ?", (entity_name,)
     ).fetchone()
     if row is None:
-        raise WriteError(
+        raise SchemaValidationError(
             f"Z_PRIMARYKEY has no entry for entity {entity_name!r} — "
             "the schema has changed and writes are not safe."
         )
