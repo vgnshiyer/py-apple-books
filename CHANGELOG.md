@@ -10,14 +10,16 @@ keeps resolving 1.9.1 until 1.10.0 is out.
 1.10 rebuilds the read path. Queries bind their values as SQL parameters.
 The library is found on first use and read through a pool of read-only
 connections that works from any thread. Results are evaluated once, and
-relations load lazily. The public API only grows: every new parameter is
-keyword-only, and every new exception keeps the built-in base 1.9 raised.
+relations load lazily. The public API only grows: the new parameters of
+the existing `PyAppleBooks` methods are keyword-only, and every new
+exception keeps the built-in base 1.9 raised.
 
 apple-books-mcp 0.8.2 accepts any `py-apple-books>=1.9.1,<2`, so its users
-get 1.10.0 on their next fresh install. The changes they can see are marked
-**(MCP)**, and the [README](README.md#note-for-apple-books-mcp-082-users)
-sums them up. Maintainer-library figures below are ratios; they differ from
-library to library.
+get 1.10.0 on their next fresh install. The changes they are likely to
+notice are marked **(MCP)**, and the
+[README](README.md#note-for-apple-books-mcp-082-users) sums them up.
+Maintainer-library figures below are ratios; they differ from library to
+library.
 
 ### Behavior changes
 
@@ -174,11 +176,11 @@ library to library.
   disables it) or `APPLE_BOOKS_QUERY_TIMEOUT` (seconds; `0`, `none` or
   `off` disable it). `query_deadline(seconds)` shortens it for a block.
   Waiting for a pooled connection counts against the limit.
-- **Store discovery.** The stores are found on first use, not at import.
-  Apple's canonical file is used when its Core Data metadata shows it is an
-  Apple Books store. A `… copy.sqlite` that sorts first is no longer read,
-  and a replaced store file is picked up by the next call. A missing
-  annotation store leaves books and collections readable and raises
+- **(MCP)** **Store discovery.** The stores are found on first use, not at
+  import. Apple's canonical file is used when its Core Data metadata shows
+  it is an Apple Books store. A `… copy.sqlite` that sorts first is no
+  longer read, and a replaced store file is picked up by the next call. A
+  missing annotation store leaves books and collections readable and raises
   `AnnotationStoreNotFoundError` for annotation queries.
 - **Schema drift.** A mapped column missing from the store (an older or
   newer Apple Books) reads as None. Filtering or sorting on it raises
@@ -205,10 +207,14 @@ library to library.
   `Subquery`.
 - **Stricter arguments.** An unknown field in a filter, `order_by`, `only=`
   or `has_fields` raises `UnknownFieldError` (a `KeyError`, as 1.9 raised,
-  and a `ValueError`). A negative `offset`, or a `limit` or `offset` that
-  isn't an integer, raises `InvalidArgumentError`. A `date` or `datetime`
-  filter value raises `DBQueryError`; pass Core Data seconds, as
-  `get_annotations_by_date_range` does.
+  and a `ValueError`). A `limit` that isn't integral raises
+  `InvalidArgumentError`; 1.9 pasted it into the SQL, which usually raised
+  `DBQueryError`. Numeric strings (`'3'`) and integral floats are still
+  accepted as a `limit`. An `offset` that isn't an `int`, or a negative
+  one, raises `InvalidArgumentError` too. A `date` filter value raises
+  `DBQueryError`, as a `datetime` already did (1.9 matched every row for a
+  `date`); pass Core Data seconds, as `get_annotations_by_date_range`
+  does.
 - **`manager.compiler.execute`** receives `(sql, params)`; it received
   literal SQL. `manager.compiler` is still an assignable attribute, and every
   model statement goes through it.
@@ -219,14 +225,15 @@ library to library.
   store that can't be read, only a copy or backup, or a store other than
   the one being read raise `AmbiguousStoreError`. `PyAppleBooks()` follows
   `APPLE_BOOKS_LIBRARY_DB` and `APPLE_BOOKS_DATA_DIR` for writes too.
-- **Write checks (F37).** Before each write the collection and membership
-  tables must have exactly the columns and declared types this version was
-  verified against, and the check runs inside the write transaction. The
-  Core Data model version of both entities is compared with the verified
-  one. `APPLE_BOOKS_MODEL_CHECK=warn` (the default) logs a difference and
-  writes, `enforce` refuses, and `off` skips that check and also allows new
-  nullable columns (left empty). Missing or retyped columns always refuse.
-  macOS 27 is unverified.
+- **(MCP)** **Write checks (F37).** Before each write the collection and
+  membership tables must have exactly the columns and declared types this
+  version was verified against, and the check runs inside the write
+  transaction. The Core Data model version of both entities is compared
+  with the verified one. `APPLE_BOOKS_MODEL_CHECK=warn` (the default) logs
+  a difference and writes, `enforce` refuses, and `off` skips that check
+  and also allows new nullable columns (left empty). Missing or retyped
+  columns always refuse. A refusal raises `SchemaValidationError`, which
+  MCP 0.8.2 reports as "Write aborted for safety". macOS 27 is unverified.
 - **Backups per store.** The current user's library still backs up into
   `~/.py_apple_books/backups/`. Any other store (named by `data_dir`,
   `library_db` or the location variables) backs up into a folder of its
@@ -260,11 +267,12 @@ library to library.
 
 ### Fixed
 
-- Importing `py_apple_books` opened the library. With no Books data (a
-  fresh Mac, CI, Docker) or no Full Disk Access, it failed at import, and
-  so did `apple-books-mcp --help`. Imports now do no I/O. On first use the
-  errors are typed: `LibraryNotFoundError` names `APPLE_BOOKS_DATA_DIR`, and
-  `LibraryAccessDeniedError` gives a Full Disk Access hint.
+- **(MCP)** Importing `py_apple_books` opened the library. With no Books
+  data (a fresh Mac, CI, Docker) or no Full Disk Access, it failed at
+  import, and so did `apple-books-mcp --help`. Imports now do no I/O. On
+  first use the errors are typed: `LibraryNotFoundError` names
+  `APPLE_BOOKS_DATA_DIR`, and `LibraryAccessDeniedError` gives a Full Disk
+  Access hint.
 - Queries from another thread (`threading`, `anyio.to_thread`, mcp 2.x)
   failed with "SQLite objects created in a thread…". Connections are pooled
   per library and usable from any thread; one process holds far fewer
@@ -273,24 +281,24 @@ library to library.
   silently replace the live library for reads and collection writes.
 - A store file replaced while the process ran was read stale until
   restart.
-- One missing column broke most read tools; it now reads as None.
-- The ORM loaded relations eagerly, one or two statements per row, so
-  MCP 0.8.2's `get_library_stats`, `describe_book` and annotation lists ran
-  about two statements per annotation. `get_library_stats` now runs three
-  statements and `describe_book` two, and `annotation.book` loads the books
-  of a whole result at once.
+- **(MCP)** One missing column broke most read tools; it now reads as None.
+- **(MCP)** The ORM loaded relations eagerly, one or two statements per row,
+  so MCP 0.8.2's `get_library_stats`, `describe_book` and annotation lists
+  ran about two statements per annotation. `get_library_stats` now runs
+  three statements and `describe_book` two, and `annotation.book` loads the
+  books of a whole result at once.
 - `ModelIterable` slicing raised `TypeError`, `only=` raised, and `list()`
   ran the query twice.
 - The write schema check couldn't detect Core Data model drift (Apple's
   store declares no NOT NULL columns). The exact column check and the model
   hash check above catch it.
-- Writes: lock contention past 5 s raises `LibraryBusyError` ("…busy…;
-  nothing was changed") instead of a raw "database is locked". So does a
-  commit blocked by another program's read. A read-only store raises
-  `WriteError`. A store that vanished between resolution and the write is
-  no longer created as an empty file. Books opened while the backup was
-  taken is noticed (`BooksAppRunningError`). Drift in the tables the writer
-  only reads raises `SchemaValidationError` before the write starts.
+- **(MCP)** Writes: lock contention past 5 s raises `LibraryBusyError`
+  ("…busy…; nothing was changed") instead of a raw "database is locked". So
+  does a commit blocked by another program's read. A read-only store raises
+  `WriteError`. A store that vanished between resolution and the write is no
+  longer created as an empty file. Books opened while the backup was taken
+  is noticed (`BooksAppRunningError`). Drift in the tables the writer only
+  reads raises `SchemaValidationError` before the write starts.
 - A backup of a store whose name extends another's (`BKLibrary-1.sqlite`)
   could be reused or pruned as the other store's backup.
 - `search_annotation_by_text` over-fetched, filtered in Python and dropped
@@ -338,8 +346,10 @@ Most code needs no change. Check these:
   primary-key order across pages, or slice a result.
 - `limit` ≤ 0 warns; pass `None` for all rows.
 - Custom `manager.compiler` replacements receive `(sql, params)`.
-- Filters with a `date`/`datetime` value, an unknown field, a string for
-  `__in`, or a `Where` operator outside `OPERATORS` now raise.
+- Filters with a `date` value, a string for `__in`, or a `Where` operator
+  outside `OPERATORS` now raise; 1.9 matched every row for a `date` and
+  wrote the others into the SQL. A `limit` that isn't integral raises
+  `InvalidArgumentError` instead of `DBQueryError`.
 - Long queries stop after 30 s; set `query_timeout=None` or
   `APPLE_BOOKS_QUERY_TIMEOUT=0` for batch jobs that need longer.
 - Errors surface on first use instead of at import.

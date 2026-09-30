@@ -127,7 +127,7 @@ with api.query_deadline(2):                # stop any query in the block after 2
 
 ## Available Functions
 
-New parameters since 1.9 are keyword-only.
+Parameters added to existing methods since 1.9 are keyword-only.
 
 ### Collections
 
@@ -485,9 +485,9 @@ print([b.title for b in api.get_collection_by_id(shelf.id).books])
 ## Backups and restore
 
 Each write backs up the library store first, with the SQLite backup API
-(WAL-inclusive). Writes within 5 minutes of each other share the backup
-taken before the first of them, and the newest 10 backups of each store are
-kept. Backups of the current user's library go to
+(WAL-inclusive). A write reuses the newest backup if it was taken less than
+5 minutes ago, and otherwise takes a new one; the newest 10 backups of each
+store are kept. Backups of the current user's library go to
 `~/.py_apple_books/backups/`. Any other store (named by `data_dir`,
 `library_db` or the location variables) gets a folder of its own under
 `~/.py_apple_books/backups/libraries/`; `store_info().backup_dir` names it.
