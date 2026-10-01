@@ -15,6 +15,9 @@ only supports that layout.
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
+import inspect
 import os
 import pathlib
 import shutil
@@ -39,20 +42,81 @@ def pytest_unconfigure(config):
     shutil.rmtree(FIXTURE_HOME, ignore_errors=True)
 
 
+# Apple Books files next to its Documents folder, in the same container
+# (``<container>/Data``): the preferences plist (reading goals) and the
+# per-book info caches (removed books).
+PREFS_PLIST = "Library/Preferences/com.apple.iBooksX.plist"
+BOOK_INFO_CACHES = "Library/Caches/AEEpubInfoSource"
+# Modules (added in 1.11) whose ``default_*_path()``/``default_*_dir()``
+# functions name such files; checked too once they exist.
+_DEFAULT_LOCATION_MODULES = ("py_apple_books._prefs", "py_apple_books.book_info")
+
+
+def _library_locations():
+    """``[(label, path)]`` for every place a default library would read."""
+    from py_apple_books.db.client import AppleBooksDBClient, default_data_dir, default_library
+
+    lib_dir = getattr(AppleBooksDBClient, "book_lib_db", (None, None))[1]
+    paths = default_library().paths()
+    found = [("Path.home()", pathlib.Path.home()), ("AppleBooksDBClient.book_lib_db", lib_dir),
+             ("default_library().paths().library", paths.library),
+             ("default_library().paths().annotations", paths.annotations)]
+    # The container files, derived from HOME and from the data dir the
+    # way the library derives its stores.
+    containers = {("HOME", pathlib.Path.home() / _bootstrap.DOCUMENTS),
+                  ("default_data_dir()", default_data_dir())}
+    if os.environ.get("APPLE_BOOKS_DATA_DIR"):
+        containers.add(("APPLE_BOOKS_DATA_DIR", pathlib.Path(os.environ["APPLE_BOOKS_DATA_DIR"])))
+    for source, docs in sorted(containers, key=str):
+        for rel in (PREFS_PLIST, BOOK_INFO_CACHES):
+            found.append((f"{rel} from {source}", pathlib.Path(docs).parent / rel))
+    for name in _DEFAULT_LOCATION_MODULES:
+        if importlib.util.find_spec(name) is None:
+            continue
+        module = importlib.import_module(name)
+        for attr in sorted(vars(module)):
+            fn = getattr(module, attr)
+            if (attr.startswith("default_") and attr.endswith(("_path", "_dir"))
+                    and callable(fn) and not isinstance(fn, type) and _no_required_args(fn)):
+                found.append((f"{name}.{attr}()", fn()))
+    return found
+
+
+def _no_required_args(fn) -> bool:
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return all(p.default is not p.empty or p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD) for p in params)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _fixture_home_guard():
     """Stop the run if the library would resolve outside the fixture HOME."""
-    from py_apple_books.db.client import AppleBooksDBClient, default_library
-
     root = FIXTURE_HOME.resolve()
-    lib_dir = getattr(AppleBooksDBClient, "book_lib_db", (None, None))[1]
-    paths = default_library().paths()
-    for label, path in (("Path.home()", pathlib.Path.home()), ("AppleBooksDBClient.book_lib_db", lib_dir),
-                        ("default_library().paths().library", paths.library),
-                        ("default_library().paths().annotations", paths.annotations)):
+    for label, path in _library_locations():
         if path is None or not pathlib.Path(path).resolve().is_relative_to(root):
             pytest.exit(f"{label} is {path}, outside the fixture HOME {root}; refusing to run "
                         f"against a real library", returncode=3)
+
+
+def _content_cache_clearer():
+    """``py_apple_books.content.clear_content_cache`` (1.11 on), or None."""
+    from py_apple_books import content
+
+    return getattr(content, "clear_content_cache", None)
+
+
+@pytest.fixture(autouse=True)
+def _content_cache_reset():
+    """Every test starts and ends with no cached book-file data, so a test
+    that rewrites a bundle can't see another test's index."""
+    clear = _content_cache_clearer()
+    if clear is not None:
+        clear()
+    yield
+    if clear is not None:
+        clear()
 
 
 def _library_env() -> dict:
