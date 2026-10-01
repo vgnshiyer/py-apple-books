@@ -10,12 +10,15 @@ installed. Checks:
 - The wheel ships every module and package-data file from the source
   tree (including py.typed and models/mappings.ini), and no tests,
   __pycache__, bytecode or .DS_Store.
-- METADATA declares ``Requires-Python: >=3.10`` and depends on exactly
-  ebooklib and beautifulsoup4.
+- METADATA declares ``Requires-Python: >=3.10`` and depends
+  unconditionally on exactly ebooklib and beautifulsoup4. The only
+  other requirement allowed is one ``extra == "pdf"`` entry on
+  pyobjc-framework-Quartz (the optional PDF support), with
+  ``Provides-Extra: pdf``.
 - The sdist carries the test suite and no junk.
 
 ``--baseline-wheel`` takes the previous release's wheel (``pip download
-py-apple-books==1.9.1 --no-deps``) and compares package files, ignoring
+py-apple-books==1.10.0 --no-deps``) and compares package files, ignoring
 ``*.dist-info/``: every baseline file must still be shipped, and every
 added file must match ``ADDED_ALLOWED``.
 """
@@ -46,15 +49,40 @@ REQUIRED_WHEEL_FILES = [
     'py_apple_books/py.typed',
 ]
 REQUIRES_PYTHON = '>=3.10'
+# Unconditional requirements.
 REQUIRES_DIST = {'ebooklib', 'beautifulsoup4'}
+# Optional extras: {extra: the one distribution it may require}.
+EXTRAS = {'pdf': 'pyobjc-framework-quartz'}
 
-# Package files this release may add on top of the baseline wheel.
-# fnmatch's '*' also matches '/', so 'testing/*' covers subdirectories.
+# Package files 1.11 may add on top of the 1.10.0 wheel: the full
+# planned list, registered once so feature streams don't edit this
+# file. (B) marks Tier B files; the release stream drops the entries of
+# any that slipped to 1.12. fnmatch's '*' also matches '/', so
+# 'testing/*' covers subdirectories.
 ADDED_ALLOWED = [
-    'py_apple_books/text.py',
-    'py_apple_books/db/metadata.py',
+    'py_apple_books/_icloud.py',
+    'py_apple_books/_messages.py',
+    'py_apple_books/_epub_index.py',
+    'py_apple_books/_content_resolve.py',
+    'py_apple_books/_content_reading.py',
+    'py_apple_books/_spans.py',
+    'py_apple_books/_cfi.py',  # (B)
+    'py_apple_books/_opf.py',
+    'py_apple_books/_prefs.py',  # (B)
+    'py_apple_books/_pdf_worker.py',  # (B)
+    'py_apple_books/_pdf_runner.py',  # (B)
+    'py_apple_books/positions.py',
+    'py_apple_books/search.py',
+    'py_apple_books/engagement.py',
+    'py_apple_books/book_info.py',
+    'py_apple_books/pdf.py',  # (B)
+    'py_apple_books/_api/*',
+    'py_apple_books/models/book_metadata.py',
+    'py_apple_books/models/series.py',
     'py_apple_books/testing/*',
 ]
+
+_EXTRA_MARKER = re.compile(r"""\bextra\s*==\s*['"]([^'"]+)['"]""")
 
 
 def static_version():
@@ -163,17 +191,41 @@ def check_wheel(wheel, version, errors):
         errors.append(
             f'METADATA Requires-Python {headers["Requires-Python"]!r} != {REQUIRES_PYTHON!r}'
         )
-    requires = headers.get_all('Requires-Dist') or []
-    dist_names = {
-        canonical_name(re.match(r'\s*([A-Za-z0-9._-]*)', req).group(1))
-        for req in requires
-    }
-    if dist_names != REQUIRES_DIST:
+    check_requirements(headers.get_all('Requires-Dist') or [],
+                       headers.get_all('Provides-Extra') or [], errors)
+    return names
+
+
+def check_requirements(requires, provides_extra, errors):
+    """Unconditional requirements are exactly ``REQUIRES_DIST``; each
+    extra in ``EXTRAS`` has at most one requirement, on its one
+    distribution, and is declared in Provides-Extra; nothing else."""
+    unconditional, by_extra = set(), {}
+    for req in requires:
+        spec, _, marker = req.partition(';')
+        name = canonical_name(re.match(r'\s*([A-Za-z0-9._-]*)', spec).group(1))
+        if not marker.strip():
+            unconditional.add(name)
+            continue
+        extras = _EXTRA_MARKER.findall(marker)
+        if len(extras) != 1 or extras[0] not in EXTRAS:
+            errors.append(f'METADATA Requires-Dist {req!r}: only the extras {sorted(EXTRAS)} '
+                          f'may add requirements')
+            continue
+        by_extra.setdefault(extras[0], []).append(name)
+    if unconditional != REQUIRES_DIST:
         errors.append(
-            f'METADATA Requires-Dist names {sorted(dist_names)} != '
+            f'METADATA Requires-Dist names {sorted(unconditional)} != '
             f'{sorted(REQUIRES_DIST)} (entries: {requires})'
         )
-    return names
+    for extra, names in sorted(by_extra.items()):
+        if names != [EXTRAS[extra]]:
+            errors.append(f'METADATA extra {extra!r} requires {names}, expected exactly '
+                          f'[{EXTRAS[extra]!r}]')
+    declared = {canonical_name(e) for e in provides_extra}
+    if declared != set(by_extra):
+        errors.append(f'METADATA Provides-Extra {sorted(declared)} != extras with '
+                      f'requirements {sorted(by_extra)}')
 
 
 def check_sdist(sdist, version, errors):
