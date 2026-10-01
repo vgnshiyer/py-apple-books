@@ -5,6 +5,10 @@ required (``REQUIRED_FIELDS``); filtering or sorting on a missing column,
 or a missing required column, raises ``UnsupportedSchemaError`` for that
 model only. Each test drifts its own ``FixtureLibrary`` with ``ALTER
 TABLE`` before reading it through a new ``LibraryDB``.
+
+The facade calls compared under drift are the drift cases in
+``tests/drift_cases`` (one module per stream); every public facade
+method needs a case or an exemption there.
 """
 
 import datetime as dt
@@ -15,6 +19,7 @@ import sqlite3
 import pytest
 
 from py_apple_books import PyAppleBooks
+from tests import drift_cases
 from py_apple_books.db import LibraryDB, use_library
 from py_apple_books.exceptions import (
     AnnotationStoreNotFoundError,
@@ -55,9 +60,11 @@ def seed(lib) -> dict:
         "deleted": lib.add_annotation(reading, "deleted", deleted=True, created=created),
         "position": lib.add_annotation(reading, None, kind="reading_position", created=created),
     }
-    return {"reading": reading["id"], "done": done["id"], "fresh": fresh["id"], "volume": volume["id"],
+    base = {"reading": reading["id"], "done": done["id"], "fresh": fresh["id"], "volume": volume["id"],
             "owned_volume": owned_volume["id"], "container": container["id"], "shelf": shelf["id"],
             **rows}
+    # Rows the streams' drift case modules add for their own cases.
+    return drift_cases.seed(lib, base)
 
 
 @pytest.fixture
@@ -96,40 +103,60 @@ def ids(rows) -> list:
 
 
 def everything(api: PyAppleBooks, rows: dict) -> dict:
-    """Every facade read method, as the MCP calls them, with each
-    result's relations traversed: ``{name: comparable result}``."""
-    def books(result):
-        return [(b.id, b.title, ids(b.annotations), ids(b.collections)) for b in result]
+    """Every facade method, as the MCP calls it, with each result's
+    relations traversed: ``{case label: comparable result}`` over the
+    registered drift cases (``tests/drift_cases``)."""
+    return drift_cases.everything(api, rows)
 
-    def annotations(result):
-        return [(a.id, a.selected_text, getattr(a.book, "id", None)) for a in result]
 
-    after = dt.datetime(2026, 1, 1)
-    return {
-        "list_collections": [(c.id, ids(c.books)) for c in api.list_collections()],
-        "get_collection_by_id": ids(api.get_collection_by_id(rows["shelf"]).books),
-        "get_collection_by_title": [c.id for c in api.get_collection_by_title("shel")],
-        "list_books": books(api.list_books()),
-        "list_books(all)": books(api.list_books(include_store_series=True)),
-        "get_book_by_id": books([api.get_book_by_id(rows["reading"])]),
-        "get_book_by_title": books(api.get_book_by_title("book")),
-        "get_books_by_genre": books(api.get_books_by_genre("fic", limit=10)),
-        "list_annotations": annotations(api.list_annotations(order_by="-creation_date")),
-        "list_annotations(deleted)": annotations(api.list_annotations(include_deleted=True)),
-        "get_annotation_by_id": annotations([api.get_annotation_by_id(rows["note"])]),
-        "get_annotations_by_color": annotations(api.get_annotations_by_color("yellow")),
-        "search_highlighted": annotations(api.search_annotation_by_highlighted_text("highlight")),
-        "search_note": annotations(api.search_annotation_by_note("note")),
-        "search_text": annotations(api.search_annotation_by_text("text")),
-        "date_range": annotations(api.get_annotations_by_date_range(after=after)),
-        "in_progress": books(api.get_books_in_progress(order_by="-last_opened_date")),
-        "finished": books(api.get_finished_books()),
-        "unstarted": books(api.get_unstarted_books()),
-        "recently_read": books(api.get_recently_read_books(limit=10)),
-        "recently_read(opened)": books(api.get_recently_read_books(order_by="-last_opened_date")),
-        "reading_location": getattr(api.get_current_reading_location(rows["reading"]), "id", None),
-        "surrounding_text": api.get_annotation_surrounding_text(rows["highlight"]),
-    }
+def public_methods() -> set:
+    return {name for name in dir(PyAppleBooks)
+            if not name.startswith("_") and callable(getattr(PyAppleBooks, name))}
+
+
+class TestRegistry:
+    def test_every_public_method_has_a_drift_case(self):
+        """A stream adding a facade method adds its drift case (or an
+        exemption with a reason) in tests/drift_cases/<stream>.py."""
+        covered, exempt = set(drift_cases.covered()), set(drift_cases.exempt())
+        missing = public_methods() - covered - exempt
+        assert not missing, f"public PyAppleBooks methods without a drift case: {sorted(missing)}"
+
+    def test_a_mixin_method_without_a_case_is_reported(self, monkeypatch):
+        from py_apple_books._api.positions import _PositionsAPI
+
+        monkeypatch.setattr(_PositionsAPI, "probe_without_case", lambda self: None, raising=False)
+        missing = public_methods() - set(drift_cases.covered()) - set(drift_cases.exempt())
+        assert missing == {"probe_without_case"}
+
+    def test_cases_and_exemptions_name_public_methods(self):
+        covered, exempt = set(drift_cases.covered()), set(drift_cases.exempt())
+        assert covered <= public_methods(), sorted(covered - public_methods())
+        assert exempt <= public_methods(), sorted(exempt - public_methods())
+        assert not covered & exempt, sorted(covered & exempt)
+        assert all(reason.strip() for _, reason in drift_cases.exempt().values())
+
+    def test_the_registry_finds_the_modules(self):
+        names = [module.__name__ for module in drift_cases.modules()]
+        assert "tests.drift_cases.facade_110" in names and names == sorted(names)
+        assert drift_cases.method_of("list_books(all)") == "list_books"
+
+    def test_duplicate_labels_and_rows_are_refused(self, monkeypatch):
+        from types import SimpleNamespace
+
+        one = SimpleNamespace(__name__="one", CASES={"list_books": None}, seed=lambda lib, rows: {"x": 1})
+        two = SimpleNamespace(__name__="two", CASES={"list_books": None}, EXEMPT={"close": "r"},
+                              seed=lambda lib, rows: {"x": 2})
+        monkeypatch.setattr(drift_cases, "modules", lambda: [one, two])
+        with pytest.raises(ValueError, match="defined twice"):
+            drift_cases.cases()
+        with pytest.raises(ValueError, match="redefines rows"):
+            drift_cases.seed(None, {})
+        assert drift_cases.exempt() == {"close": ("two", "r")}
+
+    def test_outcome(self):
+        assert drift_cases.outcome(lambda: 5) == 5
+        assert drift_cases.outcome(lambda: {}["k"]) == ("raised", "KeyError", "'k'")
 
 
 class TestOptionalColumn:
