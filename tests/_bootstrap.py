@@ -6,7 +6,8 @@ the backup directory), so the fake HOME must exist before anything
 imports the package. This module therefore never imports py_apple_books:
 it finds the schema SQL through importlib's finder (which doesn't
 execute the package) and builds the stores with plain sqlite3.
-``conftest.py`` calls it at import time.
+``conftest.py`` calls it at import time. Importing this module also
+installs the suite's audit hook (``tests/_fs_audit.py``).
 """
 
 from __future__ import annotations
@@ -19,6 +20,13 @@ import re
 import sqlite3
 import uuid
 from typing import Dict, Optional
+
+from tests import _fs_audit
+
+# The shared audit hook (tests/_fs_audit.py) goes in before anything can
+# import py_apple_books, so record() and block() see every event of the
+# package, including those of its first import.
+_fs_audit.install()
 
 DOCUMENTS = "Library/Containers/com.apple.iBooksX/Data/Documents"
 ENV_PREFIX = "APPLE_BOOKS_"
