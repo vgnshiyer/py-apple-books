@@ -9,7 +9,9 @@ from typing import Dict, List, Optional, Tuple
 from py_apple_books import collection_writer
 from py_apple_books._api._common import (  # noqa: F401 (re-exported: 1.10 private names)
     _annotation_scope,
+    _book_by_id,
     _book_scope,
+    _books_by_asset,
     _id_text,
     _owned_books_filter,
 )
@@ -362,10 +364,7 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
         :raises BookNotFoundError: no book has that id. An
             :class:`IndexError` subclass, so pre-1.10 handlers still work.
         """
-        try:
-            return Book.manager.filter(id=book_id)[0]
-        except IndexError:
-            raise BookNotFoundError(f"No book with id {_id_text(book_id)}.") from None
+        return _book_by_id(book_id)
 
     def get_book_by_title(self, title: str, *, limit: int = None, order_by: str = None,
                           offset: int = None, include_store_series: bool = False) -> ModelIterable:
@@ -611,10 +610,7 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
         per_asset = Annotation.manager.filter(**_LIVE_ANNOTATIONS).count_by("asset_id")
         # Every book row, as annotation.book finds them: Store series
         # items included, and the lowest id for an asset id two rows share.
-        books: Dict[str, Book] = {}
-        for book in Book.manager.all(only=["id", "asset_id", "title"], order_by="id"):
-            if book.asset_id is not None:
-                books.setdefault(book.asset_id, book)
+        books = _books_by_asset()
         per_book = sorted(((books[asset].id, books[asset].title, n)
                            for asset, n in per_asset.items() if asset in books),
                           key=lambda entry: (-entry[2], entry[0]))
