@@ -1,0 +1,8 @@
+# get_chapter_content {"book_id": 1, "chapter_id": "current", "max_chars": 20, "offset": 10} isError=False
+<book_text book_id="1" chapter_id="chap1" offset="10">
+
+Opening words. a sy
+</book_text>
+
+…(returned chars 10–30 of 132 [20 chars]. Call again with offset=30 to continue; 102 chars remaining.)
+(chapter_id "current" read chapter chap1, from your reading position. Pass chapter_id="chap1" with the next offset.)

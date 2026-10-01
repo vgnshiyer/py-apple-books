@@ -1,0 +1,5 @@
+# list_all_books {"limit": 2, "offset": 2} isError=False
+[3] Finished At Zero by Test Author
+[4] Unopened Book by Test Author
+
+Showing 3–4 of 6 books. Next page: offset=4.
