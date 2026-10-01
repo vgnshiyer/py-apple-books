@@ -7,6 +7,19 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from py_apple_books import collection_writer
+from py_apple_books._api._common import (  # noqa: F401 (re-exported: 1.10 private names)
+    _annotation_scope,
+    _book_scope,
+    _id_text,
+    _owned_books_filter,
+)
+from py_apple_books._api.book_info import _BookInfoAPI
+from py_apple_books._api.engagement import _EngagementAPI
+from py_apple_books._api.metadata import _MetadataAPI
+from py_apple_books._api.pdf import _PdfAPI
+from py_apple_books._api.positions import _PositionsAPI
+from py_apple_books._api.reading import _ReadingAPI
+from py_apple_books._api.search import _SearchAPI
 from py_apple_books.content import BookContent, Chapter
 from py_apple_books.db.clause import Q
 from py_apple_books.db.client import (
@@ -36,7 +49,8 @@ from py_apple_books.models import (
     Collection,
     ReadingStatus,
 )
-from py_apple_books.models.book import CONTENT_TYPE_SERIES_CONTAINER, SERIES_DATA_SOURCE
+from py_apple_books.models.annotation import _ALL_ANNOTATIONS, _LIVE_ANNOTATIONS  # noqa: F401 (1.10 names)
+from py_apple_books.models.book import CONTENT_TYPE_SERIES_CONTAINER, SERIES_DATA_SOURCE  # noqa: F401 (1.10 names)
 from py_apple_books.models.manager import ModelIterable, normalize_limit, normalize_offset
 from py_apple_books.utils import APPLE_EPOCH_OFFSET, snap_window
 from py_apple_books.write_safety import _backup_dir_for, _own_backup_dir, _writes_home_store
@@ -54,55 +68,13 @@ from py_apple_books.write_safety import _backup_dir_for, _own_backup_dir, _write
 # the bookmark itself, use :meth:`PyAppleBooks.get_current_reading_location`.
 _ANNOTATION_TYPE_READING_BOOKMARK = int(AnnotationType.READING_POSITION)
 
-# Scope of the user-facing annotation queries. Live: not soft-deleted
-# (ZANNOTATIONDELETED, NULL-safe), not a type-0 deletion tombstone and
-# not the reading-position row. ``include_deleted=True`` gives the
-# pre-1.10 set (everything but the reading-position row). Book.annotations
-# uses a copy of _LIVE_ANNOTATIONS (models can't import this module).
-_LIVE_ANNOTATIONS = {
-    "type__gt": int(AnnotationType.TOMBSTONE),
-    "type__ne": _ANNOTATION_TYPE_READING_BOOKMARK,
-    "is_deleted__isnot": 1,
-}
-_ALL_ANNOTATIONS = {"type__ne": _ANNOTATION_TYPE_READING_BOOKMARK}
-
-
-def _id_text(value) -> str:
-    """``value`` for an error message. An int too long for ``str()``
-    (``sys.get_int_max_str_digits()``) is a valid, if absurd, id."""
-    try:
-        return str(value)
-    except ValueError:
-        return "<an integer too long to print>"
-
-
-def _annotation_scope(include_deleted: bool) -> dict:
-    """Filter keywords for the user-facing annotation queries."""
-    return dict(_ALL_ANNOTATIONS if include_deleted else _LIVE_ANNOTATIONS)
-
-
-def _owned_books_filter() -> dict:
-    """Filter keywords for the books in the user's library.
-
-    Leaves out Apple Books Store series rows the user doesn't own: series
-    containers (``ZCONTENTTYPE`` 5), and Series-source volumes without
-    the redownload (ownership) flag. NULL-safe, so a row with no data
-    source or content type stays in. A predicate whose column the store
-    lacks is dropped, which shows those rows as 1.9.1 did: hiding a row
-    needs all the evidence. Same rule as :attr:`Book.is_store_series_item`.
-    """
-    scope = {}
-    if Book.manager.has_fields("content_type"):
-        scope["content_type__isnot"] = CONTENT_TYPE_SERIES_CONTAINER
-    if Book.manager.has_fields("data_source", "can_redownload"):
-        scope["where"] = Q(data_source__isnot=SERIES_DATA_SOURCE) | Q(can_redownload=1)
-    return scope
-
-
-def _book_scope(include_store_series: bool) -> dict:
-    """Filter keywords for a book list: all rows if ``include_store_series``,
-    else the owned ones."""
-    return {} if include_store_series else _owned_books_filter()
+# Scope of the user-facing annotation queries: _LIVE_ANNOTATIONS, or
+# _ALL_ANNOTATIONS with ``include_deleted=True`` (the pre-1.10 set,
+# everything but the reading-position row). Defined in
+# models/annotation.py, which Book.annotations and the 1.11 search read
+# too; these names are the same objects. The scope helpers
+# (_annotation_scope, _owned_books_filter, _book_scope, _id_text) live in
+# _api/_common.py, shared with the facade's mixins.
 
 
 # One reading-status rule, finished first: FINISHED is ZISFINISHED = 1
@@ -183,7 +155,8 @@ class StoreInfo:
     backup_dir: pathlib.Path
 
 
-class PyAppleBooks:
+class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _EngagementAPI,
+                   _BookInfoAPI, _PdfAPI):
     """Facade class for accessing Apple Books data.
 
     ``PyAppleBooks()`` reads the current user's library: the stores
@@ -886,10 +859,21 @@ def _bind_library(cls) -> None:
     """Make every public method of ``cls`` read its instance's library
     (:func:`use_library`; the current one for ``PyAppleBooks()``). Results
     keep reading it after the call: models and iterables hold the library
-    they were read from."""
+    they were read from.
+
+    Only the methods ``cls`` defines itself (``vars``) are wrapped, so
+    binding a class and then its subclass (or the facade and each of its
+    mixins) wraps every method once."""
     for name, attr in list(vars(cls).items()):
         if not name.startswith("_") and inspect.isfunction(attr):
             setattr(cls, name, _in_library(attr))
 
 
-_bind_library(PyAppleBooks)
+# The facade's mixins (py_apple_books/_api), in base-class order. Their
+# methods are bound like the facade's own, so an inherited method reads
+# the instance's library too.
+_MIXINS = PyAppleBooks.__bases__
+
+for _cls in (PyAppleBooks, *_MIXINS):
+    _bind_library(_cls)
+del _cls

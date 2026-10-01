@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from enum import Enum
 from py_apple_books.models.base import Model
-from py_apple_books.models.annotation import Annotation
+from py_apple_books.models.annotation import _LIVE_ANNOTATIONS, Annotation
 from py_apple_books.models.relations import OneToMany
 from py_apple_books.utils import apple_timestamp_to_datetime
 import pathlib
@@ -109,14 +109,14 @@ class Book(Model):
     # (``is_deleted``) and type-0 tombstones for iCloud sync; we filter
     # those out here so callers asking "what did the user annotate?" get
     # the expected set. The same filter as the annotation queries in
-    # :class:`PyAppleBooks` (``api._LIVE_ANNOTATIONS``; a copy, since
-    # models can't import the facade). For direct access to the bookmark,
-    # use :meth:`PyAppleBooks.get_current_reading_location`.
+    # :class:`PyAppleBooks`: both read ``annotation._LIVE_ANNOTATIONS``
+    # (the relation keeps its own dict of it). For direct access to the
+    # bookmark, use :meth:`PyAppleBooks.get_current_reading_location`.
     annotations = OneToMany(
         related_model=Annotation,
         related_name='book',
         foreign_key='asset_id',
-        extra_filters={'type__gt': 0, 'type__ne': 3, 'is_deleted__isnot': 1},
+        extra_filters=_LIVE_ANNOTATIONS,
     )
 
     if TYPE_CHECKING:
