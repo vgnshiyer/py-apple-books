@@ -165,6 +165,34 @@ class TestBinding:
         assert "probe_titles" not in vars(Facade)
 
 
+def test_every_drift_case_reads_the_instance_library(library, make_library):
+    """At run time: every registered facade call (the drift cases cover
+    every public method) gives the same result on PyAppleBooks(data_dir)
+    as on PyAppleBooks() inside use_library, while the default library
+    holds other rows. An unbound method would read the default one."""
+    from tests import drift_cases
+    from tests.test_schema_drift import seed
+
+    library.add_book("A default library book")
+    lib = make_library()
+    rows = seed(lib)
+    db = LibraryDB(data_dir=lib.data_dir)
+    try:
+        with use_library(db):
+            expected = drift_cases.everything(PyAppleBooks(), rows)
+    finally:
+        db.close()
+    own = PyAppleBooks(data_dir=lib.data_dir)
+    try:
+        assert drift_cases.everything(own, rows) == expected
+    finally:
+        own.close()
+    # The control: the default library gives other results.
+    default = PyAppleBooks()
+    assert {label: drift_cases.outcome(lambda: case(default, rows))
+            for label, case in drift_cases.cases().items()} != expected
+
+
 class TestScopes:
     def test_scopes_are_defined_once(self):
         assert api_module._LIVE_ANNOTATIONS is annotation_module._LIVE_ANNOTATIONS
