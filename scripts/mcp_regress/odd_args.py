@@ -1,4 +1,4 @@
-"""Odd-argument probe of the MCP 0.8.2 tools (read-only).
+"""Odd-argument probe of the MCP 0.8.2 / 0.9.0 tools (read-only).
 
   run OUT.json                 call each tool with an odd argument, save result classes
   compare BASE.json CAND.json  print the transition table; exit 1 on a regression
@@ -15,7 +15,10 @@ Only the class of each result is stored:
   OK <md5[:8]> len=<n>  any other text
 
 compare exits 1 on OK -> EXC, on 'OK notfound' -> anything else, or on a
-call missing from CAND; EXC -> OK is reported as FIXED.
+call missing from CAND; EXC -> OK is reported as FIXED. It exits 2 if
+the two runs used different apple-books-mcp versions (0.9.0 reports
+not-found as an error, 0.8.2 as text). Like harness.py, ``run`` first
+turns off downloads of evicted iCloud files for its process on macOS.
 """
 import argparse
 import hashlib
@@ -25,7 +28,9 @@ import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from harness import private_output, require_snapshot_home, text_of  # noqa: E402
+from harness import (  # noqa: E402
+    disable_materialization, mcp_version, private_output, require_snapshot_home, text_of,
+)
 
 HUGE = 99999999999999999999
 SURROGATE = chr(0xD800)
@@ -68,12 +73,14 @@ def classify(text):
 
 
 def run(out_path):
+    print(f"download of evicted iCloud files turned off: {disable_materialization()}",
+          file=sys.stderr)
     require_snapshot_home()
     target = private_output(out_path)
     import py_apple_books
     from apple_books_mcp import server as s
-    print(f"py_apple_books {py_apple_books.__version__} from {py_apple_books.__file__}",
-          file=sys.stderr)
+    print(f"py_apple_books {py_apple_books.__version__} from {py_apple_books.__file__}; "
+          f"apple-books-mcp {mcp_version()}", file=sys.stderr)
     out = {}
     for name, kwargs in CALLS:
         try:
@@ -83,7 +90,8 @@ def run(out_path):
         out[key_of(name, kwargs)] = result
         print(f"{key_of(name, kwargs):72} {result}")
     json.dump({"lib": py_apple_books.__file__, "version": py_apple_books.__version__,
-               "python": sys.version.split()[0], "out": out}, open(target, "w"), indent=1)
+               "mcp_version": mcp_version(), "python": sys.version.split()[0], "out": out},
+              open(target, "w"), indent=1)
 
 
 def transition(before, after):
@@ -103,8 +111,14 @@ def transition(before, after):
 
 def compare(base_path, cand_path):
     base, cand = (json.load(open(p)) for p in (base_path, cand_path))
+    mcp = {run.get("mcp_version", "0.8.2") for run in (base, cand)}  # older runs: 0.8.2
+    if len(mcp) != 1:
+        print(f"odd_args.py: the runs used different apple-books-mcp versions: {sorted(mcp)}",
+              file=sys.stderr)
+        return 2
     print(f"base: py_apple_books {base.get('version')} ({base.get('python')})  "
-          f"cand: py_apple_books {cand.get('version')} ({cand.get('python')})\n")
+          f"cand: py_apple_books {cand.get('version')} ({cand.get('python')})  "
+          f"apple-books-mcp {mcp.pop()}\n")
     print(f"{'call':72} {'base':22} {'cand':22} verdict")
     counts, failed = {}, False
     for key, before in base["out"].items():

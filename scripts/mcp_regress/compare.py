@@ -1,19 +1,26 @@
 """compare.py BASE_A.json BASE_B.json CANDIDATE.json [DETAIL_DIR]
            [--through STAGE] [--home SNAPSHOT_HOME] [--rules expected.py]
+           [--baseline-release VERSION]
 
 Reports, per tool, how many calls changed between baseline and candidate,
 ignoring calls whose output already differs between the two baseline runs
 (nondeterministic). Then checks the changes against the rules in
-expected.py for every item up to --through STAGE (default final):
+expected.py for every item up to --through STAGE (default final) that
+the baseline release doesn't already have (against 1.10.0: none, so
+every change is unexpected):
 
   UNEXPECTED     changed keys no active item allows
   NEW EXCEPTION  baseline A answered, the candidate raised (even if allowed)
   MISSING        keys of baseline A absent from the candidate
 
 and prints per-item counts of allowed changes. Exits 1 if any of the three
-lists is non-empty, else 0. Prints keys and counts only, never output text.
-DETAIL_DIR gets unified diffs, which hold private library text: keep it
-outside the repo.
+lists is non-empty, else 0; exits 2 if the three runs used different
+apple-books-mcp versions, or the baselines aren't one known release.
+Prints keys and counts only, never output text. DETAIL_DIR gets unified
+diffs, which hold private library text: keep it outside the repo.
+
+The baseline release comes from the runs (harness.py records it; runs
+made before it did are 1.9.1 runs); --baseline-release overrides it.
 """
 import argparse
 import difflib
@@ -47,21 +54,53 @@ def parse_args(argv=None):
     parser.add_argument("--home", help="snapshot HOME the runs used; required unless baseline")
     parser.add_argument("--rules", default=str(HERE / "expected.py"),
                         help="rules module (default: the sibling expected.py)")
+    parser.add_argument("--baseline-release",
+                        help="the py_apple_books release of the baseline runs, if they don't say")
     args = parser.parse_args(argv)
     args.rules_module = load_rules(args.rules)
     try:
         args.stage = args.rules_module.resolve_stage(args.through)
     except ValueError as e:
         parser.error(str(e))
-    if args.stage != "baseline" and not args.home:
-        parser.error(f"--home is required with --through {args.through}")
     return args
+
+
+# Runs recorded before harness.py stored these keys were all 1.9.1
+# baselines (or candidates) driven by apple-books-mcp 0.8.2.
+LEGACY = {"mcp_version": "0.8.2", "lib_release": "1.9.1"}
+
+
+def run_info(run, key):
+    return run.get(key, LEGACY[key])
+
+
+def check_runs(a, b, c, override):
+    """``(baseline_release, problem)``: the release the baselines are,
+    or why the three runs can't be compared."""
+    versions = {run_info(r, "mcp_version") for r in (a, b, c)}
+    if len(versions) != 1:
+        return None, f"the runs used different apple-books-mcp versions: {sorted(versions)}"
+    releases = {run_info(r, "lib_release") for r in (a, b)}
+    if override:
+        return override, None
+    if len(releases) != 1 or None in releases:
+        return None, (f"the baselines are not one known py_apple_books release "
+                      f"({sorted(map(str, releases))}); pass --baseline-release")
+    return releases.pop(), None
 
 
 def main(argv=None):
     args = parse_args(argv)
     rules = args.rules_module
     a, b, c = (json.load(open(p)) for p in (args.base_a, args.base_b, args.candidate))
+    baseline, problem = check_runs(a, b, c, args.baseline_release)
+    if problem:
+        print(f"compare.py: {problem}", file=sys.stderr)
+        return 2
+    if rules.needs_book_sets(args.stage, baseline) and not args.home:
+        print(f"compare.py: --home is required with --through {args.through} against "
+              f"{baseline}", file=sys.stderr)
+        return 2
     detail = private_output(args.detail_dir) if args.detail_dir else None
     if detail:
         detail.mkdir(parents=True, exist_ok=True)
@@ -74,9 +113,9 @@ def main(argv=None):
     new_exc = sorted(k for k, before in a["out"].items()
                      if k in c["out"] and not before.startswith("EXCEPTION")
                      and c["out"][k].startswith("EXCEPTION"))
-    sets = rules.book_sets(args.home) if args.stage != "baseline" else {}
-    allowed = rules.allowed_keys(changed, args.stage, sets)
-    by_item = rules.allowed_by_item(changed, args.stage, sets)
+    sets = rules.book_sets(args.home) if rules.needs_book_sets(args.stage, baseline) else {}
+    allowed = rules.allowed_keys(changed, args.stage, sets, baseline)
+    by_item = rules.allowed_by_item(changed, args.stage, sets, baseline)
     unexpected = [k for k in changed if k not in allowed]
 
     per_tool = defaultdict(lambda: {"calls": 0, "changed": 0, "exc_before": 0, "exc_after": 0,
@@ -104,7 +143,10 @@ def main(argv=None):
             (detail / f"{n:04d}_{tool}.diff").write_text(f"{key}\n{verdict}\n" + "\n".join(diff) + "\n")
 
     print(f"baseline lib:  {a['lib']}\ncandidate lib: {c['lib']}")
-    print(f"through: {args.through} (stage {args.stage}); rules: {args.rules}")
+    print(f"apple-books-mcp {run_info(a, 'mcp_version')}; baseline release {baseline}; "
+          f"candidate version {c.get('lib_version', '?')}")
+    print(f"through: {args.through} (stage {args.stage}); rules: {args.rules}; "
+          f"active items: {', '.join(rules.active_items(args.stage, baseline)) or 'none'}")
     print(f"{len(a['out'])} calls; {len(flaky)} nondeterministic between baseline runs (ignored); "
           f"{len(changed)} changed, {len(changed) - len(unexpected)} allowed, "
           f"{len(unexpected)} unexpected\n")
@@ -122,7 +164,7 @@ def main(argv=None):
     for item, keys in by_item.items():
         print(f"  {item:6} {rules.ITEMS[item]['stage']:10} {len(keys):5d}")
     if not by_item:
-        print("  (none: no items apply at this stage)")
+        print("  (none: no items apply at this stage and baseline)")
     for title, keys in (("UNEXPECTED", unexpected), ("NEW EXCEPTION", new_exc), ("MISSING", missing)):
         print(f"\n{title}: {len(keys)}")
         for key in keys:

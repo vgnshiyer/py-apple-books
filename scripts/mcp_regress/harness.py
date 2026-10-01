@@ -1,19 +1,27 @@
-"""Before/after regression harness for the MCP 0.8.2 read tools (read-only).
+"""Before/after regression harness for the MCP read tools (read-only).
 
-  discover [--force] ARGS.json   pick deterministic call arguments (released 1.9.1 only)
-  run ARGS.json OUT.json         call every read tool, save {call_key: output}
+  discover [--force] ARGS.json   pick deterministic call arguments (a released baseline only)
+  run [--mcp-version V] ARGS.json OUT.json
+                                 call every read tool, save {call_key: output}
 
 Run with HOME pointing at a read-only snapshot of the Books stores (see
-README.md); both commands refuse the real home. Which py_apple_books is used
-is decided by the interpreter and PYTHONPATH; both commands print its path.
-Never calls write tools.
+README.md); both commands refuse the real home. Which py_apple_books
+and apple-books-mcp are used is decided by the interpreter and
+PYTHONPATH; both commands print them. Never calls write tools.
+apple-books-mcp 0.8.2 and 0.9.0 are supported; 0.9.0 adds calls for
+its new tool and arguments.
 
-``discover`` refuses anything but the released py_apple_books 1.9.1 unless
-``--force``: the ids must come from the unscoped 1.9.1 view, so rows a
-later version hides (Store series items, deleted annotations) are still
-exercised. Development trees report version 1.9.1 until the release bump,
-so the check also compares the imported package's sources with the
-release. Run ``discover`` with the baseline venv.
+On macOS both commands first turn off downloads of evicted iCloud files
+for their own process, so a book file that is only in iCloud makes its
+tool fail rather than download (on the baseline and the candidate
+alike).
+
+``discover`` refuses anything but a released baseline (py_apple_books
+1.9.1 or 1.10.0, compared byte for byte with the release sources,
+since development trees report the last release's version until the
+bump) unless ``--force``. The ids come from the unscoped view (Store
+series items and deleted annotations included), so rows a version
+hides are still exercised. Run ``discover`` with a baseline venv.
 
 ARGS.json and OUT.json hold private library data (ids, titles, highlight
 text). Write them under a scratch directory and never commit them; both
@@ -30,10 +38,16 @@ import sys
 import time
 
 MAX_CONTEXT_ANNOTATIONS = 200
-DISCOVER_VERSION = "1.9.1"
-# source_digest() of the py_apple_books 1.9.1 release (the PyPI wheel and
-# the v1.9.1 tag agree).
-DISCOVER_DIGEST = "99e7f4f8ec51d45ee8929f13d91797236935cfdc49681c4e065121b21245f701"
+MAX_CURRENT_CHAPTER_BOOKS = 60
+# source_digest() of the releases discover accepts and compare can name
+# as a baseline (each PyPI wheel and its tag agree).
+RELEASES = {
+    "1.9.1": "99e7f4f8ec51d45ee8929f13d91797236935cfdc49681c4e065121b21245f701",
+    "1.10.0": "e061bd1f64b30870850825e93862d4a9e6db05da6282e2f90eb191590b89b0af",
+}
+DISCOVER_VERSION = "1.9.1"  # kept for scripts that import it
+DISCOVER_DIGEST = RELEASES[DISCOVER_VERSION]
+MCP_VERSIONS = ("0.8.2", "0.9.0")
 BOOKS_DOCUMENTS = pathlib.Path("Library/Containers/com.apple.iBooksX/Data/Documents")
 
 # ``s`` (apple_books_mcp.server) and ``py_apple_books`` are imported in
@@ -85,18 +99,26 @@ def source_digest(lib):
     return h.hexdigest()
 
 
-def release_problem(lib):
-    """Return why ``lib`` is not the released 1.9.1, or None.
+def release_of(lib):
+    """The release ``lib`` is (a RELEASES key), or None.
 
-    The version alone can't tell: development trees report 1.9.1 until the
-    release bump, whatever way they are installed. So the imported sources
-    must also match the release byte for byte.
+    The version alone can't tell: development trees report the last
+    release's version until the bump, whatever way they are installed. So
+    the imported sources must also match the release byte for byte.
     """
     version = getattr(lib, "__version__", None)
-    if version != DISCOVER_VERSION:
+    if version in RELEASES and source_digest(lib) == RELEASES[version]:
+        return version
+    return None
+
+
+def release_problem(lib):
+    """Return why ``lib`` is not a released baseline, or None."""
+    version = getattr(lib, "__version__", None)
+    if version not in RELEASES:
         return f"it reports version {version!r}"
-    if source_digest(lib) != DISCOVER_DIGEST:
-        return f"its sources differ from the {DISCOVER_VERSION} release (a development tree?)"
+    if release_of(lib) is None:
+        return f"its sources differ from the {version} release (a development tree?)"
     return None
 
 
@@ -104,34 +126,94 @@ def require_discover_version(lib, force):
     problem = release_problem(lib)
     if problem is None:
         return
-    msg = (f"discover needs the released py_apple_books {DISCOVER_VERSION} "
-           f"(the unscoped view), but {problem}; imported from {lib.__file__}. "
-           f"Use the baseline venv with {DISCOVER_VERSION} from PyPI")
+    names = " or ".join(RELEASES)
+    msg = (f"discover needs a released py_apple_books ({names}), but {problem}; "
+           f"imported from {lib.__file__}. Use a baseline venv with the release from PyPI")
     if not force:
         print(f"{msg}; pass --force to use it anyway", file=sys.stderr)
         sys.exit(2)
     print(f"warning: {msg} (--force)", file=sys.stderr)
 
 
+def mcp_version():
+    """The installed apple-books-mcp version, or None."""
+    from importlib import metadata
+    try:
+        return metadata.version("apple-books-mcp")
+    except metadata.PackageNotFoundError:
+        return None
+
+
+def version_key(version):
+    return tuple(int(part) for part in re.findall(r"\d+", version or ""))
+
+
+def require_mcp_version(wanted):
+    """Exit 2 unless the installed apple-books-mcp is ``wanted`` (if given)
+    and one this harness knows; return its version."""
+    have = mcp_version()
+    if wanted and have != wanted:
+        print(f"--mcp-version {wanted}, but this interpreter has apple-books-mcp {have}",
+              file=sys.stderr)
+        sys.exit(2)
+    if have not in MCP_VERSIONS:
+        print(f"apple-books-mcp {have} is not one of {', '.join(MCP_VERSIONS)}", file=sys.stderr)
+        sys.exit(2)
+    return have
+
+
+def disable_materialization():
+    """Turn off downloads of evicted (dataless) iCloud files for this
+    process and its children: reading one then fails with EDEADLK. True
+    if the policy is on; False off macOS or on any failure."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        # IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS,
+        # IOPOL_MATERIALIZE_DATALESS_FILES_OFF
+        if libc.setiopolicy_np(3, 0, 1) != 0:
+            return False
+        return libc.getiopolicy_np(3, 0) == 1
+    except (OSError, AttributeError):
+        return False
+
+
+def _unscoped(method, **scope):
+    """``method(**scope)``, or ``method()`` on a release without those
+    keywords (1.9.1 lists every row anyway)."""
+    try:
+        return method(**scope)
+    except TypeError:
+        return method()
+
+
 def discover(path):
     print(f"py_apple_books {py_apple_books.__version__} from {py_apple_books.__file__}",
           file=sys.stderr)
     lib = s.apple_books
-    books = sorted(lib.list_books(), key=lambda b: int(b.id))
+    books = sorted(_unscoped(lib.list_books, include_store_series=True), key=lambda b: int(b.id))
     book_ids = [int(b.id) for b in books]
+    annos = sorted(_unscoped(lib.list_annotations, include_deleted=True), key=lambda a: int(a.id))
+    anno_assets = {a.asset_id for a in annos}
     annotated = []
     for b in books:
-        if len(b.annotations):
+        # 1.10 hides deleted rows from Book.annotations; their books still count.
+        if len(b.annotations) or b.asset_id in anno_assets:
             annotated.append(int(b.id))
     collections = sorted(int(c.id) for c in lib.list_collections())
-    annos = sorted(lib.list_annotations(), key=lambda a: int(a.id))
     hinted = [int(a.id) for a in annos if getattr(a, "location", None) and a.location.chapter_id]
     step = max(1, len(hinted) // MAX_CONTEXT_ANNOTATIONS)
     context_ids = hinted[::step][:MAX_CONTEXT_ANNOTATIONS]
     describe_ids = [int(a.id) for a in annos[:: max(1, len(annos) // 60)]][:60]
     chapter_calls = []
     for bid in book_ids:
-        out = text_of(s.list_book_chapters(bid))
+        try:
+            out = text_of(s.list_book_chapters(bid))
+        except Exception:  # 0.9.0 raises for a book it can't read
+            continue
         ids = [m.group(1) for m in re.finditer(r"\(id=([^)]+)\)\s*$", out, re.M)]
         for cid in (ids[:1] + ids[len(ids) // 2: len(ids) // 2 + 1]):
             chapter_calls.append([bid, cid])
@@ -139,13 +221,17 @@ def discover(path):
     args = dict(book_ids=book_ids, annotated=annotated, collections=collections,
                 context_ids=context_ids, describe_ids=describe_ids,
                 chapter_calls=chapter_calls, revisit_title=revisit_title,
-                colors=["yellow", "green", "blue", "pink", "purple", "underline"])
+                colors=["yellow", "green", "blue", "pink", "purple", "underline"],
+                discovered_with={"py_apple_books": release_of(py_apple_books),
+                                 "apple_books_mcp": mcp_version()})
     json.dump(args, open(path, "w"))
     print(f"books={len(book_ids)} annotated={len(annotated)} collections={len(collections)} "
           f"context={len(context_ids)} (of {len(hinted)} hinted) chapter_calls={len(chapter_calls)}")
 
 
-def calls(a):
+def calls(a, version="0.8.2"):
+    """``(tool, kwargs)`` for every call; apple-books-mcp ``version``
+    0.9.0 and later get the calls for its new tool and arguments too."""
     yield "list_all_collections", {}
     for cid in a["collections"]:
         yield "get_collection_books", {"collection_id": str(cid)}
@@ -184,13 +270,27 @@ def calls(a):
     yield "weekly_digest", {"days": 7}
     yield "library_snapshot", {}
     yield "revisit_book", {"book_title": a["revisit_title"]}
+    if version_key(version) < version_key("0.9.0"):
+        return
+    for query in ("the", "a", "don't"):
+        yield "search_books", {"query": query}
+    # chapter_id defaults to "current": the chapter being read.
+    readable = list(dict.fromkeys(bid for bid, _ in a["chapter_calls"]))
+    step = max(1, len(readable) // MAX_CURRENT_CHAPTER_BOOKS)
+    for bid in readable[::step][:MAX_CURRENT_CHAPTER_BOOKS]:
+        yield "get_chapter_content", {"book_id": bid}
+    yield "list_all_books", {"limit": 50, "offset": 50}
+    yield "list_all_annotations", {"limit": 100, "offset": 100}
+    yield "search_annotations", {"text": "the", "limit": 50, "offset": 50}
+    yield "get_annotations_by_date_range", {"after": "2025-01-01", "order_by": "oldest"}
 
 
-def run(args_path, out_path):
+def run(args_path, out_path, version):
     a = json.load(open(args_path))
     out, timings = {}, {}
-    print("py_apple_books from", py_apple_books.__file__, file=sys.stderr)
-    for name, kwargs in calls(a):
+    print(f"py_apple_books from {py_apple_books.__file__}; apple-books-mcp {version}",
+          file=sys.stderr)
+    for name, kwargs in calls(a, version):
         key = f"{name}({json.dumps(kwargs, sort_keys=True)})"
         t = time.perf_counter()
         try:
@@ -198,7 +298,9 @@ def run(args_path, out_path):
         except Exception as e:  # recorded, compared like any other output
             out[key] = f"EXCEPTION {type(e).__name__}: {e}"
         timings[key] = round(time.perf_counter() - t, 3)
-    json.dump({"lib": py_apple_books.__file__, "out": out, "timings": timings}, open(out_path, "w"))
+    json.dump({"lib": py_apple_books.__file__, "lib_version": py_apple_books.__version__,
+               "lib_release": release_of(py_apple_books), "mcp_version": version,
+               "out": out, "timings": timings}, open(out_path, "w"))
     print(f"{len(out)} calls, {sum(timings.values()):.1f}s total", file=sys.stderr)
 
 
@@ -206,25 +308,30 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
-    d = sub.add_parser("discover", help="write ARGS.json from the 1.9.1 library")
+    d = sub.add_parser("discover", help="write ARGS.json from a released baseline library")
     d.add_argument("args_json")
     d.add_argument("--force", action="store_true",
-                   help=f"accept a py_apple_books other than the {DISCOVER_VERSION} release")
+                   help=f"accept a py_apple_books other than the {' or '.join(RELEASES)} releases")
     r = sub.add_parser("run", help="call every read tool with ARGS.json, write OUT.json")
     r.add_argument("args_json")
     r.add_argument("out_json")
+    r.add_argument("--mcp-version", choices=MCP_VERSIONS,
+                   help="exit 2 unless this is the installed apple-books-mcp")
     return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
     cli = parse_args()
+    print(f"download of evicted iCloud files turned off: {disable_materialization()}",
+          file=sys.stderr)
     import py_apple_books
     if cli.cmd == "discover":
         require_discover_version(py_apple_books, cli.force)
+    version = require_mcp_version(getattr(cli, "mcp_version", None))
     require_snapshot_home()
     target = private_output(cli.args_json if cli.cmd == "discover" else cli.out_json)
     from apple_books_mcp import server as s
     if cli.cmd == "discover":
         discover(target)
     else:
-        run(cli.args_json, target)
+        run(cli.args_json, target, version)
