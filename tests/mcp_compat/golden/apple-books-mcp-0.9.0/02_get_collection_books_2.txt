@@ -1,0 +1,2 @@
+# get_collection_books {"collection_id": "999999"} isError=True
+Error executing tool get_collection_books: No collection with id 999999. Use list_all_collections or search_collections_by_title to find collection ids.

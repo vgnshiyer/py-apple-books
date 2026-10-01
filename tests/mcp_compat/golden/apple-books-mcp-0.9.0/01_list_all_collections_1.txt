@@ -1,0 +1,10 @@
+# list_all_collections {} isError=False
+[1] Library
+[2] Audiobooks
+[3] Books
+[4] Downloaded
+[5] Finished
+[6] PDFs
+[7] My Samples
+[8] Want to Read
+[9] Shelf

@@ -1,0 +1,5 @@
+# get_books_in_progress {"limit": 1} isError=False
+[1] Synthetic Book by Test Author
+  Progress: In Progress (42.0%) | Last Read: 2026-09-20
+
+Showing 1–1 of 2 books. Next page: offset=1.

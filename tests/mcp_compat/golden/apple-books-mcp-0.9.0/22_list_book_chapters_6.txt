@@ -1,0 +1,2 @@
+# list_book_chapters {"book_id": 5} isError=True
+Error executing tool list_book_chapters: Book not available: 'Series Stack' is an Apple Books Store series item that isn't in your library (an unowned volume or a series container), so there is no book file to read.

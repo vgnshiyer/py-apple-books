@@ -1,0 +1,7 @@
+# describe_book {"book_id": "3"} isError=False
+Finished At Zero by Test Author
+  Book id: 3
+  Genre:    History
+  Progress: Finished
+  Readable text: not downloaded (open it in Books to download it)
+  Open in Books: ibooks://assetid/46C018889D985441931D1EEFB2FB4F71

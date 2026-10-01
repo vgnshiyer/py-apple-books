@@ -1,0 +1,7 @@
+# describe_collection {"collection_id": "9"} isError=False
+Shelf
+  Collection id: 9
+  Books: 2
+
+  - [2] Don't Panic by Second Author
+  - [1] Synthetic Book by Test Author

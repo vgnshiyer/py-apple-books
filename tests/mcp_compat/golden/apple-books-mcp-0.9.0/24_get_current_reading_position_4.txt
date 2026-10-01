@@ -1,0 +1,3 @@
+# get_current_reading_position {"book_id": 7} isError=False
+No reading position and no highlights yet — open the book to a chapter and read or highlight something, then try again.
+Open in Books: ibooks://assetid/43C5611539FD5C31899EDFFA5B3D807C

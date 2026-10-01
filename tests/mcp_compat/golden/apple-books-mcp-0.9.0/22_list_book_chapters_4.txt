@@ -1,0 +1,2 @@
+# list_book_chapters {"book_id": 7} isError=True
+Error executing tool list_book_chapters: Book is DRM-protected: 'Locked Store Book' is a DRM-protected Apple Books Store purchase (FairPlay). Its text content cannot be read directly; only imported EPUBs and PDFs are readable.

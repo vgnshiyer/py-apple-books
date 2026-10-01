@@ -1,0 +1,2 @@
+# get_chapter_content {"book_id": 1, "chapter_id": "Chapter 5"} isError=True
+Error executing tool get_chapter_content: No chapter or spine entry with id 'Chapter 5' in this book. Pass an id from the book's table of contents, or a chapter's 1-based order (e.g. "5"). list_book_chapters(1) lists this book's chapters.

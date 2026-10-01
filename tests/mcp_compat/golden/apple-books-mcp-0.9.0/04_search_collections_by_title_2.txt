@@ -1,0 +1,2 @@
+# search_collections_by_title {"title": "nothing like it"} isError=False
+No collections matched 'nothing like it'.
