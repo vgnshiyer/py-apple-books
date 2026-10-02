@@ -256,6 +256,49 @@ def test_the_cache_schema_is_not_trusted(home, reader):
     assert reader.get_cached_book_info("A")["A"].title == "older"
 
 
+_COMPUTED = "printf('%.*c', 10, 'x')"  # harmless, but of any size the file asks
+
+
+@pytest.mark.parametrize("ddl", [
+    "CREATE TABLE T (ZDATABASEKEY, ZBOOKTITLE); INSERT INTO T VALUES ('A', 'from a view'); "
+    "CREATE VIEW ZAEBOOKINFO AS SELECT ZDATABASEKEY, ZBOOKTITLE FROM T",
+    f"CREATE VIEW ZAEBOOKINFO AS SELECT 'A' AS ZDATABASEKEY, {_COMPUTED} AS ZBOOKTITLE",
+    "CREATE VIRTUAL TABLE ZAEBOOKINFO USING fts5(ZDATABASEKEY, ZBOOKTITLE); "
+    "INSERT INTO ZAEBOOKINFO VALUES ('A', 'from a virtual table')",
+    f"CREATE TABLE ZAEBOOKINFO (Z_PK INTEGER PRIMARY KEY, ZDATABASEKEY VARCHAR, ZBOOKAUTHOR VARCHAR, "
+    f"ZBOOKTITLE VARCHAR GENERATED ALWAYS AS ({_COMPUTED}) VIRTUAL); "
+    "INSERT INTO ZAEBOOKINFO (ZDATABASEKEY, ZBOOKAUTHOR) VALUES ('A', 'stored author')",
+    f"CREATE TABLE ZAEBOOKINFO (Z_PK INTEGER PRIMARY KEY, ZDATABASEKEY VARCHAR, ZBOOKAUTHOR VARCHAR, "
+    f"ZBOOKTITLE VARCHAR GENERATED ALWAYS AS ({_COMPUTED}) STORED); "
+    "INSERT INTO ZAEBOOKINFO (ZDATABASEKEY, ZBOOKAUTHOR) VALUES ('A', 'stored author')",
+], ids=["view", "computed_view", "virtual_table", "generated_virtual", "generated_stored"])
+def test_only_an_ordinary_table_is_read(home, reader, spy, ddl):
+    # Every column a read selects must be stored in an ordinary table: a
+    # view, a virtual table or a virtual generated column computes its
+    # values at each read, at any size the file asks. Such a file is
+    # skipped (a generated column is left out, as if absent), and an
+    # older cache answers.
+    folder = home.book_info_dir
+    folder.mkdir(parents=True)
+    con = sqlite3.connect(folder / cache_name("v2"))
+    try:
+        con.executescript(ddl)
+        con.commit()
+    except sqlite3.OperationalError as e:  # pragma: no cover - depends on the SQLite build
+        pytest.skip(f"this SQLite can't build the case: {e}")
+    finally:
+        con.close()
+    home.add_book_info_cache([{"asset_id": "A", "title": "older", "author": "older author"}], version="v1")
+    assert reader.get_cached_book_info("A") == {
+        "A": CachedBookInfo("A", "older", "older author", source=cache_name("v1"))}
+    assert spy.files() == [cache_name("v2"), cache_name("v1")]
+    selects = [sql for sql, _ in spy.statements if sql.startswith("SELECT")]
+    if "GENERATED" in ddl:  # the newest file was read without its generated title
+        assert len(selects) == 2 and "ZBOOKTITLE" not in selects[0]
+    else:  # refused before any SELECT
+        assert len(selects) == 1
+
+
 def test_year_written_as_an_integer_reads_as_text(home, reader):
     home.add_book_info_cache([{"asset_id": "Y", "title": "Y", "year": 2001}])
     assert reader.get_cached_book_info("Y")["Y"].year == "2001"

@@ -453,6 +453,33 @@ def _check_unchanged(path: str, mode: str, before: tuple) -> None:
         raise _SidecarsChanged
 
 
+# How SQLite records an ordinary table ("CREATE VIRTUAL TABLE" for a
+# virtual one).
+_ORDINARY_TABLE = re.compile(r"CREATE\s+TABLE\b", re.IGNORECASE)
+
+
+def _stored_columns(con: sqlite3.Connection) -> set:
+    """The upper-cased names of the stored columns of ZAEBOOKINFO.
+
+    Raises :class:`_Drifted` unless ZAEBOOKINFO is an ordinary table: the
+    file is not ours, and a view or a virtual table would run the file's
+    own expressions at every read, which ``trusted_schema=OFF`` limits to
+    harmless functions but not in size (one call could build a value of
+    gigabytes before the value cap applies). ``PRAGMA table_info`` lists
+    stored columns only, so a generated column is left out, as if absent,
+    and never selected. Books' caches are ordinary Core Data tables.
+    """
+    found = con.execute("SELECT type, rootpage, sql FROM main.sqlite_master "
+                        "WHERE type IN ('table', 'view') AND name = ? COLLATE NOCASE", (_TABLE,)).fetchall()
+    if len(found) != 1:
+        raise _Drifted
+    kind, root, sql = found[0]
+    if (kind != "table" or not isinstance(root, int) or root < 1
+            or not isinstance(sql, str) or not _ORDINARY_TABLE.match(sql)):
+        raise _Drifted
+    return {str(r[1]).upper() for r in _execute(con, f"PRAGMA table_info({_TABLE})")}
+
+
 def _query(path: str, mode: str, ids: Sequence[str], deadline: float) -> Dict[str, _Row]:
     """The rows of ``ids`` from the cache file ``path`` opened in ``mode``."""
     uri = f"file:{quote(path)}?mode=ro" + ("&immutable=1" if mode == _WAL_IMMUTABLE else "")
@@ -460,12 +487,12 @@ def _query(path: str, mode: str, ids: Sequence[str], deadline: float) -> Dict[st
     try:
         con.text_factory = _decode_lenient
         con.set_progress_handler(lambda: time.monotonic() > deadline, _PROGRESS_OPCODES)
-        # The file is not ours: functions its schema uses (in a view or a
-        # trigger) must be harmless ones. A no-op before SQLite 3.31.
+        # The file is not ours: functions its schema uses (in a trigger,
+        # say) must be harmless ones. A no-op before SQLite 3.31.
         con.execute("PRAGMA trusted_schema=OFF")
         con.execute("PRAGMA query_only=1")
         con.execute("BEGIN")  # one consistent snapshot for every statement
-        have = {str(r[1]).upper() for r in _execute(con, f"PRAGMA table_info({_TABLE})")}
+        have = _stored_columns(con)
         if _KEY not in have or not {_TITLE, _AUTHOR} & have:
             raise _Drifted
         found = _select(con, have, ids)
