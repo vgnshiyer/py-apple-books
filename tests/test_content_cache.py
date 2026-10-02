@@ -191,6 +191,41 @@ class TestHits:
         estimated = sum(index.weight for index in kept)
         assert 0.5 * estimated <= used <= 1.25 * estimated
 
+    @pytest.mark.parametrize("shape", ["metadata", "names", "astral"])
+    def test_weight_covers_long_package_strings(self, tmp_path, shape):
+        """Strings from the package document are kept by what they cost,
+        whatever their length: the package metadata isn't kept at all,
+        and the names and paths that are kept (ids, hrefs, properties)
+        are weighed by their size, so a crafted package can't pin memory
+        the weight doesn't show."""
+        big = 2_000_000
+        files = [("c1", "<p>one</p>"), ("c2", "<p>two</p>")]
+        kwargs = {}
+        if shape == "metadata":
+            kwargs["metadata_xml"] = "".join(
+                f"<dc:description>{chr(97 + i) * big}</dc:description>" for i in range(3))
+            kwargs["title"] = "T" * big
+        else:
+            mark = "\U0001F600" if shape == "astral" else ""
+            files[1] = ("c2", "<p>two</p>", {"properties": mark + "p" * big})
+            kwargs["extra_items"] = [("x" * big, mark + "h" * big + ".xhtml",
+                                      "application/xhtml+xml", None)]
+        bundle = write_epub_bundle(tmp_path / "Long.epub", files, toc=[("One", "c1.xhtml")], **kwargs)
+        _epub_index._build_index(_epub_shapes.plain(tmp_path / "warm"), os.stat(tmp_path / "warm"))
+        gc.collect()
+        tracemalloc.start()
+        try:
+            index = _epub_index._build_index(bundle, os.stat(bundle))
+            gc.collect()
+            used = tracemalloc.get_traced_memory()[0]
+        finally:
+            tracemalloc.stop()
+        assert index.book.metadata == {} and index.book.guide == []
+        assert index.book.title == "" and index.book.language == "en"
+        assert used <= index.weight <= 4 * used + 100_000, (used, index.weight)
+        # Text extraction doesn't need what was dropped.
+        assert BookContent(bundle).get_spine_item_text("c2") == "two"
+
     def test_get_chapter_flattens_the_toc_once(self, tmp_path, monkeypatch):
         content = BookContent(_epub_shapes.plain(tmp_path))
         calls = []

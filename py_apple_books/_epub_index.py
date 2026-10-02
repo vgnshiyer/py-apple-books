@@ -39,6 +39,7 @@ import pathlib
 import posixpath
 import re
 import stat as _stat
+import sys
 import threading
 import urllib.parse
 import zipfile
@@ -206,8 +207,9 @@ class _BookIndex:
     :attr book: ebooklib's book from the index-only load, keeping what
         text extraction needs: its text documents (those not read have
         :class:`_Deferred` content), ebooklib's own spine view, language
-        and templates. Binary items, the parsed ToC and page lists are
-        dropped (see :attr:`manifest` and :attr:`chapters`).
+        and templates. Binary items, the parsed ToC and page lists, the
+        package metadata and the guide are dropped (see :attr:`manifest`
+        and :attr:`chapters`).
     :attr opf_dir: The package document's folder in the bundle (as
         ``BookContent`` derives it).
     :attr manifest: manifest id -> ``(href, media type, entry name)``:
@@ -412,6 +414,18 @@ def _build_index(root: pathlib.Path, root_st: os.stat_result) -> _BookIndex:
         ) from e
 
 
+def _str_weight(values: Iterable[Any]) -> int:
+    """The memory taken by the strings among ``values`` (and inside the
+    lists and tuples among them, one level down)."""
+    total = 0
+    for value in values:
+        if isinstance(value, str):
+            total += sys.getsizeof(value)
+        elif isinstance(value, (list, tuple)):
+            total += sum(sys.getsizeof(v) for v in value if isinstance(v, str))
+    return total
+
+
 def _index_from(root: pathlib.Path, root_st: os.stat_result, reader: _IndexReader,
                 book: Any) -> _BookIndex:
     """The :class:`_BookIndex` of a book :class:`_IndexReader` loaded."""
@@ -442,9 +456,10 @@ def _index_from(root: pathlib.Path, root_st: os.stat_result, reader: _IndexReade
     key = _key(root_st, ((name, *reader.keyed[name]) for name in keyed_files))
     # Keep only what text extraction needs: the text documents (those not
     # read stay deferred), ebooklib's spine view, the book's language and
-    # templates. Binary items (their text is refused anyway), the NCX and
-    # ebooklib's parsed ToC and page lists (the chapter list is computed)
-    # are dropped.
+    # templates. Binary items (their text is refused anyway), the NCX,
+    # ebooklib's parsed ToC and page lists (the chapter list is computed),
+    # the package metadata (title, identifiers, descriptions...) and the
+    # guide are dropped.
     # An id is looked up as ebooklib does (its first item), so an id whose
     # first item is binary keeps no item at all (refused, as it was).
     first_is_text: Dict[Any, bool] = {}
@@ -455,24 +470,39 @@ def _index_from(root: pathlib.Path, root_st: os.stat_result, reader: _IndexReade
                   and _content._is_text_media_type(getattr(item, "media_type", None))]
     book.toc = []
     book.pages = []
+    book.metadata = {}
+    book.guide = []
+    book.title = ""
+    book.uid = ""
     for item in book.items:
         if getattr(item, "pages", None):
             item.pages = []
     kept_bytes = sum(len(item.content) for item in book.items
                      if isinstance(item.content, bytes) and not isinstance(item.content, _Deferred))
-    # Calibrated with tracemalloc on synthetic books: about 1 KB
-    # per kept item and 0.5 KB per ToC entry, spine entry and manifest map
-    # entry, plus the navigation documents kept as read.
-    weight = (8192 + 2 * kept_bytes + 1024 * len(book.items)
-              + 512 * (len(chapters) + len(spine) + len(manifest))
-              + sum(len(c.id) + len(c.title) + len(c.href) + len(c.fragment) for c in chapters))
+    manifest_kept = {i: v[:3] for i, v in manifest.items()}
+    # Calibrated with tracemalloc on synthetic books: every string kept, by
+    # its size (names and paths come from the package document, whatever
+    # their length), plus about 0.5 KB per kept item and 0.25 KB per ToC
+    # entry, spine entry and manifest map entry for the objects holding
+    # them, plus the navigation documents kept as read.
+    weight = (8192 + 2 * kept_bytes + 512 * len(book.items)
+              + 256 * (len(chapters) + len(spine) + len(manifest))
+              + sum(_str_weight((c.id, c.title, c.href, c.fragment)) for c in chapters)
+              + _str_weight(vars(book).values())
+              + sum(_str_weight(vars(item).values()) for item in book.items)
+              + sum(_str_weight((getattr(item.content, "entry", None),)) for item in book.items)
+              + sum(_str_weight(pair) for pair in book.spine)
+              + sum(_str_weight((i, *v)) for i, v in manifest_kept.items())
+              + sum(_str_weight((s.item_id, s.href, s.media_type)) for s in spine)
+              + _str_weight(first) + _str_weight(toc_orders) + _str_weight(toc_page_ids)
+              + _str_weight(keyed_files))
     return _BookIndex(
         key=key,
         chapters=chapters,
         spine=spine,
         book=book,
         opf_dir=opf_dir,
-        manifest=MappingProxyType({i: v[:3] for i, v in manifest.items()}),
+        manifest=MappingProxyType(manifest_kept),
         first_spine_index=MappingProxyType(first),
         toc_orders=MappingProxyType(toc_orders),
         toc_page_ids=toc_page_ids,
