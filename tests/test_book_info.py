@@ -1049,6 +1049,46 @@ def test_fork_while_another_thread_is_between_statements(three, reader, monkeypa
         worker.join(timeout=30)
 
 
+def test_close_while_another_thread_is_reading(three, reader, monkeypatch):
+    # close() neither waits for nor disturbs a read in progress: the read
+    # finishes into the old index, which nothing uses again, and the next
+    # call builds a new index from the files.
+    entered, release = threading.Event(), threading.Event()
+    real = book_info._execute
+
+    def execute(con, sql, params=()):
+        if threading.current_thread().name == "reader" and sql.startswith("SELECT"):
+            entered.set()
+            assert release.wait(timeout=20)
+        return real(con, sql, params)
+
+    monkeypatch.setattr(book_info, "_execute", execute)
+    results = []
+    worker = threading.Thread(target=lambda: results.append(reader.get_cached_book_info("A")), name="reader")
+    worker.start()
+    try:
+        assert entered.wait(timeout=10)  # mid-read, holding the old index's build lock and the read lock
+        old = index_of(reader)
+        start = time.monotonic()
+        reader.close()
+        assert time.monotonic() - start < 1.0
+        assert old.dead and index_of(reader) is None
+        start = time.monotonic()
+        with reader.query_deadline(0.3):
+            assert reader.get_cached_book_info("A") == {}  # a new index, waiting its turn to read
+        assert time.monotonic() - start < 1.5
+        new = index_of(reader)
+        assert new is not None and new is not old
+    finally:
+        release.set()
+        worker.join(timeout=30)
+    expected = {"A": CachedBookInfo("A", "A in 26.10", None, source=cache_name(V10))}
+    assert results == [expected]  # the paused read finished normally
+    assert cache_name(V10) in old._memos and new._memos == {}  # its rows stayed in the old index
+    assert reader.get_cached_book_info("A") == expected
+    assert index_of(reader) is new and list(new._memos[cache_name(V10)].rows) == ["A"]
+
+
 # -- folder guards -------------------------------------------------------------------
 
 
