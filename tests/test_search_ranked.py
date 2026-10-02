@@ -115,7 +115,7 @@ SPECIAL_QUERIES = [
 ]
 
 
-def _match_database(rows=("a habit of decision making", "don't panic", "名前 は 太郎")):
+def _match_database(rows=("a habit of decision making", "don't wait", "名前 は 太郎")):
     conn, fts = search._new_database()
     conn.executemany("INSERT INTO ann (rowid, sel, note, rep, asset, live) VALUES (?, ?, '', ?, 'A', 1)",
                      [(i, search.fold_for_match(t), search.fold_for_match(t)) for i, t in enumerate(rows, 1)])
@@ -141,7 +141,7 @@ def test_special_queries_run_every_tier_without_error(query):
 
 @pytest.mark.parametrize("query, items, substring, needle", [
     ("Decision-Making", ("decision", "making"), False, "decision-making"),
-    ("don’t panic", ("don't", "panic"), False, "don't panic"),
+    ("don’t wait", ("don't", "wait"), False, "don't wait"),
     ("NOT habits", ("habits",), False, "not habits"),
     ("the of", ("the of",), False, "the of"),
     ("the", ("the",), False, "the"),
@@ -414,7 +414,7 @@ class TestScope:
 
 # -- superset of search_annotation_by_text -------------------------------------------
 
-WORDS = ["habit", "habits", "decision", "making", "indecision", "Gödel", "GÖDEL", "don’t", "don't",
+WORDS = ["habit", "habits", "decision", "making", "indecision", "Görel", "GÖREL", "don’t", "don't",
          "ﬁnd", "find", "Straße", "strasse", "naïve", "co-operate", "e-mail", "—", "…", "...",
          "memory", "memories", "the", "of", "a", "learning", "x", "50%", "under_score", "“quoted”",
          "名前", "학교에", "café", "cafe\u0301", "\u00a0", "line\nbreak", "tab\tbed"]
@@ -596,7 +596,7 @@ MULTILINGUAL = [
     ("她是一个好姑娘", "姑娘", 1, SUBSTRING),
     ("학교에 갔다", "학교", 1, SUBSTRING),
     ("ذهبت إلى المدرسة", "مدرسة", 1, SUBSTRING),
-    ("Don’t panic", "don't", 1, FTS),
+    ("Don’t wait", "don't", 1, FTS),
     ("don't stop", "don’t", 1, FTS),
     ("to deﬁne terms", "define", 1, FTS),
     ("to define terms", "deﬁne", 1, FTS),
@@ -606,9 +606,9 @@ MULTILINGUAL = [
     ("and so on...", "…", 1, SUBSTRING),
     ("ばかな話", "はか", 0, None),
     ("ばかな話", "ばか", 1, SUBSTRING),
-    ("Kurt Gödel", "GÖDEL", 1, FTS),
-    ("Kurt Gödel", "Go\u0308del", 1, FTS),
-    ("Kurt Godel", "Gödel", 1, FTS),
+    ("Kurt Görel", "GÖREL", 1, FTS),
+    ("Kurt Görel", "Go\u0308rel", 1, FTS),
+    ("Kurt Gorel", "Görel", 1, FTS),
     ("मैं किताब पढ़ता हूँ", "किताब", 1, FTS),
     ("книги на полке", "книги", 1, FTS),
 ]

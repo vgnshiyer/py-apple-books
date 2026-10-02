@@ -103,8 +103,8 @@ class _SearchAPI:
     def search_books(self, query: str, *, limit: Optional[int] = None, order_by: Optional[str] = None,
                      offset: Optional[int] = None, include_store_series: bool = False) -> ModelIterable:
         """Get the books whose title or author contains every word of
-        ``query``, each word in either (``"hobbit tolkien"`` finds The
-        Hobbit by J. R. R. Tolkien), ignoring case, accents and
+        ``query``, each word in either (``"history smith"`` finds a
+        history book by an author named Smith), ignoring case, accents and
         quote/dash style as :meth:`get_book_by_title` does. Store series
         items you don't own are left out unless ``include_store_series``.
 

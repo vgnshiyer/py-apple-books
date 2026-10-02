@@ -73,15 +73,15 @@ def mcp09(api, query) -> list:
 # -- fixtures --------------------------------------------------------------------
 
 BOOKS = [
-    ("The Hobbit and me", "J. R. R. Tolkien"),
+    ("The Lantern and me", "Q. R. Ostrander"),
     ("x y", "Anon"),
-    ("Gödel, Escher, Bach", "Douglas Hofstadter"),
-    ("Don’t Panic", "Some—One"),
+    ("Görel, Esker, Bakh", "Dorian Halvorsen"),
+    ("Don’t Wait", "Some—One"),
     ("ﬁnding Strasse", "Straße Author"),
-    ("Hobbit", None),
+    ("Lantern", None),
     ("50% Off", "C++ Guy"),
     ("under_score", "A. Writer"),
-    ("Hobbit Tales", "Another Tolkien"),
+    ("Lantern Tales", "Another Ostrander"),
     (None, "Untitled Author"),
     ("Naïve Café", "Zoë Q"),
 ]
@@ -91,8 +91,8 @@ BOOKS = [
 def lib(make_library):
     lib = make_library()
     lib.ids = {title: lib.add_book(title, author)["id"] for title, author in BOOKS}
-    lib.series = lib.add_book("Series Hobbit Volume", "J. R. R. Tolkien", data_source=STORE_SERIES)["id"]
-    lib.container = lib.add_book("Hobbit Series", "J. R. R. Tolkien", data_source=STORE_SERIES,
+    lib.series = lib.add_book("Series Lantern Volume", "Q. R. Ostrander", data_source=STORE_SERIES)["id"]
+    lib.container = lib.add_book("Lantern Series", "Q. R. Ostrander", data_source=STORE_SERIES,
                                  content_type=5)["id"]
     return lib
 
@@ -117,17 +117,17 @@ def titles(api, query, **kwargs) -> list:
 
 class TestMatching:
     def test_title_author_and_both(self, books):
-        assert titles(books, "panic") == ["Don’t Panic"]
-        assert titles(books, "hofstadter") == ["Gödel, Escher, Bach"]
-        assert titles(books, "hobbit tolkien") == ["Hobbit Tales", "The Hobbit and me"]
-        assert titles(books, "tolkien hobbit") == titles(books, "hobbit tolkien")
-        assert titles(books, "hobbit tales tolkien") == ["Hobbit Tales"]
-        assert titles(books, "hobbit nobody") == []
+        assert titles(books, "wait") == ["Don’t Wait"]
+        assert titles(books, "halvorsen") == ["Görel, Esker, Bakh"]
+        assert titles(books, "lantern ostrander") == ["Lantern Tales", "The Lantern and me"]
+        assert titles(books, "ostrander lantern") == titles(books, "lantern ostrander")
+        assert titles(books, "lantern tales ostrander") == ["Lantern Tales"]
+        assert titles(books, "lantern nobody") == []
 
     def test_folded(self, books):
-        assert titles(books, "GODEL bach") == ["Gödel, Escher, Bach"]
-        assert titles(books, "don't") == ["Don’t Panic"]
-        assert titles(books, "some-one") == ["Don’t Panic"]
+        assert titles(books, "GOREL bakh") == ["Görel, Esker, Bakh"]
+        assert titles(books, "don't") == ["Don’t Wait"]
+        assert titles(books, "some-one") == ["Don’t Wait"]
         assert titles(books, "finding") == ["ﬁnding Strasse"]
         assert titles(books, "STRASSE author") == ["ﬁnding Strasse"]
         assert titles(books, "naive cafe zoe") == ["Naïve Café"]
@@ -139,7 +139,7 @@ class TestMatching:
         assert titles(books, "c++") == ["50% Off"]
 
     def test_a_word_may_be_part_of_a_longer_one(self, books):
-        assert titles(books, "hob tolk") == ["Hobbit Tales", "The Hobbit and me"]
+        assert titles(books, "lant ostr") == ["Lantern Tales", "The Lantern and me"]
 
     def test_empty_whitespace_and_folded_away(self, lib, books):
         everything = sorted(lib.ids.values())
@@ -164,10 +164,10 @@ class TestMatching:
 
 # -- parity with apple-books-mcp 0.9 --------------------------------------------------
 
-EXACT = ["hobbit", "godel", "don't", "-one", "finding", "strasse", "50%", "c++", "_", "%", "author",
-         "", "   ", "\u200b", "´", "x", "e", "tolkien"]
-SUPERSET = ["hobbit \u200b", "hobbit \u0301", "hobbit ´", "x ¨", " hobbit", "hobbit tolkien", "godel bach",
-            "the hobbit", "escher, bach"]
+EXACT = ["lantern", "gorel", "don't", "-one", "finding", "strasse", "50%", "c++", "_", "%", "author",
+         "", "   ", "\u200b", "´", "x", "e", "ostrander"]
+SUPERSET = ["lantern \u200b", "lantern \u0301", "lantern ´", "x ¨", " lantern", "lantern ostrander", "gorel bakh",
+            "the lantern", "esker, bakh"]
 
 
 class TestParityWithMcp09:
@@ -182,7 +182,7 @@ class TestParityWithMcp09:
     def test_the_counterexamples_of_splitting_before_folding(self, books):
         """Splitting the raw query and folding each word made these match
         nothing, where 0.9 matches."""
-        for query in ("hobbit \u200b", "hobbit \u0301", "hobbit ´", "x ¨"):
+        for query in ("lantern \u200b", "lantern \u0301", "lantern ´", "x ¨"):
             assert mcp09(books, query), query
             assert set(found(books, query)) >= set(mcp09(books, query)), query
         assert found(books, "x ¨") == mcp09(books, "x ¨")
@@ -211,10 +211,10 @@ class TestParityWithMcp09:
 
 class TestScope:
     def test_store_series_rows(self, lib, books):
-        assert lib.series not in found(books, "hobbit")
-        assert lib.series not in found(books, "series hobbit volume tolkien")
-        assert found(books, "series hobbit volume", include_store_series=True) == [lib.series]
-        assert lib.container in found(books, "hobbit", include_store_series=True)
+        assert lib.series not in found(books, "lantern")
+        assert lib.series not in found(books, "series lantern volume ostrander")
+        assert found(books, "series lantern volume", include_store_series=True) == [lib.series]
+        assert lib.container in found(books, "lantern", include_store_series=True)
 
     def test_paging_follows_the_id_order(self, lib, books):
         everything = found(books, "")
@@ -223,14 +223,14 @@ class TestScope:
         assert [b.id for b in result[0:4]] == everything[:4]
         assert [b.id for b in result[4:8]] == everything[4:8]
         assert [b.id for b in books.search_books("", limit=3, offset=3)] == everything[3:6]
-        assert [b.id for b in books.search_books("hobbit", order_by="-id")] == sorted(
-            found(books, "hobbit"), reverse=True)
+        assert [b.id for b in books.search_books("lantern", order_by="-id")] == sorted(
+            found(books, "lantern"), reverse=True)
 
     @pytest.mark.parametrize("kwargs", [{"limit": 0}, {"limit": -1}, {"limit": True}, {"limit": "5"},
                                         {"limit": 1.5}, {"offset": -1}, {"offset": True}])
     def test_bad_limits(self, books, kwargs):
         with pytest.raises(InvalidArgumentError):
-            books.search_books("hobbit", **kwargs)
+            books.search_books("lantern", **kwargs)
 
     def test_good_limits(self, books):
         assert len(books.search_books("", limit=2 ** 64)) == len(books.search_books(""))
@@ -238,18 +238,18 @@ class TestScope:
 
 
 def test_one_statement_with_the_query_in_parameters_only(books, sql_trace):
-    hits = list(books.search_books("hobbit tolkien"))
+    hits = list(books.search_books("lantern ostrander"))
     assert len(hits) == 2 and len(sql_trace) == 1
     sql, params = sql_trace[0]
-    assert "hobbit" not in sql.lower() and "tolkien" not in sql.lower()
-    assert {"hobbit", "tolkien"} <= set(params)
+    assert "lantern" not in sql.lower() and "ostrander" not in sql.lower()
+    assert {"lantern", "ostrander"} <= set(params)
     del sql_trace[:]
-    assert books.search_books("hobbit").count() == 3 and len(sql_trace) == 1
+    assert books.search_books("lantern").count() == 3 and len(sql_trace) == 1
 
 
 def test_without_an_author_column_titles_only(lib, books):
     lib.execute("library", "ALTER TABLE ZBKLIBRARYASSET DROP COLUMN ZAUTHOR")
     books.close()  # read the schema again
-    assert titles(books, "tolkien") == []
-    assert titles(books, "hobbit tales") == ["Hobbit Tales"]
+    assert titles(books, "ostrander") == []
+    assert titles(books, "lantern tales") == ["Lantern Tales"]
     assert found(books, "") == sorted(i for t, i in lib.ids.items() if t is not None)
