@@ -137,7 +137,7 @@ def _no_held_locks():
     """Every test leaves no folder locked."""
     yield
     assert not write_safety._held_fds
-    assert all(state.owner is None for state in write_safety._registry.values())
+    assert write_safety._registry == {}
 
 
 # -- bursts ---------------------------------------------------------------------
@@ -455,7 +455,14 @@ def test_nested_hold_in_one_thread_shares_the_outer_one(tmp_path, backups):
     assert _flock_free(backups)
 
 
-def test_folders_locked_once_each_in_real_path_order(tmp_path, monkeypatch):
+def _key(folder):
+    st = os.stat(folder)
+    return ("inode", st.st_dev, st.st_ino)
+
+
+def test_folders_locked_once_each_in_inode_order(tmp_path, monkeypatch):
+    """Each folder once, however it is spelled, in (device, inode)
+    order, which every process agrees on."""
     a, b = tmp_path / "a", tmp_path / "b"
     a.mkdir()
     b.mkdir()
@@ -464,15 +471,218 @@ def test_folders_locked_once_each_in_real_path_order(tmp_path, monkeypatch):
     hold = write_safety._hold_folder
 
     @contextlib.contextmanager
-    def spy(path, deadline):
-        order.append(path)
-        with hold(path, deadline):
+    def spy(key, fd, generation, deadline):
+        order.append(key)
+        with hold(key, fd, generation, deadline):
             yield
 
     monkeypatch.setattr(write_safety, "_hold_folder", spy)
-    with write_safety._backup_folder_lock(b, tmp_path / "z-link", a):
-        pass
-    assert order == sorted({os.path.realpath(a), os.path.realpath(b)})
+    with write_safety._backup_folder_lock(b, tmp_path / "z-link", a, tmp_path / "a" / "."):
+        assert len(write_safety._held_fds) == 2
+    assert order == sorted({_key(a), _key(b)})
+
+
+def test_missing_folder_is_keyed_by_real_path(tmp_path):
+    missing = tmp_path / "missing"
+    (tmp_path / "link").symlink_to(missing)
+    assert write_safety._folder_key(str(missing), None) == (
+        "path", os.path.realpath(missing)
+    )
+    with write_safety._backup_folder_lock(missing, tmp_path / "link", timeout=0):
+        assert len(write_safety._registry) == 1
+
+
+def _case_variant(folder):
+    """``folder`` with its last component's letter case swapped, if the
+    volume is case-insensitive (else None)."""
+    variant = folder.with_name(folder.name.swapcase())
+    if not variant.exists():
+        return None
+    return variant
+
+
+def test_two_spellings_of_one_folder_are_one_lock(tmp_path):
+    """A case variant (on a case-insensitive volume) or a symlink of a
+    folder is the same folder: one descriptor, one flock, no wait for
+    itself."""
+    folder = tmp_path / "Backups"
+    folder.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(folder)
+    spellings = [alias]
+    variant = _case_variant(folder)
+    if variant is not None:
+        spellings.append(variant)
+    start = time.monotonic()
+    with write_safety._backup_folder_lock(folder, *spellings, timeout=2):
+        assert len(write_safety._held_fds) == 1
+        assert len(write_safety._registry) == 1
+        assert not _flock_free(folder)
+    assert time.monotonic() - start < 1
+    assert _flock_free(folder)
+
+
+def test_two_spellings_share_one_thread_lock_without_flock(tmp_path, monkeypatch):
+    """Without flock, the thread lock is the only lock: two spellings of
+    one folder must still get the same one."""
+    monkeypatch.setattr(write_safety, "fcntl", None)
+    folder = tmp_path / "Backups"
+    folder.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(folder)
+    other = _case_variant(folder) or alias
+    holding, release = threading.Event(), threading.Event()
+
+    def hold():
+        with write_safety._backup_folder_lock(folder):
+            holding.set()
+            release.wait(30)
+
+    t = threading.Thread(target=hold)
+    t.start()
+    try:
+        assert holding.wait(30)
+        for spelling in (alias, other):
+            with pytest.raises(LibraryBusyError):
+                with write_safety._backup_folder_lock(spelling, timeout=0.05):
+                    pass
+    finally:
+        release.set()
+        t.join(30)
+
+
+def _firmlink_spelling(folder):
+    """``folder`` spelled through macOS's data volume
+    (``/System/Volumes/Data/...``), if that names the same folder."""
+    if sys.platform != "darwin":
+        return None
+    real = os.path.realpath(folder)
+    variant = pathlib.Path("/System/Volumes/Data" + real)
+    try:
+        if not os.path.samefile(variant, real):
+            return None
+    except OSError:
+        return None
+    return variant
+
+
+@pytest.mark.parametrize("spelling", ["case", "firmlink"])
+def test_restore_with_the_backup_folder_spelled_another_way(
+    db, tmp_path, monkeypatch, spelling
+):
+    """The backup in the snapshot folder, named another way (another
+    letter case on a case-insensitive volume, or a macOS firmlink):
+    the restore takes the folder's lock once, without waiting for
+    itself (it used to time out with LibraryBusyError)."""
+    monkeypatch.setattr(write_safety, "books_is_running", lambda: False)
+    monkeypatch.setattr(write_safety, "BACKUP_LOCK_TIMEOUT", 2.0)
+    folder = tmp_path / "Backups"
+    backup = write_safety.backup_library(db, folder)
+    if spelling == "case":
+        other = _case_variant(folder)
+        if other is None:
+            pytest.skip("case-sensitive file system")
+    else:
+        other = _firmlink_spelling(folder)
+        if other is None:
+            pytest.skip("no /System/Volumes/Data firmlink for this folder")
+    start = time.monotonic()
+    snap = write_safety.restore_library(other / backup.name, db, force=True, backup_dir=folder)
+    assert time.monotonic() - start < 1
+    assert snap.parent == folder
+    assert backup.exists()
+
+
+def test_restore_through_a_symlink_locks_the_real_backup_folder(db, tmp_path, monkeypatch):
+    """``backup_path`` a symlink to a backup in another folder: the
+    restore holds both the link's folder and the backup's own, so a
+    write there can't prune the backup halfway."""
+    monkeypatch.setattr(write_safety, "books_is_running", lambda: False)
+    real = tmp_path / "real"
+    backup = write_safety.backup_library(db, real)
+    links = tmp_path / "links"
+    links.mkdir()
+    link = links / backup.name
+    link.symlink_to(backup)
+    seen = {}
+    inner = write_safety._restore_locked
+
+    def spy(*args, **kwargs):
+        seen["real"] = _flock_free(real)
+        seen["links"] = _flock_free(links)
+        return inner(*args, **kwargs)
+
+    monkeypatch.setattr(write_safety, "_restore_locked", spy)
+    write_safety.restore_library(link, db, force=True, backup_dir=links)
+    assert seen == {"real": False, "links": False}
+
+
+def test_registry_keeps_only_folders_in_use(tmp_path):
+    """Entries go when their last hold (or waiter) does: the registry
+    doesn't grow with every folder ever locked."""
+    for i in range(20):
+        folder = tmp_path / f"f{i}"
+        folder.mkdir()
+        with write_safety._backup_folder_lock(folder):
+            assert len(write_safety._registry) == 1
+    assert write_safety._registry == {}
+
+
+def test_registry_entry_stays_while_a_thread_waits(backups):
+    holding, release = threading.Event(), threading.Event()
+    waited = []
+
+    def hold():
+        with write_safety._backup_folder_lock(backups):
+            holding.set()
+            release.wait(30)
+
+    def wait():
+        with write_safety._backup_folder_lock(backups, timeout=30):
+            waited.append(len(write_safety._registry))
+
+    t = threading.Thread(target=hold)
+    t.start()
+    assert holding.wait(30)
+    w = threading.Thread(target=wait)
+    w.start()
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        with write_safety._registry_guard:
+            users = [s.users for s in write_safety._registry.values()]
+        if users == [2]:
+            break
+        time.sleep(0.01)
+    assert users == [2]
+    release.set()
+    t.join(30)
+    w.join(30)
+    assert waited == [1]
+    assert write_safety._registry == {}
+
+
+def test_open_raced_by_a_fork_is_done_again(backups, monkeypatch):
+    """A fork while the folder was being opened (outside the guard) may
+    have given the child an unrecorded copy: that descriptor is closed
+    unused and the folder opened again."""
+    real_open = os.open
+    opened = []
+
+    def forking_open(path, flags, *args):
+        fd = real_open(path, flags, *args)
+        opened.append(fd)
+        if len(opened) == 1:
+            # What the fork hooks do in the parent around a fork.
+            write_safety._before_fork()
+            write_safety._after_fork_in_parent()
+        return fd
+
+    monkeypatch.setattr(write_safety.os, "open", forking_open)
+    with write_safety._backup_folder_lock(backups):
+        assert len(opened) == 2
+        assert write_safety._held_fds == {opened[1]}
+        assert not _flock_free(backups)
+    assert _flock_free(backups)
 
 
 def test_opposite_orders_do_not_deadlock(tmp_path):

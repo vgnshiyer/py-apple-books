@@ -193,42 +193,60 @@ def ensure_books_not_running() -> None:
 # Backup folder lock
 # ---------------------------------------------------------------------------
 #
-# One lock per backup folder (by real path) for threads and processes
-# alike: a thread lock from the registry below, then an exclusive
-# flock(2) on the folder itself (a descriptor opened on the directory,
-# so no lock file is ever created). A flock belongs to the open file
-# description, which a forked child shares: if the child kept its copy,
-# the lock would outlive this process's release. So the fork hooks close
-# the child's copies (never LOCK_UN, which would release this process's
-# lock as well) and give the child a fresh registry. Where flock isn't
-# available (no fcntl, a folder that can't be opened, a file system
-# without flock) the thread lock alone serializes this process.
+# One lock per backup folder for threads and processes alike: a thread
+# lock from the registry below, then an exclusive flock(2) on the folder
+# itself (a descriptor opened on the directory, so no lock file is ever
+# created). A flock belongs to the open file description, which a forked
+# child shares: if the child kept its copy, the lock would outlive this
+# process's release. So every folder descriptor is recorded, and the
+# fork hooks close the child's copies (never LOCK_UN, which would
+# release this process's lock as well) and give the child a fresh
+# registry. Where flock isn't available (no fcntl, a folder that can't
+# be opened, a file system without flock) the thread lock alone
+# serializes this process.
+#
+# A folder is identified by its device and inode, read from the
+# descriptor the flock is taken on: one folder can have many spellings
+# (a symlink, another letter case on a case-insensitive volume, a
+# firmlink such as /System/Volumes/Data/...), and two descriptors on it
+# in one process would conflict with each other. Only a folder that
+# can't be looked at is identified by its real path. Folders are locked
+# in the order of these keys, the same in every process, so two callers
+# can't deadlock.
 #
 # The lock never takes an SQLite or LibraryDB lock.
 
 
 class _FolderLock:
-    """Registry entry for one backup folder: its thread lock and, while
-    a thread holds it, that thread and how deeply it nests the lock."""
+    """Registry entry for one backup folder: its thread lock, the thread
+    holding it, and how many holds hold or wait for it (the entry is
+    dropped when the last one leaves, so the registry only has the
+    folders in use)."""
 
-    __slots__ = ("lock", "owner", "depth")
+    __slots__ = ("lock", "owner", "users")
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.owner: Optional[int] = None
-        self.depth = 0
+        self.users = 0
 
 
-# Guards the registry and the set of locked folder descriptors. Held
-# only for dict and set operations and around opening or closing a
-# folder's descriptor, so that "open, then record" is atomic for a fork
-# (the before-fork hook takes it).
+# Guards the registry and the set of recorded folder descriptors. Held
+# for dict and set operations, around closing a recorded descriptor, so
+# that "close, then forget" is atomic for a fork (the before-fork hook
+# takes it), and, only after a fork raced an open, around opening one
+# again (see _open_folder). A fork, or another folder's lock, waits
+# while it is held: closing a directory descriptor doesn't wait on the
+# disk, but releasing a flock on a network volume may take a round trip.
 _registry_guard = threading.Lock()
 _registry: dict = {}
 _held_fds: set = set()
 # Bumped in a forked child: a hold taken before the fork releases
 # nothing there (its descriptor is already closed, its lock replaced).
 _generation = 0
+# Bumped after every fork, in the parent and the child: a folder opened
+# while it changed may have a copy in a child that isn't recorded.
+_forks = 0
 
 
 def _before_fork() -> None:
@@ -236,16 +254,19 @@ def _before_fork() -> None:
 
 
 def _after_fork_in_parent() -> None:
+    global _forks
+    _forks += 1
     _registry_guard.release()
 
 
 def _after_fork_in_child() -> None:
-    global _registry_guard, _registry, _held_fds, _generation
+    global _registry_guard, _registry, _held_fds, _generation, _forks
     held = _held_fds
     _registry_guard = threading.Lock()
     _registry = {}
     _held_fds = set()
     _generation += 1
+    _forks += 1
     for fd in held:
         try:
             os.close(fd)
@@ -302,10 +323,70 @@ def _acquire_thread_lock(lock: threading.Lock, deadline: float) -> bool:
     return lock.acquire(blocking=False)
 
 
-def _close_folder_fd(fd: int, generation: int) -> None:
+_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_folder(path: str) -> Optional[int]:
+    """A descriptor on the folder ``path``, recorded so that a forked
+    child closes its copy; None without fcntl or when the folder can't
+    be opened (the reason is logged at DEBUG, without the path).
+
+    The folder is opened outside the registry guard, so a slow open (a
+    stale network mount, say) holds up neither forks nor other folders'
+    locks. A fork during that open may have left the child an
+    unrecorded copy, which would keep a flock taken on it alive; then
+    the descriptor is closed unused and the folder opened again under
+    the guard.
+    """
+    if fcntl is None:
+        logger.debug("Backup folder lock: no fcntl here; using a thread lock only.")
+        return None
+    with _registry_guard:
+        forks = _forks
+    try:
+        fd = os.open(path, _OPEN_FLAGS)
+    except OSError as e:
+        logger.debug(
+            "Backup folder lock: can't open the folder (%s); using a thread lock only.",
+            _errno_name(e),
+        )
+        return None
+    with _registry_guard:
+        if forks == _forks:
+            _held_fds.add(fd)
+            return fd
+    os.close(fd)
+    with _registry_guard:
+        try:
+            fd = os.open(path, _OPEN_FLAGS)
+        except OSError as e:
+            logger.debug(
+                "Backup folder lock: can't open the folder (%s); using a thread lock only.",
+                _errno_name(e),
+            )
+            return None
+        _held_fds.add(fd)
+        return fd
+
+
+def _folder_key(path: str, fd: Optional[int]) -> tuple:
+    """What identifies the folder ``path`` (open as ``fd``, or None) in
+    every thread and process, however it is spelled: its device and
+    inode, or, for a folder that can't be looked at (missing, say), its
+    real path."""
+    try:
+        st = os.fstat(fd) if fd is not None else os.stat(path)
+    except OSError:
+        return ("path", os.path.realpath(path))
+    return ("inode", st.st_dev, st.st_ino)
+
+
+def _close_folder_fd(fd: Optional[int], generation: int) -> None:
     """Close (and so unlock) a folder descriptor this process recorded,
     unless a fork has happened since (the child closed it already, and
     the number may name another file by now)."""
+    if fd is None:
+        return
     with _registry_guard:
         if generation != _generation or fd not in _held_fds:
             return
@@ -316,96 +397,95 @@ def _close_folder_fd(fd: int, generation: int) -> None:
             pass
 
 
-def _flock_folder(path: str, deadline: float, generation: int) -> Optional[int]:
-    """An exclusive flock on the folder ``path`` (a real path), polled
-    until ``deadline`` after at least one attempt: the locked
-    descriptor, or None where flock isn't available (the caller's
-    thread lock is then the only lock; the reason is logged at DEBUG).
+def _flock_fd(fd: int, deadline: float) -> bool:
+    """An exclusive flock on the folder descriptor ``fd``, polled until
+    ``deadline`` after at least one attempt: True once taken, False
+    where the file system doesn't support flock (logged at DEBUG).
 
     :raises LibraryBusyError: another process held it past the deadline.
     """
-    if fcntl is None:
-        logger.debug("Backup folder lock: no fcntl here; using a thread lock only.")
-        return None
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
-    with _registry_guard:
-        try:
-            fd = os.open(path, flags)
-        except OSError as e:
-            logger.debug(
-                "Backup folder lock: can't open the folder (%s); using a thread lock only.",
-                _errno_name(e),
-            )
-            return None
-        _held_fds.add(fd)
     pause = _POLL_FIRST
-    try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return fd
-            except OSError as e:
-                if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
-                    # ENOTSUP, EOPNOTSUPP, ENOLCK (network file systems)
-                    # and the like: no flock on this folder.
-                    logger.debug(
-                        "Backup folder lock: flock is unavailable (%s); using a "
-                        "thread lock only.",
-                        _errno_name(e),
-                    )
-                    _close_folder_fd(fd, generation)
-                    return None
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise LibraryBusyError(_LOCK_BUSY_MESSAGE)
-            time.sleep(min(pause, remaining))
-            pause = min(pause + _POLL_STEP, _POLL_MAX)
-    except BaseException:
-        _close_folder_fd(fd, generation)
-        raise
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError as e:
+            if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                # ENOTSUP, EOPNOTSUPP, ENOLCK (network file systems) and
+                # the like: no flock on this folder.
+                logger.debug(
+                    "Backup folder lock: flock is unavailable (%s); using a "
+                    "thread lock only.",
+                    _errno_name(e),
+                )
+                return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LibraryBusyError(_LOCK_BUSY_MESSAGE)
+        time.sleep(min(pause, remaining))
+        pause = min(pause + _POLL_STEP, _POLL_MAX)
+
+
+def _leave_registry(key: tuple, state: _FolderLock, generation: int) -> None:
+    """One hold of ``key`` is over: drop its registry entry if no other
+    hold holds or waits for it (nothing to do after a fork: the
+    registry is the child's own)."""
+    with _registry_guard:
+        if generation != _generation:
+            return
+        state.users -= 1
+        if state.users <= 0 and _registry.get(key) is state:
+            del _registry[key]
 
 
 @contextlib.contextmanager
-def _hold_folder(path: str, deadline: float):
-    """Hold the backup lock of the folder ``path`` (a real path) for the
-    block; see :func:`_backup_folder_lock`. Nested holds by one thread
-    share the outer one."""
+def _hold_folder(key: tuple, fd: Optional[int], generation: int, deadline: float):
+    """Hold the backup lock of the folder ``key`` (see
+    :func:`_folder_key`) for the block: its thread lock, then a flock on
+    ``fd`` (None: the thread lock only). Takes over ``fd``: it is closed
+    when the hold ends, fails, or nests in this thread's own hold of the
+    folder, which it then shares."""
     me = threading.get_ident()
     with _registry_guard:
-        state = _registry.get(path)
+        state = _registry.get(key)
         if state is None:
-            state = _registry[path] = _FolderLock()
-        generation = _generation
-    if state.owner == me:
-        state.depth += 1
-        try:
-            yield
-        finally:
-            state.depth -= 1
-        return
-    if not _acquire_thread_lock(state.lock, deadline):
-        raise LibraryBusyError(_LOCK_BUSY_MESSAGE)
+            state = _registry[key] = _FolderLock()
+        state.users += 1
     try:
-        fd = _flock_folder(path, deadline, generation)
-    except BaseException:
-        state.lock.release()
-        raise
-    state.owner, state.depth = me, 1
-    try:
-        yield
-    finally:
-        state.owner, state.depth = None, 0
-        if fd is not None:
+        if state.owner == me:
             _close_folder_fd(fd, generation)
-        if generation == _generation:
-            state.lock.release()
+            fd = None
+            yield
+            return
+        if not _acquire_thread_lock(state.lock, deadline):
+            raise LibraryBusyError(_LOCK_BUSY_MESSAGE)
+        try:
+            if fd is not None and not _flock_fd(fd, deadline):
+                _close_folder_fd(fd, generation)
+                fd = None
+            state.owner = me
+            try:
+                yield
+            finally:
+                state.owner = None
+                # Unlock the folder before the thread lock: a thread
+                # waiting for it then finds the flock free.
+                _close_folder_fd(fd, generation)
+                fd = None
+        finally:
+            if generation == _generation:
+                state.lock.release()
+    finally:
+        _close_folder_fd(fd, generation)
+        _leave_registry(key, state, generation)
 
 
 @contextlib.contextmanager
 def _backup_folder_lock(*dirs, timeout: Optional[float] = None):
     """Hold the backup lock of every folder in ``dirs`` for the block,
-    against other threads and processes (each folder once, by real path,
-    taken in sorted order so two callers can't deadlock).
+    against other threads and processes (each folder once, however it is
+    spelled, taken in an order every process agrees on, so two callers
+    can't deadlock; see :func:`_folder_key`).
 
     Waits for all of them together up to ``timeout`` seconds (None:
     :data:`BACKUP_LOCK_TIMEOUT`, read now), or until the enclosing
@@ -418,11 +498,26 @@ def _backup_folder_lock(*dirs, timeout: Optional[float] = None):
     :raises LibraryBusyError: the wait ran out; nothing is held then.
     """
     deadline = _lock_deadline(timeout)
-    paths = sorted({os.path.realpath(os.fspath(d)) for d in dirs})
-    with contextlib.ExitStack() as stack:
-        for path in paths:
-            stack.enter_context(_hold_folder(path, deadline))
-        yield
+    with _registry_guard:
+        generation = _generation
+    pending: dict = {}  # key -> descriptor not yet taken over by a hold
+    try:
+        for d in dirs:
+            path = os.fspath(d)
+            fd = _open_folder(path)
+            key = _folder_key(path, fd)
+            if key in pending:
+                _close_folder_fd(fd, generation)
+            else:
+                pending[key] = fd
+        with contextlib.ExitStack() as stack:
+            for key in sorted(pending):
+                fd = pending.pop(key)
+                stack.enter_context(_hold_folder(key, fd, generation, deadline))
+            yield
+    finally:
+        for fd in pending.values():
+            _close_folder_fd(fd, generation)
 
 
 def _make_dirs(path) -> None:
@@ -878,10 +973,14 @@ def restore_library(
 
     From the check onwards it holds the backup folder lock (see
     :func:`backup_library`) of the folder the snapshot goes to and of
-    the backup's own folder, so no concurrent write can prune the
-    backup being restored, or take its pre-write backup halfway through
-    the restore. A missing snapshot folder is created only with
-    ``snapshot``.
+    the backup's own folder (as given and, for a symlink, where the file
+    it points to is), so no concurrent write using this version can
+    prune the backup being restored, or take its pre-write backup
+    halfway through the restore. A missing snapshot folder is created
+    only with ``snapshot``, and before the checks, since the lock needs
+    it: a restore refused after that (or one that waited too long for
+    the lock) may leave that empty folder behind, but changes nothing
+    else.
 
     :param db_path: The library database to overwrite; defaults to the
         Books library (the store the location variables name, else the
@@ -896,12 +995,12 @@ def restore_library(
         library's backups go (see :func:`backup_library`).
     :return: The snapshot's path, or None with ``snapshot=False``.
     :raises BackupValidationError: a pre-restore check failed; nothing
-        was changed.
+        was changed (but see above for the snapshot folder).
     :raises BooksAppRunningError: Books is running; nothing was changed.
     :raises LibraryBusyError: another backup or restore held a backup
         folder for :data:`BACKUP_LOCK_TIMEOUT` seconds (or until the
         enclosing :func:`~py_apple_books.db.query_deadline`); nothing
-        was changed.
+        was changed (but see above for the snapshot folder).
     :raises AmbiguousStoreError: no ``db_path``, and the Books library
         can't be told for sure (several candidate stores) or, with
         ``snapshot`` and without ``force``, can't be read; nothing was
@@ -928,7 +1027,12 @@ def restore_library(
             _make_dirs(backup_dir)
         except OSError as e:
             raise WriteError(f"Pre-restore snapshot failed, nothing restored: {e}") from e
-    with _backup_folder_lock(backup_dir, backup_path.parent):
+    # The backup's folder both as given and where the file really is
+    # (they differ when backup_path is a symlink): a write in either may
+    # prune it.
+    with _backup_folder_lock(
+        backup_dir, backup_path.parent, Path(os.path.realpath(backup_path)).parent
+    ):
         return _restore_locked(backup_path, db_path, backup_dir, force, snapshot)
 
 
