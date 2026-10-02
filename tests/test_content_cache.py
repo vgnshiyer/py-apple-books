@@ -1097,9 +1097,18 @@ class TestThreads:
 def test_synthetic_scale(make_library, tmp_path, small_cache, capsys):
     """5,000 library books, 300 of them with a bundle: every book through
     the gate, with a weight cap that forces eviction. Prints the memory
-    the pass left allocated, and its peak (tracemalloc; reported, not
-    asserted)."""
+    the pass left allocated and its peak (tracemalloc), and the growth of
+    the process's peak resident size over the pass (RSS; it includes
+    tracemalloc's own overhead): reported, not asserted."""
+    import resource
+    import sys
+
     from py_apple_books import PyAppleBooks
+
+    def max_rss_mib():
+        # ru_maxrss is in bytes on macOS, in KiB on Linux.
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return rss / 2**20 if sys.platform == "darwin" else rss / 2**10
 
     lib = make_library()
     lib.populate(books=5000, annotations_per_book=10)
@@ -1121,6 +1130,7 @@ def test_synthetic_scale(make_library, tmp_path, small_cache, capsys):
     api = PyAppleBooks(data_dir=lib.data_dir)
     books = list(api.list_books(limit=None))
     reasons = {}
+    rss_before = max_rss_mib()
     tracemalloc.start()
     started = time.perf_counter()
     for book in books:
@@ -1132,9 +1142,11 @@ def test_synthetic_scale(make_library, tmp_path, small_cache, capsys):
     elapsed = time.perf_counter() - started
     left, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
+    rss_growth = max_rss_mib() - rss_before
     assert reasons.get("None") == 300 and sum(reasons.values()) == 5000, reasons
     assert 0 < cache.stats()["book"] < 300  # evicted down to the cap
     with capsys.disabled():
         print(f"\n[scale] 5000 books, 300 bundles: {elapsed:.2f}s (traced), allocated "
-              f"{left / 2**20:.1f} MiB after, peak {peak / 2**20:.1f} MiB, cache {cache.stats()}")
+              f"{left / 2**20:.1f} MiB after, peak {peak / 2**20:.1f} MiB, peak RSS growth "
+              f"{rss_growth:.1f} MiB, cache {cache.stats()}")
     shutil.rmtree(bundles_dir)
