@@ -124,7 +124,9 @@ class _EngagementAPI:
         :raises InvalidArgumentError: ``limit`` below 1, or a bad
             ``offset``.
         :raises UnsupportedSchemaError: (when the result is read) the
-            store has neither the underline flag nor the style column.
+            store has neither the underline flag nor the style column,
+            or lacks a column ``order_by`` needs (the default order
+            needs the annotation creation date).
         """
         limit, offset = strict_limit(limit), strict_offset(offset)
         return Annotation.manager.filter(
@@ -208,6 +210,8 @@ class _EngagementAPI:
             ``after``, ``before`` or exclusion, or a ``seed`` that isn't a
             string.
         :raises BookNotFoundError: no book has id ``book_id``.
+        :raises UnsupportedSchemaError: ``after`` or ``before`` on a store
+            without the annotation creation date.
         """
         limit, offset = strict_limit(limit), strict_offset(offset)
         day = _eng._local_day(on)

@@ -350,6 +350,23 @@ class TestCandidates:
         # P(first pick has a note) = 2w / (2w + (1 - w)) with w = 0.5: 2/3.
         assert abs(firsts / 500 - 2 / 3) < 0.08
 
+    def test_blank_notes_weigh_one(self, make_library):
+        # A note of only white space is no note: weight 1, as in the
+        # oracle. Counting it twice would give another order.
+        lib = make_library()
+        book = lib.add_book("Blank notes")
+        for i in range(18):
+            lib.add_annotation(book, f"a passage long enough to sample, number {i}.",
+                               note=(None, "   ", " \n\t ")[i % 3], created=local(2026, 1, 1 + i))
+        rows = lib.execute("annotations", "SELECT Z_PK, ZANNOTATIONUUID, ZANNOTATIONNOTE FROM ZAEANNOTATION "
+                                          "WHERE ZANNOTATIONTYPE = 2")
+        assert {r[2] for r in rows} == {None, "   ", " \n\t "}
+        with LibraryDB(data_dir=lib.data_dir) as db, use_library(db):
+            got = ids(PyAppleBooks().sample_highlights(limit=None, on=DAY))
+        assert got == oracle(lib)
+        blank_as_noted = sorted(rows, key=lambda r: (-oracle_key(DAY, None, r[1].upper(), bool(r[2])), r[0]))
+        assert got != [r[0] for r in blank_as_noted]
+
     def test_threads(self, api, populated):
         expected = ids(api.sample_highlights(limit=None, on=DAY))
         results, errors = [], []

@@ -102,3 +102,11 @@ class TestDrift:
         with LibraryDB(data_dir=lib.data_dir) as db, use_library(db):
             with pytest.raises(UnsupportedSchemaError, match="ZANNOTATIONSTYLE"):
                 list(PyAppleBooks().get_underlines())
+
+    def test_default_order_needs_the_creation_date(self, make_library):
+        lib, ids = self.seeded(make_library, "ZANNOTATIONCREATIONDATE")
+        with LibraryDB(data_dir=lib.data_dir) as db, use_library(db):
+            api = PyAppleBooks()
+            with pytest.raises(UnsupportedSchemaError, match="ZANNOTATIONCREATIONDATE"):
+                list(api.get_underlines())
+            assert [a.id for a in api.get_underlines(order_by="id")] == [ids[0]]
