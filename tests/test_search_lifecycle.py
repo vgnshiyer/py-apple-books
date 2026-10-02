@@ -82,11 +82,11 @@ def paused_build(monkeypatch):
     pauses = []
     real_fill = search.AnnotationIndex._fill
 
-    def fill(self, db, pending):
+    def fill(self, db, pending, *args):
         if pauses and not pauses[0].gate.is_set():
             pauses[0].entered.set()
             assert pauses[0].gate.wait(timeout=20)
-        return real_fill(self, db, pending)
+        return real_fill(self, db, pending, *args)
 
     monkeypatch.setattr(search.AnnotationIndex, "_fill", fill)
 
@@ -384,7 +384,10 @@ def test_a_retired_generation_is_closed_by_its_last_user(lib, db, monkeypatch):
     assert not is_closed(index._ready.conn)
 
 
-def test_close_never_waits_for_or_aborts_a_build(db, paused_build):
+def test_close_never_waits_for_a_build(db, paused_build):
+    """close() returns at once; the paused builder then leaves the
+    discarded index (closing its database as the last user) and the
+    call completes on the library's new one."""
     pause = paused_build()
     builder, built = in_thread(lambda: len(ranked(db, limit=None)))
     assert pause.entered.wait(10)
@@ -398,8 +401,10 @@ def test_close_never_waits_for_or_aborts_a_build(db, paused_build):
     builder.join(30)
     assert built == [("ok", 200)]  # the running search finished
     assert is_closed(conn)  # closed by its last user
-    assert search._INDEX_KEY not in db._derived
-    assert len(ranked(db, limit=None)) == 200 and index_of(db) is not index
+    assert index.builds == 0 and index.rows_fetched == 0  # it moved on, not built
+    new = index_of(db)
+    assert new is not index and new.builds == 1
+    assert len(ranked(db, limit=None)) == 200 and index_of(db) is new
 
 
 def test_a_discarded_index_takes_no_new_search(db, monkeypatch):
@@ -425,6 +430,198 @@ def test_a_discarded_index_takes_no_new_search(db, monkeypatch):
     # The last attempt of a call searches a closed index rather than fail.
     assert len(index.search(db, search._plan(QUERY), if_discarded=True)) == 200
     assert index.builds == 2 and index._ready is None and index._inside == 0
+
+
+def test_a_build_on_a_discarded_index_stops_at_the_next_chunk(lib, monkeypatch):
+    """close() during a build: the builder (not on its last attempt)
+    reads no chunk after the one in flight, and the call completes on
+    the library's new index."""
+    monkeypatch.setattr(search, "_CHUNK", 20)
+    db = LibraryDB(data_dir=lib.data_dir, query_timeout=None)
+    entered, gate = threading.Event(), threading.Event()
+    real_run = search._run
+
+    def run_insert(conn, fn, deadline, limit):
+        out = real_run(conn, fn, deadline, limit)
+        if getattr(fn, "__name__", "") == "insert" and not entered.is_set():
+            entered.set()  # one chunk in: pause the first build
+            assert gate.wait(20)
+        return out
+
+    monkeypatch.setattr(search, "_run", run_insert)
+    try:
+        builder, built = in_thread(lambda: len(ranked(db, limit=None)))
+        assert entered.wait(10)
+        index = index_of(db)
+        conn = index._pending.conn
+        db.close()
+        gate.set()
+        builder.join(30)
+        assert built == [("ok", 200)]
+        assert index.rows_fetched == search._CHUNK and index.builds == 0
+        assert is_closed(conn) and index._pending is None
+        assert index_of(db) is not index and index_of(db).builds == 1
+    finally:
+        gate.set()
+        db.close()
+
+
+def test_a_wait_for_a_discarded_index_moves_on(db, monkeypatch):
+    """Callers waiting for the build lock or the check lock of an index
+    that close() discards stop waiting and use the library's new index,
+    while the holder of the lock is still busy."""
+    now = [1000.0]
+    monkeypatch.setattr(search, "_clock", lambda: now[0])
+    assert len(ranked(db, limit=None)) == 200
+    first = index_of(db)
+    db.close()
+    # The build lock: a builder of the next index is paused holding it.
+    index = db._derived_cache(search._INDEX_KEY, search.AnnotationIndex)
+    assert index is not first
+    entered, gate = threading.Event(), threading.Event()
+    real_fill = search.AnnotationIndex._fill
+
+    def fill(self, db, pending, *args):
+        if self is index:
+            entered.set()
+            assert gate.wait(20)
+        return real_fill(self, db, pending, *args)
+
+    monkeypatch.setattr(search.AnnotationIndex, "_fill", fill)
+    try:
+        builder, built = in_thread(lambda: len(ranked(db, limit=None)))
+        assert entered.wait(10)
+        waiter, waited = in_thread(lambda: len(ranked(db, limit=None)))
+        deadline = time.monotonic() + 10
+        while index._inside < 2:  # the waiter is inside, at the build lock
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        time.sleep(0.1)
+        db.close()
+        waiter.join(10)
+        assert waited == [("ok", 200)] and index._build_lock.locked()  # the builder is still paused
+    finally:
+        gate.set()
+    builder.join(30)
+    assert built == [("ok", 200)] and index.builds == 0
+    # The check lock: a fingerprint of the current index is due, and
+    # another thread holds the lock.
+    current = index_of(db)
+    assert current is not index and current.builds == 1
+    now[0] += search._RECHECK * 2
+    with current._check_lock:
+        waiter, waited = in_thread(lambda: len(ranked(db, limit=None)))
+        deadline = time.monotonic() + 10
+        while current._inside < 1:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        time.sleep(0.1)
+        db.close()
+        waiter.join(10)
+        assert waited == [("ok", 200)]
+    assert current.builds == 1 and index_of(db) is not current
+
+
+def test_closes_during_cold_searches_stack_no_builds(lib, monkeypatch):
+    """16 threads search while close() runs 40 times, 20 ms apart, during
+    builds: every call returns every hit; a build by a call that can
+    move on (not its last attempt) inserts at most the chunk in flight
+    once its index is discarded; and the last attempts share one index,
+    so at most 3 builds run at once (the current index's, the shared
+    one's, and one finishing its chunk). Before, each close() during a
+    build added one more concurrent full build (5-9 here), and at 20,000
+    annotations the calls waiting behind them hit the 30 s timeout."""
+    lib.populate(books=10, annotations_per_book=100)  # 1,000 more rows
+    expected = len(PyAppleBooks(data_dir=lib.data_dir).search_annotations(QUERY, limit=None))
+    assert expected == 1200
+    monkeypatch.setattr(search, "_CHUNK", 50)
+    local = threading.local()
+    lock = threading.Lock()
+    fills = []  # [index, if_discarded, inserts once the index was discarded]
+    running, most = [0], [0]
+    real_search, real_fill, real_run = (search.AnnotationIndex.search, search.AnnotationIndex._fill,
+                                        search._run)
+
+    def index_search(self, db, plan, **kwargs):
+        local.if_discarded = kwargs.get("if_discarded", False)
+        return real_search(self, db, plan, **kwargs)
+
+    def fill(self, db, pending, *args):
+        record = [self, local.if_discarded, 0]
+        with lock:
+            fills.append(record)
+            running[0] += 1
+            most[0] = max(most[0], running[0])
+        local.fill = record
+        try:
+            return real_fill(self, db, pending, *args)
+        finally:
+            local.fill = None
+            with lock:
+                running[0] -= 1
+
+    def run_insert(conn, fn, deadline, limit):
+        record = getattr(local, "fill", None)
+        if record is not None and getattr(fn, "__name__", "") == "insert":
+            if record[0]._dead:
+                record[2] += 1
+            time.sleep(0.005)  # a build spans several close() calls
+        return real_run(conn, fn, deadline, limit)
+
+    monkeypatch.setattr(search.AnnotationIndex, "search", index_search)
+    monkeypatch.setattr(search.AnnotationIndex, "_fill", fill)
+    monkeypatch.setattr(search, "_run", run_insert)
+    db = LibraryDB(data_dir=lib.data_dir)  # the default 30 s timeout
+    stop = threading.Event()
+
+    def loop():
+        counts = []
+        while not stop.is_set():
+            counts.append(len(ranked(db, limit=None)))
+        return counts
+
+    workers = [in_thread(loop) for _ in range(16)]
+    try:
+        for _ in range(40):
+            time.sleep(0.02)
+            db.close()
+        stop.set()
+        for thread, _ in workers:
+            thread.join(60)
+    finally:
+        stop.set()
+        db.close()
+    results = [result for _, result in workers]
+    assert all(r and r[0][0] == "ok" and r[0][1] and set(r[0][1]) == {expected} for r in results), [
+        r and (r[0][0], r[0][0] == "error" and type(r[0][1]).__name__) for r in results]
+    movable = [record for record in fills if not record[1]]
+    assert movable and max(record[2] for record in movable) <= 1, [record[2] for record in movable]
+    assert most[0] <= 3, most[0]
+
+
+def test_last_attempts_share_one_index(lib, db):
+    """The index a call's last attempt uses: the library's current one,
+    registered, until an index of the library completes a build while
+    not discarded; meanwhile every last attempt gets the registered one,
+    even once it is discarded."""
+    first = db._derived_cache(search._INDEX_KEY, search.AnnotationIndex)
+    assert search._finisher(db, first) is first
+    db.close()
+    second = db._derived_cache(search._INDEX_KEY, search.AnnotationIndex)
+    assert second is not first and first.dead
+    assert search._finisher(db, second) is first
+    # The last attempt finishes on it: one build, of the discarded index.
+    assert len(first.search(db, search._plan(QUERY), if_discarded=True)) == 200
+    assert first.builds == 1 and search._finisher(db, second) is first
+    assert len(ranked(db, limit=None)) == 200  # second builds, not discarded
+    assert second.builds == 1 and db not in search._finishers
+    assert search._finisher(db, second) is second
+    other = LibraryDB(data_dir=lib.data_dir, query_timeout=None)
+    try:
+        current = other._derived_cache(search._INDEX_KEY, search.AnnotationIndex)
+        assert search._finisher(other, current) is current  # per library
+    finally:
+        other.close()
 
 
 def test_a_dropped_index_closes_its_database(db):

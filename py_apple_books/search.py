@@ -29,6 +29,7 @@ import sqlite3
 import threading
 import time
 import unicodedata
+import weakref
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, TypeVar
@@ -84,6 +85,11 @@ _PAGE_CHUNK = 500
 
 # SQLite VM instructions between deadline checks on the private database.
 _PROGRESS_OPCODES = 1000
+
+# Seconds between checks, while waiting for a lock of the index, of
+# whether it was discarded (a caller that can move on to the library's
+# new index then stops waiting).
+_DEAD_POLL = 0.05
 
 # The key of the index in LibraryDB._derived_cache.
 _INDEX_KEY = "annotation_index"
@@ -327,17 +333,35 @@ def _timeout(what: str, limit: Optional[float]) -> QueryTimeoutError:
     return QueryTimeoutError(f"{what} (limit {limit:g} s).", timeout=limit)
 
 
-def _wait(lock: threading.Lock, deadline: Optional[float], limit: Optional[float]) -> None:
+def _wait(lock: threading.Lock, deadline: Optional[float], limit: Optional[float],
+          stop: Optional[Callable[[], bool]] = None) -> None:
     """Acquire ``lock`` by ``deadline`` (None: however long it takes).
 
+    With ``stop``, give up once ``stop()`` is true: it is checked every
+    ``_DEAD_POLL`` seconds while waiting, and once the lock is acquired
+    (which is then released).
+
     :raises QueryTimeoutError: the deadline came first.
+    :raises _Dead: ``stop()`` came true first.
     """
-    if deadline is None:
-        lock.acquire()
-    # Clamped as the pool's waits are: a huge (valid) timeout would
-    # otherwise overflow acquire().
-    elif not lock.acquire(timeout=min(max(0.0, deadline - time.monotonic()), threading.TIMEOUT_MAX)):
-        raise _timeout("Timed out waiting for the annotation search index", limit)
+    while True:
+        if deadline is None:
+            timeout = -1.0 if stop is None else _DEAD_POLL
+        else:
+            # Clamped as the pool's waits are: a huge (valid) timeout
+            # would otherwise overflow acquire().
+            timeout = min(max(0.0, deadline - time.monotonic()), threading.TIMEOUT_MAX)
+            if stop is not None:
+                timeout = min(timeout, _DEAD_POLL)
+        if lock.acquire(timeout=timeout):
+            if stop is not None and stop():
+                lock.release()
+                raise _Dead
+            return
+        if stop is not None and stop():
+            raise _Dead
+        if deadline is not None and (stop is None or time.monotonic() >= deadline):
+            raise _timeout("Timed out waiting for the annotation search index", limit)
 
 
 def _run(conn: sqlite3.Connection, fn: Callable[[sqlite3.Connection], _T],
@@ -459,7 +483,8 @@ class AnnotationIndex:
     search per database), ``_state`` (the fields, held only around
     reading and writing them), then the library's own lock and
     connections (pooled reads). No thread holds two of the first three
-    at once; waits for them end at the statement deadline.
+    at once; waits for them end at the statement deadline. The module's
+    ``_finishers_lock`` is a leaf, held only around its registry.
 
     Freshness: one thread at a time fingerprints the store (see
     :meth:`_check`), at most once per ``_RECHECK`` seconds; the others
@@ -469,9 +494,16 @@ class AnnotationIndex:
     that a caller's deadline stops is continued by the next caller.
 
     ``discard()`` never blocks: it stops new use, and the last search
-    inside closes the databases (a search already inside finishes on
-    them, a build included). In a forked child the index is never used
-    (``dead``); the library makes a new one.
+    inside closes the databases. A search already inside that can move
+    on to the library's new index (any attempt but a call's last, see
+    :func:`_index_hits`) stops fingerprinting and building this one at
+    its next lock wait or build chunk and raises ``_Dead``. A call's
+    last attempt finishes on the databases, a build included, on the
+    one index the last attempts share (:func:`_finisher`). So repeated
+    ``close()`` calls during searches run at most about two builds at
+    once (the library's current index and the shared one), not one more
+    per call. In a forked child the index is never used (``dead``); the
+    library makes a new one.
     """
 
     def __init__(self):
@@ -494,6 +526,15 @@ class AnnotationIndex:
     @property
     def dead(self) -> bool:
         return self._dead or os.getpid() != self._pid
+
+    def _stop(self, if_discarded: bool) -> Optional[Callable[[], bool]]:
+        """What tells a caller to stop its fingerprint or build and move
+        on to the library's new index: None (never) on its last attempt
+        (``if_discarded``)."""
+        return None if if_discarded else self._discarded
+
+    def _discarded(self) -> bool:
+        return self._dead
 
     def _detach_all(self) -> List[sqlite3.Connection]:
         """With ``_state`` held and no search inside: forget both
@@ -600,7 +641,7 @@ class AnnotationIndex:
             gen.ttl_at = None
         return not gen.expired(now)
 
-    def _check(self, db: "LibraryDB") -> Tuple[Optional[_Gen], tuple, bool, float]:
+    def _check(self, db: "LibraryDB", if_discarded: bool = False) -> Tuple[Optional[_Gen], tuple, bool, float]:
         """``(gen, key, ttl, checked)``: the store's fingerprint ``key``
         (and whether a TTL applies), taken at ``checked`` (by this thread,
         or by another less than ``_RECHECK`` seconds ago), and the ready
@@ -610,9 +651,11 @@ class AnnotationIndex:
         checked by the one before it, or reuses its fingerprint. The clock
         is read before the statement, under the lock, so a later
         ``checked`` always comes with a fingerprint taken later.
+
+        :raises _Dead: the index was discarded (unless ``if_discarded``).
         """
         deadline, limit = db._statement_deadline()
-        _wait(self._check_lock, deadline, limit)
+        _wait(self._check_lock, deadline, limit, self._stop(if_discarded))
         try:
             now = _clock()
             with self._state:
@@ -638,18 +681,22 @@ class AnnotationIndex:
         finally:
             self._check_lock.release()
 
-    def _pin_fresh(self, db: "LibraryDB") -> _Gen:
+    def _pin_fresh(self, db: "LibraryDB", if_discarded: bool = False) -> _Gen:
         """A generation built from the store as it is now (as of the last
-        check, at most ``_RECHECK`` seconds ago), pinned."""
+        check, at most ``_RECHECK`` seconds ago), pinned.
+
+        :raises _Dead: the index was discarded before it had to be
+            checked or built (unless ``if_discarded``).
+        """
         while True:
             with self._state:
                 gen = self._pin_if_fresh(_clock())
             if gen is not None:
                 return gen
-            gen, key, ttl, checked = self._check(db)
+            gen, key, ttl, checked = self._check(db, if_discarded)
             if gen is not None:
                 return gen
-            gen = self._build(db, key, ttl, checked)
+            gen = self._build(db, key, ttl, checked, if_discarded)
             with self._state:
                 # What this call built (or found built for its key) is
                 # used even if already due for a check: progress.
@@ -659,13 +706,20 @@ class AnnotationIndex:
 
     # -- build ----------------------------------------------------------------
 
-    def _build(self, db: "LibraryDB", key: tuple, ttl: bool, checked: float) -> _Gen:
+    def _build(self, db: "LibraryDB", key: tuple, ttl: bool, checked: float,
+               if_discarded: bool = False) -> _Gen:
         """The generation for ``key`` (fingerprinted at ``checked``): built,
         or the build in progress continued. A generation or build from a
         fingerprint taken since is used instead: never an older one in
-        place of a newer one."""
+        place of a newer one.
+
+        :raises _Dead: the index was discarded before or during the build
+            (unless ``if_discarded``); the build stops at a chunk
+            boundary, resumable as any.
+        """
+        stop = self._stop(if_discarded)
         deadline, limit = db._statement_deadline()
-        _wait(self._build_lock, deadline, limit)
+        _wait(self._build_lock, deadline, limit, stop)
         try:
             with self._state:
                 ready = self._ready
@@ -688,24 +742,32 @@ class AnnotationIndex:
                                    checked + _TTL_WITHOUT_ZOPT if ttl else None)
                 with self._state:
                     self._pending = pending
-            self._fill(db, pending)
+            self._fill(db, pending, stop)
             gen = _Gen(pending.conn, pending.fts, pending.key, pending.checked, pending.ttl_at)
             with self._state:
                 self._pending = None
                 self._ready = gen
                 self.builds += 1
+                live = not self._dead
+            if live:
+                _end_finisher(db)
             return gen
         finally:
             self._build_lock.release()
 
-    def _fill(self, db: "LibraryDB", pending: _Pending) -> None:
+    def _fill(self, db: "LibraryDB", pending: _Pending, stop: Optional[Callable[[], bool]] = None) -> None:
         """Read the rest of the store into ``pending``, chunk by chunk
-        (a chunk read but not inserted is read again next time)."""
+        (a chunk read but not inserted is read again next time).
+
+        :raises _Dead: ``stop()`` came true (checked before each chunk).
+        """
         ix = _row_index()
         read = list(ix)
         manager = Annotation.manager
         with use_library(db):
             while True:
+                if stop is not None and stop():
+                    raise _Dead
                 after = {} if pending.last is None else {"id__gt": pending.last}
                 rows = manager.filter(only=read, order_by="id", limit=_CHUNK, **after,
                                       **_ALL_ANNOTATIONS).run_query()
@@ -744,7 +806,8 @@ class AnnotationIndex:
         :param if_discarded: search even if ``discard()`` was called (the
             databases are then closed when the search leaves).
         :raises _Dead: the index belongs to another process, or was
-            discarded (unless ``if_discarded``).
+            discarded (unless ``if_discarded``) before the search had a
+            fresh generation: on entry, or while it fingerprinted or built.
         """
         if os.getpid() != self._pid:
             raise _Dead
@@ -753,7 +816,7 @@ class AnnotationIndex:
                 raise _Dead
             self._inside += 1
         try:
-            gen = self._pin_fresh(db)
+            gen = self._pin_fresh(db, if_discarded)
             try:
                 deadline, limit = db._statement_deadline()
                 _wait(gen.lock, deadline, limit)
@@ -861,16 +924,61 @@ def _query(conn: sqlite3.Connection, fts: Optional[str], plan: _Plan, asset_id,
 def _index_hits(db: "LibraryDB", plan: _Plan, **kwargs) -> List[tuple]:
     """The hits of ``plan`` in the library's index. An index discarded by
     ``close()`` once the call got it is replaced by the library's new
-    one; the last attempt uses it anyway, so repeated closes don't fail
-    the search."""
+    one (also mid-way through fingerprinting or building it). The last
+    attempt finishes even on a discarded index, so repeated closes don't
+    fail the search; it uses the index :func:`_finisher` picks, shared
+    by the last attempts of the other calls, so they build it once
+    between them."""
     attempts = 3
     for attempt in range(attempts):
         index = db._derived_cache(_INDEX_KEY, AnnotationIndex)
+        last = attempt == attempts - 1
+        if last:
+            index = _finisher(db, index)
         try:
-            return index.search(db, plan, if_discarded=attempt == attempts - 1, **kwargs)
+            return index.search(db, plan, if_discarded=last, **kwargs)
         except _Dead:
             continue
     raise DBQueryError(_FAILED)
+
+
+# Per library, the index that the last attempts of calls finish on (see
+# _index_hits): the first index a last attempt reached since an index of
+# the library last completed a build while not discarded. Weak keys: a
+# dropped library is still collected.
+_finishers: "weakref.WeakKeyDictionary[LibraryDB, AnnotationIndex]" = weakref.WeakKeyDictionary()
+_finishers_lock = threading.Lock()
+
+
+def _new_finishers_lock() -> None:
+    # As _new_fts5_lock; the parent's indexes in the registry are never
+    # used in the child (see _finisher).
+    global _finishers_lock
+    _finishers_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_new_finishers_lock)
+
+
+def _finisher(db: "LibraryDB", current: AnnotationIndex) -> AnnotationIndex:
+    """The index a call's last attempt searches (even if discarded): the
+    library's registered one, else ``current``, then registered. So the
+    last attempts of all the calls caught in a run of ``close()`` calls
+    share one index (and one build), rather than each finish a build of
+    the index that was current when it got there."""
+    with _finishers_lock:
+        index = _finishers.get(db)
+        if index is None or index._pid != os.getpid():
+            index = _finishers[db] = current
+    return index
+
+
+def _end_finisher(db: "LibraryDB") -> None:
+    """An index of ``db`` completed a build while not discarded: the run
+    of ``close()`` calls is over (the next last attempt picks anew)."""
+    with _finishers_lock:
+        _finishers.pop(db, None)
 
 
 # Above this, a page's ``offset + limit`` ranks every hit (SQLite's
