@@ -26,7 +26,7 @@ import operator
 import re
 import threading
 import unicodedata
-from typing import Dict, Iterator, List, Optional, Pattern, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 __all__ = [
     "fold_for_match",
@@ -140,7 +140,7 @@ def fold_for_match(s) -> Optional[str]:
 # threads, free-threaded builds included). Characters above U+FFFF are
 # rare in book text and are folded per call instead.
 _FOLD_LOCK = threading.Lock()
-_FOLD_TABLES: Optional[Tuple[Dict[int, str], Pattern, frozenset]] = None
+_FOLD_TABLES: Optional[Tuple[Dict[int, str], re.Pattern, frozenset]] = None
 
 # ASCII whitespace other than ' ' (\t \n \v \f \r and U+001C-U+001F), which
 # folds to ' ' like every whitespace character.
@@ -148,7 +148,7 @@ _ASCII_SPACES = {cp: " " for cp in range(0x80) if chr(cp).isspace() and cp != 0x
 _SPACE_RUN = re.compile(" {2,}")
 
 
-def _fold_tables() -> Tuple[Dict[int, str], Pattern, frozenset]:
+def _fold_tables() -> Tuple[Dict[int, str], re.Pattern, frozenset]:
     """``(table, irregular, zero_marks)``, built on first use.
 
     * ``table``: code point → fold, for the BMP characters whose fold is
@@ -170,7 +170,7 @@ def _fold_tables() -> Tuple[Dict[int, str], Pattern, frozenset]:
     return tables
 
 
-def _build_fold_tables() -> Tuple[Dict[int, str], Pattern, frozenset]:
+def _build_fold_tables() -> Tuple[Dict[int, str], re.Pattern, frozenset]:
     table: Dict[int, str] = {}
     irregular: List[int] = []
     zero_marks = set()
@@ -348,8 +348,8 @@ def finditer_folded(text: str, query) -> Iterator[Tuple[int, int]]:
 
     A match that starts or ends inside the fold of one character (an
     ``s`` of ``ß``) is widened to the whole character, and a match is
-    extended over the combining accents that follow it, so a span never
-    ends inside a character. The query is converted like
+    extended over the combining accents that follow it (the ones the fold
+    drops), so a decomposed letter is never cut from its accent. The query is converted like
     :func:`fold_for_match`'s input (``None`` and ``bytes`` included), and
     its leading and trailing whitespace is ignored; a query that folds to
     nothing (empty, whitespace only, or only characters the fold drops)
