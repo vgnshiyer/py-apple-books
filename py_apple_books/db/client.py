@@ -1097,7 +1097,7 @@ class LibraryDB:
                     if pooled.busy != _BUSY_TIMEOUT or (
                             deadline is not None and deadline - time.monotonic() < _BUSY_TIMEOUT):
                         self._limit_busy_wait(pooled, deadline)
-                    return self._call(fn, pooled)
+                    return self._call(fn, pooled, deadline)
                 finally:
                     # Strict again for the next checkout (connection()).
                     conn.text_factory = str
@@ -1140,14 +1140,16 @@ class LibraryDB:
         # which quotes the cell, is neither its cause nor its context.
         raise DBQueryError(f"Error executing query: {message}")
 
-    def _call(self, fn: Callable[[_Pooled], _T], pooled: _Pooled) -> _T:
+    def _call(self, fn: Callable[[_Pooled], _T], pooled: _Pooled,
+              deadline: Optional[float]) -> _T:
         """``fn(pooled)``, reading text leniently once this library is
         known to hold invalid UTF-8.
 
         A decode error makes the library lenient for good and runs ``fn``
-        once more, on the same connection and under the same deadline,
-        with :func:`_decode_lenient` as the ``text_factory`` (the caller
-        sets it back to ``str``).
+        once more, on the same connection and under the same deadline
+        (``deadline``: SQLite waits for a lock no longer than the time
+        left), with :func:`_decode_lenient` as the ``text_factory`` (the
+        caller sets it back to ``str``).
         """
         conn = pooled.conn
         if self._lenient_text:
@@ -1161,6 +1163,8 @@ class LibraryDB:
         # Out of the except block, so an error of the retry doesn't chain
         # to the decode error, whose message quotes the cell.
         self._make_lenient()
+        if deadline is not None:
+            self._limit_busy_wait(pooled, deadline)
         conn.text_factory = _decode_lenient
         return fn(pooled)
 

@@ -12,6 +12,7 @@ Synthetic libraries only; the invalid bytes are written with
 import logging
 import sqlite3
 import threading
+import time
 import uuid
 
 import pytest
@@ -192,6 +193,71 @@ def test_the_retry_uses_the_same_connection(bad):
     with LibraryDB(data_dir=bad.data_dir, max_connections=1, max_idle=1, query_timeout=5) as db:
         assert db.execute(TITLES) == [(FINE,), (REPLACED,)]
         assert len(db._idle) == 1 and db._idle[0].conn.text_factory is str
+
+
+def _slow_first_attempt(monkeypatch, seconds, then=None):
+    """Make the first attempt of a statement that meets invalid text
+    seem to take ``seconds`` (then run ``then()``) before the retry."""
+    make_lenient = LibraryDB._make_lenient
+
+    def slow(self):
+        time.sleep(seconds)
+        if then is not None:
+            then()
+        make_lenient(self)
+
+    monkeypatch.setattr(LibraryDB, "_make_lenient", slow)
+
+
+def test_the_retry_waits_for_a_lock_no_longer_than_the_time_left(bad, monkeypatch):
+    _slow_first_attempt(monkeypatch, 0.5)
+    waits = []
+
+    def fn(conn):
+        waits.append(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        return conn.execute(TITLES).fetchall()
+
+    with LibraryDB(data_dir=bad.data_dir, query_timeout=4) as db:
+        assert db._run(fn) == [(FINE,), (REPLACED,)]
+    first, retry = waits
+    assert 3000 < first <= 4000 and first - retry >= 450
+
+
+def test_a_lock_taken_before_the_retry_stops_it_at_the_deadline(bad, monkeypatch):
+    """Another connection locks the store between the first attempt and
+    the retry: the retry gives up when the statement's time is up, not
+    a whole limit later."""
+    held, release = threading.Event(), threading.Event()
+
+    def locker():
+        conn = sqlite3.connect(bad.library_path, isolation_level=None)
+        try:
+            conn.execute("BEGIN EXCLUSIVE")  # a DELETE-journal store: readers wait
+            held.set()
+            release.wait(timeout=30)
+            conn.execute("ROLLBACK")
+        finally:
+            conn.close()
+
+    thread = threading.Thread(target=locker, daemon=True)
+
+    def lock():
+        thread.start()
+        assert held.wait(timeout=10)
+
+    _slow_first_attempt(monkeypatch, 0.8, lock)
+    try:
+        with LibraryDB(data_dir=bad.data_dir, query_timeout=1.0) as db:
+            start = time.monotonic()
+            with pytest.raises(QueryTimeoutError, match="locked database") as exc:
+                db.execute(TITLES)
+            elapsed = time.monotonic() - start
+    finally:
+        release.set()
+        thread.join(timeout=10)
+    assert elapsed < 1.5  # 0.8 s, then what was left of 1 s; not 0.8 s + 1 s
+    cause = exc.value.__cause__
+    assert isinstance(cause, sqlite3.OperationalError) and cause.__context__ is None
 
 
 def test_an_error_of_the_retry_is_not_chained_to_the_decode_error(db):
