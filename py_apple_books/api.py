@@ -124,6 +124,13 @@ class LibraryStats:
     None). ``annotations_per_book`` holds ``(book id, title, count)``
     for every book with annotations, most annotated first (ties by id);
     the title is None for a book without one.
+
+    ``orphan_assets`` (1.11) breaks ``orphan_annotations`` down by the
+    asset id the annotations name: ``(asset id, count)`` for every asset
+    id no book row has; its counts add up to ``orphan_annotations``. Most
+    annotations first; among equal counts None comes last, and other ids
+    sort by type name, then value. The ids are as stored, so None, ``''``
+    and a bytes value are distinct entries.
     """
 
     total_books: int
@@ -133,6 +140,7 @@ class LibraryStats:
     total_annotations: int
     orphan_annotations: int
     annotations_per_book: Tuple[Tuple[int, Optional[str], int], ...] = ()
+    orphan_assets: Tuple[Tuple[Optional[str], int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -651,14 +659,17 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
         per_book = sorted(((books[asset].id, books[asset].title, n)
                            for asset, n in per_asset.items() if asset in books),
                           key=lambda entry: (-entry[2], entry[0]))
+        orphans = sorted(((asset, n) for asset, n in per_asset.items() if asset not in books),
+                         key=_orphan_order)
         return LibraryStats(
             total_books=sum(counts.values()),
             finished_books=counts[ReadingStatus.FINISHED],
             in_progress_books=counts[ReadingStatus.IN_PROGRESS],
             unstarted_books=counts[ReadingStatus.UNSTARTED],
             total_annotations=sum(per_asset.values()),
-            orphan_annotations=sum(n for asset, n in per_asset.items() if asset not in books),
+            orphan_annotations=sum(n for _, n in orphans),
             annotations_per_book=tuple(per_book),
+            orphan_assets=tuple(orphans),
         )
 
     # -- content actions --
@@ -894,6 +905,15 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
             chars_before,
             chars_after,
         )
+
+
+def _orphan_order(entry) -> tuple:
+    """Sort key of a ``LibraryStats.orphan_assets`` entry: most
+    annotations first, then None last, then by type name and value, so
+    raw keys of mixed types (None, str, bytes) never compare across
+    types."""
+    key, count = entry
+    return (-count, key is None, type(key).__name__, key if key is not None else "")
 
 
 def _quoted_title(book) -> str:
