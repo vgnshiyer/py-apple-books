@@ -36,7 +36,8 @@ CONTENT_TYPE_PDF = 3
 # The 1.11 fields' conversions. Each is tolerant (a value of the wrong
 # type or shape reads as None rather than failing the list the row is in)
 # and idempotent (a value it already produced is kept), so a Book built
-# from another one's fields keeps them.
+# from another one's fields keeps them; high_water_progress excepted,
+# which is converted to a percent like reading_progress is.
 _YEAR_TEXT = re.compile(r"[0-9]{4}")
 _FLAGS = {0: False, 1: True, "0": False, "1": True}
 
