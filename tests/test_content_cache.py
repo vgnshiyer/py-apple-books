@@ -888,6 +888,38 @@ class TestThreads:
         worker.join(10)
         assert _epub_index._CACHE.stats() == {"weight": 0}
 
+    def test_a_call_after_a_clear_does_not_take_an_older_build(self, tmp_path, monkeypatch, begins):
+        # An anchor table has no files to re-check, so a caller after
+        # clear_content_cache() must build its own instead of waiting for
+        # (and taking) the value of a build that began before the clear.
+        bundle = _epub_shapes.gutenberg(tmp_path)
+        started, release = threading.Event(), threading.Event()
+        parses = []
+        real = _epub_index._anchor_table
+
+        def paused(raw):
+            parses.append(1)
+            if len(parses) == 1:
+                started.set()
+                release.wait(5)
+            return real(raw)
+
+        monkeypatch.setattr(_epub_index, "_anchor_table", paused)
+        worker = threading.Thread(target=lambda: _epub_index._anchor_table_for(bundle, "OEBPS/body.xhtml"))
+        worker.start()
+        try:
+            assert started.wait(5)
+            clear_content_cache()
+            table = _epub_index._anchor_table_for(bundle, "OEBPS/body.xhtml")
+        finally:
+            release.set()
+            worker.join(10)
+        assert begins.calls == [("anchor", True), ("anchor", True)]
+        assert len(parses) == 2 and set(table) == {"ch1", "ch2", "ch3"}
+        # Only the build after the clear is kept.
+        assert _epub_index._CACHE.stats() == {"anchor": 1, "weight": table.weight}
+        assert _epub_index._anchor_table_for(bundle, "OEBPS/body.xhtml") is table
+
     def test_many_threads_many_calls(self, tmp_path):
         bundles = [SHAPES[name](tmp_path) for name in ("plain", "gutenberg", "toc_pages")]
         expected = {}
