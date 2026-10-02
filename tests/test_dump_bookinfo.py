@@ -211,6 +211,18 @@ def test_unreadable_cache_is_a_note_and_the_stores_are_dumped(lib, folder, tmp_p
     assert str(folder) not in err
 
 
+def test_lstat_failure_is_a_note_without_the_path(lib, tmp_path, capsys):
+    # The container's Library is a file: lstat of the cache folder fails
+    # with ENOTDIR, which is not "no cache" and must not end the dump.
+    (lib.data_dir.parent / "Library").write_text("not a folder")
+    assert dump(lib, tmp_path / "out") == 0
+    fixture = fixture_dir(tmp_path / "out")
+    assert sorted(p.name for p in fixture.iterdir()) == STORE_FILES
+    err = capsys.readouterr().err
+    assert "note: AEBookInfo.sql not written: [Errno" in err
+    assert str(lib.data_dir.parent) not in err
+
+
 def test_cache_without_the_table_is_refused(folder):
     path = folder / CACHE_NAME
     con = sqlite3.connect(path)

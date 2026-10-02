@@ -451,6 +451,9 @@ def _book_info_or_none(data_dir: pathlib.Path) -> Optional[Tuple[str, dict]]:
     except DumpError as e:
         print(f"note: {BOOK_INFO}.sql not written: {e}", file=sys.stderr)
         return None
+    except OSError as e:  # an lstat on the way failed: not a missing file
+        print(f"note: {BOOK_INFO}.sql not written: {_os_error(e)}", file=sys.stderr)
+        return None
     return sql, info
 
 
