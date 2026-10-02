@@ -198,7 +198,7 @@ def test_a_long_query_plans_fast():
     queries = ["x" * MAX_QUERY_LENGTH, ("word " * 2000)[:MAX_QUERY_LENGTH],
                ("名前" * 5000)[:MAX_QUERY_LENGTH], ("-.,;" * 2500)[:MAX_QUERY_LENGTH]]
     for query in queries:
-        best = min(_timed(lambda: search._plan(query)) for _ in range(3))
+        best = min(_timed(lambda q=query: search._plan(q)) for _ in range(3))
         assert best < 0.05, (query[:10], best)
 
 
@@ -429,7 +429,7 @@ def corpus(lib, ranked):
     rng = random.Random(77)
     books = [lib.add_book(f"Book {i}") for i in range(3)]
     texts = []
-    for i in range(120):
+    for _ in range(120):
         sel = _sentence(rng)
         note = _sentence(rng) if rng.random() < 0.3 else None
         surrounding = f"{_sentence(rng)} {sel} {_sentence(rng)}" if rng.random() < 0.7 else None
