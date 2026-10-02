@@ -411,6 +411,31 @@ def test_fork(db):
     assert len(ranked(db, limit=None)) == 200 and parents.builds == 1
 
 
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_fork_while_fts5_is_being_probed(monkeypatch):
+    """A child forked while a thread holds the FTS5 probe's lock gets a
+    lock of its own, rather than waiting forever in fts5_available()."""
+    monkeypatch.setattr(search, "_fts5", None)
+    held = search._fts5_lock
+    held.acquire()  # as a thread inside the first probe holds it
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            pid = os.fork()
+        if pid == 0:  # pragma: no cover - child
+            status = 1
+            try:
+                _child_time_limit(10)
+                status = 0 if search.fts5_available() in (True, False) else 1
+            finally:
+                os._exit(status)
+        _, status = os.waitpid(pid, 0)
+    finally:
+        held.release()
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+    assert search._fts5_lock is held  # the parent's own lock is untouched
+
+
 def test_another_process_never_uses_the_index(db):
     ranked(db)
     parents = index_of(db)

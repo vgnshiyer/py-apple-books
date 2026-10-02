@@ -156,6 +156,17 @@ _fts5: Optional[bool] = None
 _fts5_lock = threading.Lock()
 
 
+def _new_fts5_lock() -> None:
+    # A child forked while another thread held the lock (probing) would
+    # otherwise wait for it forever.
+    global _fts5_lock
+    _fts5_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_new_fts5_lock)
+
+
 def _probe_fts5() -> bool:
     try:
         conn = sqlite3.connect(":memory:")
