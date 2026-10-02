@@ -10,6 +10,7 @@ import datetime as dt
 import os
 import random
 import shutil
+import threading
 import time
 
 import pytest
@@ -101,6 +102,34 @@ class TestTypes:
         monkeypatch.setattr(search, "_probe_fts5", lambda: calls.append(1) or real())
         assert search.fts5_available() is search.fts5_available()
         assert calls == [1]
+
+    def test_fts5_is_probed_once_across_threads(self, monkeypatch):
+        """16 first calls at once: one probe, and every thread gets its
+        result."""
+        monkeypatch.setattr(search, "_fts5", None)
+        calls = []
+        real = search._probe_fts5
+
+        def slow_probe():
+            calls.append(1)
+            time.sleep(0.2)  # every thread arrives while it runs
+            return real()
+
+        monkeypatch.setattr(search, "_probe_fts5", slow_probe)
+        barrier = threading.Barrier(16)
+        results = []
+
+        def first_call():
+            barrier.wait(10)
+            results.append(search.fts5_available())
+
+        threads = [threading.Thread(target=first_call, daemon=True) for _ in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        assert calls == [1] and len(results) == 16 and len(set(results)) == 1
+        assert search.fts5_available() is results[0] and calls == [1]
 
 
 # -- the query builder -----------------------------------------------------------
@@ -320,6 +349,26 @@ class TestRanking:
         hits = ranked.search_annotations("alpha zz", limit=None, require_all=True)
         assert [(h.annotation.id, h.matched_all) for h in hits] == [(both, True)]
         assert ids(ranked.search_annotations("alpha zzz", limit=None, require_all=True)) == []
+
+    @pytest.mark.parametrize("require_all", [False, True])
+    def test_the_fallback_runs_only_when_nothing_else_matched(self, lib, ranked, filler, require_all):
+        """Rows only the fallback finds (every word inside a longer word)
+        are left out as soon as tiers 1-3 find anything."""
+        every_word = lib.add_annotation(filler, "alpha beta token")  # tier 1
+        lib.add_annotation(filler, "prefixalpha prefixbeta")
+        whole_query = lib.add_annotation(filler, "xgamma deltax")  # tier 2 only
+        lib.add_annotation(filler, "prefixgamma prefixdelta")
+        some_words = lib.add_annotation(filler, "kappa token")  # tier 3 only
+        inside = lib.add_annotation(filler, "prefixkappa prefixomega")
+        hits = ranked.search_annotations("alpha beta", limit=None, require_all=require_all)
+        assert [(h.annotation.id, h.matched_all, h.method) for h in hits] == [(every_word, True, FTS)]
+        hits = ranked.search_annotations("gamma delta", limit=None, require_all=require_all)
+        assert [(h.annotation.id, h.matched_all, h.method) for h in hits] == [(whole_query, True, SUBSTRING)]
+        hits = ranked.search_annotations("kappa omega", limit=None, require_all=require_all)
+        if require_all:  # tier 3 is skipped: nothing matched, so the fallback runs
+            assert [(h.annotation.id, h.matched_all, h.method) for h in hits] == [(inside, True, SUBSTRING)]
+        else:
+            assert [(h.annotation.id, h.matched_all, h.method) for h in hits] == [(some_words, False, FTS)]
 
     def test_stopwords_are_left_out(self, lib, ranked, filler):
         row = lib.add_annotation(filler, "habits shape us")

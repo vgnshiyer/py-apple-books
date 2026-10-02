@@ -350,6 +350,40 @@ def test_close_during_searches(lib, monkeypatch):
     assert made and all(is_closed(conn) for conn in made)
 
 
+def test_a_retired_generation_is_closed_by_its_last_user(lib, db, monkeypatch):
+    """A rebuild retires the generation a running search holds: it stays
+    open while that search runs, and the search closes it as it leaves."""
+    now = [1000.0]
+    monkeypatch.setattr(search, "_clock", lambda: now[0])
+    assert len(ranked(db, limit=None)) == 200
+    index = index_of(db)
+    old = index._ready
+    entered, gate = threading.Event(), threading.Event()
+    real = search._query
+
+    def query(conn, *args):
+        if conn is old.conn and not gate.is_set():
+            entered.set()
+            assert gate.wait(20)
+        return real(conn, *args)
+
+    monkeypatch.setattr(search, "_query", query)
+    paused, result = in_thread(lambda: len(ranked(db, limit=None)))
+    try:
+        assert entered.wait(10)
+        lib.add_annotation(lib.add_book("Growing"), f"one more {QUERY}")
+        now[0] += search._RECHECK * 2
+        assert len(ranked(db, limit=None)) == 201  # the rebuild retires the paused search's generation
+        assert index.builds == 2 and index._ready is not old
+        assert old.retired and old.users == 1 and not is_closed(old.conn)
+    finally:
+        gate.set()
+        paused.join(30)
+    assert result == [("ok", 200)]
+    assert old.users == 0 and is_closed(old.conn)
+    assert not is_closed(index._ready.conn)
+
+
 def test_close_never_waits_for_or_aborts_a_build(db, paused_build):
     pause = paused_build()
     builder, built = in_thread(lambda: len(ranked(db, limit=None)))
