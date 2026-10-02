@@ -10,6 +10,15 @@ Books' preferences plist) or starting a process raises
 ``PermissionError`` and is recorded. Expected: nothing refused, no
 error. The control, ``get_book_content`` on that book, must be refused,
 which shows the hook is armed.
+
+Stat-family calls raise no audit event, yet a lookup inside an evicted
+iCloud folder can download that folder's listing, so the script also
+wraps ``os.stat``, ``os.lstat``, ``os.access`` (``os.path.exists`` and
+friends go through them), pathlib's accessor on 3.10 and the
+``_icloud`` stat patch points, and records every path they see while
+the methods run: none may be in the bundle or under ``Library/Mobile
+Documents``. The control must stat the bundle, which shows the wrappers
+are armed.
 """
 
 import json
@@ -34,8 +43,37 @@ _SCRIPT = textwrap.dedent(r'''
     audit.install()
     assert "py_apple_books" not in sys.modules
 
+    import os, pathlib as _pathlib
+
+    # Stat-family calls (no audit event): record their paths while
+    # stat_seen is set. Installed before py_apple_books is imported, so
+    # a module-level alias would be wrapped too.
+    stat_seen = None
+
+    def recording(original):
+        def wrapper(path, *args, **kwargs):
+            if stat_seen is not None and not isinstance(path, int):
+                name = os.fsdecode(os.fspath(path))
+                if kwargs.get("dir_fd") is not None:
+                    name = "<dir_fd>/" + name   # can't be resolved: never expected here
+                stat_seen.append(os.path.abspath(name) if not name.startswith("<") else name)
+            return original(path, *args, **kwargs)
+        return wrapper
+
+    for _name in ("stat", "lstat", "access"):
+        setattr(os, _name, recording(getattr(os, _name)))
+    _accessor = getattr(_pathlib, "_NormalAccessor", None)   # 3.10: bound at import
+    if _accessor is not None:
+        for _name in ("stat", "lstat"):
+            if hasattr(_accessor, _name):
+                setattr(_accessor, _name, staticmethod(getattr(os, _name)))
+
     from py_apple_books import PyAppleBooks
+    from py_apple_books import _icloud
     from py_apple_books.testing import FixtureLibrary, write_epub_bundle
+
+    for _name in ("stat", "lstat"):
+        setattr(_icloud, _name, recording(getattr(_icloud, _name)))
 
     home = pathlib.Path(sys.argv[2])
     UTC = dt.timezone.utc
@@ -73,6 +111,14 @@ _SCRIPT = textwrap.dedent(r'''
     policy = audit.Policy.for_library(home, books=[bundle], allow=[lib.prefs_path])
     out = {"results": {}, "errors": {}, "refused": [], "uncalled": []}
     api = PyAppleBooks(data_dir=lib.data_dir)
+    mobile = os.path.join(os.path.realpath(home), "library", "mobile documents").casefold()
+    roots = [os.path.realpath(bundle).casefold(), mobile]
+
+    def inside(path):
+        p = os.path.realpath(path).casefold() if not path.startswith("<") else path
+        return path.startswith("<") or any(p == r or p.startswith(r + os.sep) for r in roots)
+
+    stat_seen = []
     with audit.block(policy, all_threads=True) as rec:
         for name, call in calls.items():
             if call is None:
@@ -82,15 +128,21 @@ _SCRIPT = textwrap.dedent(r'''
                 out["results"][name] = call(api)
             except Exception as e:
                 out["errors"][name] = "".join(traceback.format_exception_only(type(e), e))
+    seen, stat_seen = stat_seen, None
     out["refused"] = [[ev.event, reason] for ev, reason in rec.refused]
+    out["stat_calls"] = len(seen)
+    out["stat_inside"] = sorted({p for p in seen if inside(p)})
 
+    stat_seen = []
     with audit.block(policy, all_threads=True) as control:
         try:
             api.get_book_content(book["id"])
             out["control"] = "read"
         except Exception as e:
             out["control"] = type(e).__name__
+    seen, stat_seen = stat_seen, None
     out["control_refused"] = len(control.refused)
+    out["control_stat_inside"] = len([p for p in seen if inside(p)])
     api.close()
     print(json.dumps(out))
 ''')
@@ -113,5 +165,10 @@ def test_engagement_methods_touch_no_book_file(tmp_path):
     assert results["get_highlights_on_this_day"] == [6, 5]
     assert results["sample_highlights"][0] == 4 and set(results["sample_highlights"][1]) == {"Cloud Book"}
     assert results["get_finished_books"] == 1 and results["get_library_stats"] == 1
-    # The control: reading the book is refused.
+    # No stat-family lookup in the bundle or iCloud Drive (the methods
+    # do stat other paths, such as the store folders).
+    assert out["stat_calls"] > 0
+    assert out["stat_inside"] == []
+    # The control: reading the book is refused, and it stats the bundle.
     assert out["control_refused"] > 0 and out["control"] != "read"
+    assert out["control_stat_inside"] > 0
