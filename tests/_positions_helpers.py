@@ -64,8 +64,9 @@ class FakeICloud:
         self.stats.clear()
 
     def touched(self, path) -> List[str]:
+        stats = list(self.stats)  # before realpath() below stats anything
         real = os.path.realpath(path)
-        return [x for x in list(self.stats)
+        return [x for x in stats
                 if os.path.realpath(x) == real or os.path.realpath(x).startswith(real + os.sep)]
 
 
