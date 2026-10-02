@@ -20,7 +20,7 @@ import pytest
 from py_apple_books import _epub_index
 from py_apple_books import content as content_module
 from py_apple_books.content import BookContent, clear_content_cache
-from py_apple_books.exceptions import AppleBooksError
+from py_apple_books.exceptions import AppleBooksError, UnsafeEpubEntryError
 from py_apple_books.testing import write_epub_bundle
 from tests import _epub_shapes
 from tests._epub_shapes import SHAPES
@@ -327,6 +327,127 @@ class TestInvalidation:
         assert _epub_index._CACHE.stats() == {"weight": 0}
         BookContent(bundle).list_spine_items()
         assert len(builds) == 2
+
+
+# ---------------------------------------------------------------------------
+# Anchor tables
+# ---------------------------------------------------------------------------
+
+
+# Expected paths are the element steps of hand-written CFIs: from <html>,
+# the n-th child element is step 2n; text, comments, the XML declaration
+# and the doctype don't count.
+_ANCHOR_DOC = b"""<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>T</title><meta charset="utf-8"/></head>
+<body id="b">
+  Some text <!-- a comment -->
+  <section id="s1">
+    <h1 id="h">Title</h1>
+    <p>Para <a name="n1">one</a> and <span id="sp">x</span> tail</p>
+    <p><a name="sp">same name as the span's id</a><a id="dup">first</a><em id="dup">second</em></p>
+  </section>
+  text between
+  <section id="s2"><div><p id="deep">d</p></div><a name="n1">again</a></section>
+</body>
+</html>
+"""
+
+_ANCHOR_PATHS = {
+    "b": (4,),                # /4: <body>, after <head> (/2)
+    "s1": (4, 2),
+    "h": (4, 2, 2),
+    "n1": (4, 2, 4, 2),       # the first <a name="n1">; no id has that name
+    "sp": (4, 2, 4, 4),       # the <span> id, not the later <a name="sp">
+    "dup": (4, 2, 6, 4),      # the first element with that id
+    "s2": (4, 4),
+    "deep": (4, 4, 2, 2),
+}
+
+
+class TestAnchorTables:
+    def test_paths_are_cfi_element_steps(self):
+        table = _epub_index._anchor_table(_ANCHOR_DOC)
+        assert dict(table) == _ANCHOR_PATHS
+        assert table == _ANCHOR_PATHS and len(table) == len(_ANCHOR_PATHS)
+        assert "nope" not in table and table.get("nope") is None
+        with pytest.raises(KeyError):
+            table["nope"]
+
+    def test_ids_win_over_names_and_first_wins(self):
+        table = _epub_index._anchor_table(
+            b'<html><body><a name="x">1</a><p id="y">2</p><a name="y">3</a>'
+            b'<a name="z">4</a><a name="z">5</a><p id="x">6</p></body></html>')
+        # <body> is /2 (no <head>); its children /2 to /12.
+        assert dict(table) == {"x": (2, 12), "y": (2, 4), "z": (2, 8)}
+
+    def test_without_an_html_element(self):
+        assert dict(_epub_index._anchor_table(b'<body><p id="a">x</p><div><i id="b"/></div></body>')) == {
+            "a": (2, 2), "b": (2, 4, 2)}
+        assert dict(_epub_index._anchor_table(b'<p id="a">x</p><p id="b">y</p>')) == {"a": (2,), "b": (4,)}
+        assert dict(_epub_index._anchor_table(b"just text")) == {}
+
+    def test_repr_has_no_document_text(self):
+        assert repr(_epub_index._anchor_table(_ANCHOR_DOC)) == "<anchor table: 8 anchors>"
+
+    def test_size_cap(self, monkeypatch):
+        raw = b'<html><body><p id="a">x</p></body></html>'
+        monkeypatch.setattr(_epub_index, "MAX_ANCHOR_BYTES", len(raw))
+        assert dict(_epub_index._anchor_table(raw)) == {"a": (2, 2)}
+        assert _epub_index._anchor_table(raw + b" ") is None
+
+    def test_a_file_over_the_cap_is_not_read(self, tmp_path, monkeypatch):
+        bundle = _epub_shapes.gutenberg(tmp_path)
+        body = bundle / "OEBPS" / "body.xhtml"
+        monkeypatch.setattr(_epub_index, "MAX_ANCHOR_BYTES", body.stat().st_size - 1)
+        monkeypatch.setattr(content_module, "_read_entry", lambda *a: pytest.fail("read"))
+        assert _epub_index._anchor_table_for(bundle, "OEBPS/body.xhtml") is None
+
+    def test_deep_nesting_costs_linear_memory(self):
+        # Paths are built on lookup: a table of 5,000 nested elements, each
+        # with an id, keeps one (parent, step) pair per element, not 5,000
+        # paths of up to 5,000 steps (about 100 MiB).
+        depth = 5000
+        raw = ("<html><body>" + "".join(f'<div id="d{i}">' for i in range(depth)) + "x"
+               + "</div>" * depth + "</body></html>").encode()
+        gc.collect()
+        tracemalloc.start()
+        try:
+            table = _epub_index._anchor_table(raw)
+            gc.collect()
+            kept, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert len(table) == depth
+        assert table["d0"] == (2, 2) and table[f"d{depth - 1}"] == (2,) + (2,) * depth
+        assert kept < 2 * 2**20 and peak < 40 * 2**20, (kept, peak)
+        assert table.weight < 2 * 2**20
+
+    def test_a_table_too_heavy_to_keep_is_none_and_not_parsed_again(self, tmp_path, monkeypatch, small_cache):
+        bundle = _epub_shapes.gutenberg(tmp_path)
+        cache = small_cache(max_weight=300)  # the marker (256) fits, the table doesn't
+        parses = []
+        real = _epub_index._anchor_table
+
+        def spy(raw):
+            parses.append(1)
+            return real(raw)
+
+        monkeypatch.setattr(_epub_index, "_anchor_table", spy)
+        assert _epub_index._anchor_table_for(bundle, "OEBPS/body.xhtml") is None
+        assert _epub_index._anchor_table_for(bundle, "OEBPS/body.xhtml") is None
+        assert parses == [1] and cache.stats() == {"anchor": 1, "weight": 256}
+
+    def test_errors_name_the_entry_not_a_path(self, tmp_path):
+        bundle = _epub_shapes.gutenberg(tmp_path)
+        with pytest.raises(AppleBooksError) as exc:
+            _epub_index._anchor_table_for(bundle, "OEBPS/missing.xhtml")
+        assert not isinstance(exc.value, OSError)
+        assert str(exc.value).startswith("Could not read EPUB entry 'OEBPS/missing.xhtml'")
+        assert str(tmp_path) not in str(exc.value)
+        with pytest.raises(UnsafeEpubEntryError):
+            _epub_index._anchor_table_for(bundle, "../outside.xhtml")
 
 
 # ---------------------------------------------------------------------------

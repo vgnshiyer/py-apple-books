@@ -40,7 +40,9 @@ import stat as _stat
 import threading
 import urllib.parse
 import zipfile
+from array import array
 from collections import OrderedDict
+from collections.abc import Mapping as _MappingABC
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, NamedTuple, Optional, Set, Tuple
@@ -944,54 +946,136 @@ def _path_gate(path: Any) -> Tuple[Optional[UnavailableReason], Optional[tuple]]
 # ---------------------------------------------------------------------------
 
 
-def _anchor_table(raw: bytes) -> Optional[Dict[str, Tuple[int, ...]]]:
+class _AnchorTable(_MappingABC):
+    """``{anchor: element path}`` of one content document (read-only).
+
+    Each element is kept as one ``(parent, step)`` pair, and a path is
+    built when it is looked up (in steps proportional to the element's
+    depth), so the table's memory grows with the number of elements and
+    anchors, however deeply they are nested. Iterating over every path
+    costs the sum of the anchors' depths: look anchors up instead.
+    """
+
+    __slots__ = ("_anchors", "_parents", "_steps")
+
+    def __init__(self, anchors: Dict[str, int], parents: "array[int]", steps: "array[int]") -> None:
+        self._anchors = anchors
+        self._parents = parents
+        self._steps = steps
+
+    def __getitem__(self, anchor: str) -> Tuple[int, ...]:
+        node = self._anchors[anchor]
+        parents, steps = self._parents, self._steps
+        path: List[int] = []
+        while node:
+            path.append(steps[node])
+            node = parents[node]
+        path.reverse()
+        return tuple(path)
+
+    def __contains__(self, anchor: object) -> bool:
+        return anchor in self._anchors
+
+    def __iter__(self):
+        return iter(self._anchors)
+
+    def __len__(self) -> int:
+        return len(self._anchors)
+
+    def __repr__(self) -> str:
+        return f"<anchor table: {len(self._anchors)} anchors>"
+
+    @property
+    def weight(self) -> int:
+        """Estimated size in memory, in bytes (calibrated with tracemalloc
+        on synthetic documents)."""
+        return (512 + 18 * len(self._parents)
+                + sum(110 + len(anchor) for anchor in self._anchors))
+
+
+def _anchor_table(raw: bytes) -> Optional[_AnchorTable]:
     """``{anchor: element path}`` of a content document: every element
     ``id``, and every ``<a name>`` no element has as its id (the first
     in document order wins). An element path is its CFI steps from the
     root ``<html>`` element (the even numbers ``2 * (n + 1)`` for the
-    n-th child element on the way), from one iterative pre-order walk of
-    bs4's ``html.parser`` tree. None for a document over
-    :data:`MAX_ANCHOR_BYTES`."""
+    n-th child element on the way; from the top of the document when it
+    has no ``<html>``), from one iterative pre-order walk of bs4's
+    ``html.parser`` tree. None for a document over
+    :data:`MAX_ANCHOR_BYTES`. Time and memory are linear in the size of
+    the document, whatever its nesting (see :class:`_AnchorTable`)."""
     if len(raw) > MAX_ANCHOR_BYTES:
         return None
     soup = BeautifulSoup(raw, "html.parser")
     top = soup.find("html")
     if top is None:
         top = soup
-    ids: Dict[str, Tuple[int, ...]] = {}
-    names: Dict[str, Tuple[int, ...]] = {}
-    stack: List[Tuple[Any, Tuple[int, ...]]] = [(top, ())]
+    # Node 0 is `top`; node n > 0 has its parent node and its CFI step.
+    parents = array("q", [0])
+    steps = array("q", [0])
+    ids: Dict[str, int] = {}
+    names: Dict[str, int] = {}
+    stack: List[Tuple[Any, int]] = [(top, 0)]
     while stack:
-        element, path = stack.pop()
-        if element is not top:
+        element, node = stack.pop()
+        if node:
             anchor = element.get("id")
             if isinstance(anchor, str) and anchor and anchor not in ids:
-                ids[anchor] = path
+                ids[anchor] = node
             if element.name == "a":
                 name = element.get("name")
                 if isinstance(name, str) and name and name not in names:
-                    names[name] = path
+                    names[name] = node
         children = []
         count = 0
         for child in element.children:
             if isinstance(child, Tag):
                 count += 1
-                children.append((child, path + (2 * count,)))
+                children.append((child, len(parents)))
+                parents.append(node)
+                steps.append(2 * count)
         stack.extend(reversed(children))
     names.update(ids)
-    return names
+    return _AnchorTable(names, parents, steps)
+
+
+class _TooLarge:
+    """Stored in place of an anchor table too heavy for the cache, so the
+    file isn't parsed again on every call (see :func:`_anchor_table_for`)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<anchor table too large to keep>"
+
+
+_TOO_LARGE = _TooLarge()
 
 
 def _anchor_table_for(root: Any, href: str) -> Optional[Mapping[str, Tuple[int, ...]]]:
-    """The cached anchor table of bundle entry ``href`` (read through
+    """The cached anchor table (see :func:`_anchor_table`) of bundle entry
+    ``href`` (bundle-relative, unquoted), read through
     ``content._read_entry`` and keyed by the file's identity, size and
-    modification time); None when the file is larger than
-    :data:`MAX_ANCHOR_BYTES`.
+    modification time; built once however many threads ask at the same
+    time. None when the file is larger than :data:`MAX_ANCHOR_BYTES`, or
+    its table would be heavier than the whole cache (that verdict is
+    kept, so the file isn't parsed again).
 
-    :raises BookNotDownloadedError, UnsafeEpubEntryError, OSError: as
-        ``content._read_entry_bytes``.
+    It checks only the file it reads (containment, iCloud placeholders
+    on the way, size): run the book's gate (:func:`_gate_book` or
+    :func:`_gate_path`, which checks DRM and the book's state) first.
+
+    :raises BookNotDownloadedError: the file, or a folder on the way, is
+        an iCloud placeholder.
+    :raises UnsafeEpubEntryError: the entry is outside the bundle, not a
+        regular file, or too large to read.
+    :raises AppleBooksError: the file can't be read (the message names
+        the entry, never a path).
     """
     root = pathlib.Path(root)
+
+    def unreadable(e: OSError) -> AppleBooksError:
+        return AppleBooksError(f"Could not read EPUB entry {quote_name(href)}: {detail(e)}")
+
     with _icloud.no_materialize():
         try:
             path = _content._safe_bundle_path(root, href)
@@ -1000,25 +1084,31 @@ def _anchor_table_for(root: Any, href: str) -> Optional[Mapping[str, Tuple[int, 
             err = _icloud.not_downloaded_error(e)
             if err is not None:
                 raise err from None
-            raise
+            raise unreadable(e) from e
     if st.st_size > MAX_ANCHOR_BYTES:
         return None
     ident = ("anchor", st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
 
-    def lookup() -> Optional[Mapping[str, Tuple[int, ...]]]:
+    def lookup() -> Any:
         entry = _CACHE.peek(ident)
         if entry is None:
             return None
         _CACHE.touch(ident, entry)
         return entry.value
 
-    def build() -> Tuple[Optional[Mapping[str, Tuple[int, ...]]], tuple, int, bool]:
-        data, read_st, stable = _content._read_entry(root, href, MAX_ANCHOR_BYTES)
+    def build() -> Tuple[Any, tuple, int, bool]:
+        try:
+            data, read_st, stable = _content._read_entry(root, href, MAX_ANCHOR_BYTES)
+        except OSError as e:
+            raise unreadable(e) from e
         table = _anchor_table(data)
         if table is None:
-            return None, ident, 0, False
+            return _TOO_LARGE, ident, 256, False
         same = ("anchor", read_st.st_dev, read_st.st_ino, read_st.st_mtime_ns, read_st.st_size) == ident
-        weight = 512 + sum(200 + len(k) + 8 * len(v) for k, v in table.items())
-        return MappingProxyType(table), ident, weight, stable and same
+        weight = table.weight
+        if weight > _CACHE.max_weight:
+            return _TOO_LARGE, ident, 256, stable and same
+        return table, ident, weight, stable and same
 
-    return _get_or_build(ident, lookup, build)
+    found = _get_or_build(ident, lookup, build)
+    return None if found is _TOO_LARGE else found
