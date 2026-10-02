@@ -19,7 +19,7 @@ from py_apple_books.db import LibraryDB, use_library
 from py_apple_books.engagement import ReadingGoals
 from py_apple_books.exceptions import InvalidArgumentError
 from py_apple_books.testing import YEAR_ZERO
-from tests import _fs_audit
+from tests import _fs_audit, engagement_helpers
 
 UTC = dt.timezone.utc
 
@@ -168,6 +168,22 @@ class TestReasons:
         path = tmp_path / "deep.plist"
         path.write_bytes(body)
         assert _prefs._read_goals(path) == (None, "unparseable")
+
+    def test_repeated_offsets_are_cheap(self, tmp_path):
+        # A crafted 8 MiB file whose offset table points every entry at
+        # one NaN date: each distinct offset is looked at once (looking
+        # at every entry took seconds).
+        body = b"bplist00\x33" + struct.pack(">d", float("nan"))
+        table = len(body)
+        count = _prefs.MAX_BYTES - table - 32
+        data = body + bytes([8]) * count + struct.pack(">6xBBQQQ", 1, 1, count, 0, table)
+        assert _prefs._patch_binary_dates(data)[9:17] == struct.pack(">d", _prefs._SENTINEL_SECONDS)
+        path = tmp_path / "crafted.plist"
+        path.write_bytes(data)
+        start = time.perf_counter()
+        assert _prefs._read_goals(path) == (None, "not_dict")
+        elapsed = time.perf_counter() - start
+        assert elapsed < (0.5 if engagement_helpers.SLOW else 1.5), f"{elapsed:.3f} s"
 
     def test_not_a_dict(self, tmp_path):
         cyclic = b"bplist00" + b"\xa1\x00\x00"

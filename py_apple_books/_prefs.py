@@ -65,6 +65,9 @@ NOT_DICT = "not_dict"
 # Folder names (case-insensitive) whose contents may be cloud placeholders.
 _CLOUD_FOLDERS = frozenset({"mobile documents", "cloudstorage"})
 
+# struct codes of the binary plist integer sizes (big-endian).
+_OFFSET_CODES = {1: "B", 2: "H", 4: "L", 8: "Q"}
+
 _O_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
             | getattr(os, "O_CLOEXEC", 0))
 _CHUNK = 64 * 1024
@@ -186,17 +189,20 @@ def _read_bytes(path: str) -> Tuple[Optional[bytes], str, Optional[float]]:
 def _patch_binary_dates(data: bytes) -> bytes:
     """``data`` (a binary plist) with every date object a datetime can't
     hold set to the sentinel. Raises ValueError for a malformed trailer
-    (the parser would refuse the file anyway)."""
+    (the parser would refuse the file anyway).
+
+    The offset table is unpacked in one call and each distinct offset is
+    looked at once, so a crafted table repeating one entry costs about
+    what plistlib's own read of the table does."""
     if len(data) < 40:
         raise ValueError("truncated")
     offset_size, ref_size, count, _top, table = struct.unpack(">6xBBQQQ", data[-32:])
-    if (offset_size not in (1, 2, 4, 8) or ref_size not in (1, 2, 4, 8) or count > len(data)
+    if (offset_size not in _OFFSET_CODES or ref_size not in _OFFSET_CODES or count > len(data)
             or table + count * offset_size > len(data) - 32):
         raise ValueError("bad trailer")
+    offsets = set(struct.unpack_from(f">{count}{_OFFSET_CODES[offset_size]}", data, table))
     patched = bytearray(data)
-    for i in range(count):
-        at = table + i * offset_size
-        offset = int.from_bytes(data[at:at + offset_size], "big")
+    for offset in offsets:
         if offset + 9 <= table and data[offset] == 0x33:
             (seconds,) = struct.unpack(">d", data[offset + 1:offset + 9])
             if not (math.isfinite(seconds) and _DATE_MIN <= seconds <= _DATE_MAX):
