@@ -739,9 +739,12 @@ class AnnotationIndex:
     # -- search ---------------------------------------------------------------
 
     def search(self, db: "LibraryDB", plan: _Plan, *, asset_id=None, include_deleted: bool = False,
-               require_all: bool = False, if_discarded: bool = False) -> List[tuple]:
+               require_all: bool = False, want: Optional[int] = None,
+               if_discarded: bool = False) -> List[tuple]:
         """``[(annotation id, score, matched_all, method)]``, best first.
 
+        :param want: rank at least this many hits (all there are if
+            fewer), not necessarily more; None for all.
         :param if_discarded: search even if ``discard()`` was called (the
             databases are then closed when the search leaves).
         :raises _Dead: the index belongs to another process, or was
@@ -760,7 +763,7 @@ class AnnotationIndex:
                 _wait(gen.lock, deadline, limit)
                 try:
                     return _run(gen.conn, lambda conn: _query(
-                        conn, gen.fts, plan, asset_id, include_deleted, require_all), deadline, limit)
+                        conn, gen.fts, plan, asset_id, include_deleted, require_all, want), deadline, limit)
                 finally:
                     gen.lock.release()
             finally:
@@ -774,7 +777,7 @@ class AnnotationIndex:
 
 
 def _query(conn: sqlite3.Connection, fts: Optional[str], plan: _Plan, asset_id,
-           include_deleted: bool, require_all: bool) -> List[tuple]:
+           include_deleted: bool, require_all: bool, want: Optional[int] = None) -> List[tuple]:
     """The hits of ``plan`` in the private database, in tier order:
 
     1. every item (FTS5 AND, best bm25 first; substrings for a
@@ -789,6 +792,12 @@ def _query(conn: sqlite3.Connection, fts: Optional[str], plan: _Plan, asset_id,
 
     Ties go to the higher annotation id; a row is listed once, in the
     first tier that finds it.
+
+    With ``want``, each tier reads at most ``want`` rows and the later
+    tiers are skipped once ``want`` hits are found: the list is then the
+    first ``want`` (or more) of the whole one, in the same order, without
+    ranking and fetching every match of a frequent word. Fewer than
+    ``want`` hits means all of them.
     """
     scope, params = [], []
     if not include_deleted:
@@ -797,8 +806,14 @@ def _query(conn: sqlite3.Connection, fts: Optional[str], plan: _Plan, asset_id,
         scope.append("asset = ?")
         params.append(asset_id)
     extra = "".join(f" AND {s}" for s in scope)
+    # A tier's rows already listed number at most len(hits), so ``want``
+    # rows of it hold at least ``want - len(hits)`` new ones (or all).
+    params.append(-1 if want is None else want)  # LIMIT -1: no limit
     hits: List[tuple] = []
     seen = set()
+
+    def enough() -> bool:
+        return want is not None and len(hits) >= want
 
     def add(rows, matched_all: bool, method: MatchMethod) -> None:
         for rowid, score in rows:
@@ -813,19 +828,23 @@ def _query(conn: sqlite3.Connection, fts: Optional[str], plan: _Plan, asset_id,
             score_terms.append(" + ".join(f"(instr({c}, ?) > 0) * {w}" for c, w in zip(_COLUMNS, _WEIGHTS)))
         per_item = [item for item in items for _ in _COLUMNS]
         sql = (f"SELECT rowid, {' + '.join(score_terms)} AS s FROM ann "
-               f"WHERE ({f' {connector} '.join(conditions)}){extra} ORDER BY s DESC, rowid DESC")
+               f"WHERE ({f' {connector} '.join(conditions)}){extra} ORDER BY s DESC, rowid DESC LIMIT ?")
         add(conn.execute(sql, per_item + per_item + params).fetchall(), matched_all, MatchMethod.SUBSTRING)
 
     use_fts = fts is not None and not plan.substring
     weights = ", ".join(str(w) for w in _WEIGHTS)
     fts_sql = (f"SELECT rowid, -bm25(ann, {weights}) FROM ann WHERE ann MATCH ?{extra} "
-               f"ORDER BY bm25(ann, {weights}), rowid DESC")
+               f"ORDER BY bm25(ann, {weights}), rowid DESC LIMIT ?")
     if use_fts:
         add(conn.execute(fts_sql, [" AND ".join(plan.terms)] + params).fetchall(), True, MatchMethod.FTS)
     else:
         substring(plan.items, "AND", True)
+    if enough():
+        return hits
     if plan.needle is not None:
         substring((plan.needle,), "AND", True)
+    if enough():
+        return hits
     if not require_all and len(plan.items) > 1:
         if use_fts:
             add(conn.execute(fts_sql, [" OR ".join(plan.terms)] + params).fetchall(), False, MatchMethod.FTS)
@@ -835,7 +854,7 @@ def _query(conn: sqlite3.Connection, fts: Optional[str], plan: _Plan, asset_id,
         long_items = tuple(item for item in plan.items if len(item) >= 3)
         if long_items:
             substring(plan.items, "AND", True)
-            if not require_all and len(long_items) < len(plan.items):
+            if not require_all and len(long_items) < len(plan.items) and not enough():
                 substring(long_items, "AND", False)
     return hits
 
@@ -858,30 +877,53 @@ def _index_hits(db: "LibraryDB", plan: _Plan, **kwargs) -> Tuple[AnnotationIndex
     raise DBQueryError(_FAILED)
 
 
+# Above this, a page's ``offset + limit`` ranks every hit (SQLite's
+# LIMIT takes a signed 64-bit integer).
+_RANK_ALL = 2 ** 62
+
+
 def _search_annotations(db: "LibraryDB", plan: _Plan, *, limit: Optional[int], offset: int,
                         asset_id, require_all: bool, include_deleted: bool) -> List[AnnotationHit]:
     """``search_annotations`` once its arguments are checked: the hits of
     ``plan`` in ``db``, ``[offset:offset + limit]`` of the ranked list.
 
-    Each page's annotations are read again in the requested scope; one
-    gone since the index was checked (deleted, say) is skipped, the page
-    is filled from the next hits, and the index is fingerprinted again on
-    the next search.
+    Only the hits up to the page's end are ranked. Each page's
+    annotations are read again in the requested scope; one gone since the
+    index was checked (deleted, say) is skipped, the page is filled from
+    the next hits (all of them ranked if those run out), and the index is
+    fingerprinted again on the next search.
     """
     if not db.has_annotations():
         raise AnnotationStoreNotFoundError(ANNOTATIONS_NOT_FOUND)
-    index, raw = _index_hits(db, plan, asset_id=asset_id, include_deleted=include_deleted,
-                             require_all=require_all)
+    options = {"asset_id": asset_id, "include_deleted": include_deleted, "require_all": require_all}
+    want = None if limit is None or offset + limit > _RANK_ALL else offset + limit
+    index, raw = _index_hits(db, plan, want=want, **options)
     scope = dict(_ALL_ANNOTATIONS if include_deleted else _LIVE_ANNOTATIONS)
     if asset_id is not None:
         scope["asset_id"] = asset_id
+    out, dropped = _page(db, raw, offset, limit, scope)
+    if want is not None and len(out) < limit and len(raw) >= want:
+        # Hits gone from the store left the page short, and the hits after
+        # the ones ranked may fill it: the page again, from all of them.
+        index, raw = _index_hits(db, plan, want=None, **options)
+        out, again = _page(db, raw, offset, limit, scope)
+        dropped = dropped or again
+    if dropped:
+        index.mark_stale()
+    return out
+
+
+def _page(db: "LibraryDB", raw: List[tuple], offset: int, limit: Optional[int],
+          scope: dict) -> Tuple[List[AnnotationHit], bool]:
+    """``(hits, dropped)``: ``raw[offset:]`` read as AnnotationHits in
+    ``scope``, at most ``limit``, and whether one was gone and skipped."""
     out: List[AnnotationHit] = []
     dropped = False
     i = offset
     with use_library(db):
         while i < len(raw) and (limit is None or len(out) < limit):
-            want = len(raw) - i if limit is None else limit - len(out)
-            batch = raw[i:i + want]
+            need = len(raw) - i if limit is None else limit - len(out)
+            batch = raw[i:i + need]
             i += len(batch)
             for j in range(0, len(batch), _PAGE_CHUNK):
                 part = batch[j:j + _PAGE_CHUNK]
@@ -892,6 +934,4 @@ def _search_annotations(db: "LibraryDB", plan: _Plan, *, limit: Optional[int], o
                         dropped = True
                     else:
                         out.append(AnnotationHit(annotation, score, matched_all, method))
-    if dropped:
-        index.mark_stale()
-    return out
+    return out, dropped

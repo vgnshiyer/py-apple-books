@@ -347,6 +347,76 @@ class TestPaging:
         assert ids(ranked.search_annotations("zebra", offset=0)) == everything[:20]  # default limit 20
         assert ranked.search_annotations("zebra", offset=100) == []
 
+    def test_a_page_ranks_only_the_hits_up_to_its_end(self, ranked, many, monkeypatch):
+        sizes = []
+        real = search._query
+
+        def query(*args):
+            hits = real(*args)
+            sizes.append(len(hits))
+            return hits
+
+        monkeypatch.setattr(search, "_query", query)
+        assert len(ranked.search_annotations("zebra", limit=4, offset=2)) == 4
+        assert len(ranked.search_annotations("zebra", limit=None)) == 23
+        assert sizes == [6, 23]
+
+    @pytest.mark.parametrize("fts", [True, False])
+    def test_pages_across_tiers(self, monkeypatch, lib, ranked, filler, fts):
+        if not fts:
+            monkeypatch.setattr(search, "_fts5", False)
+        for i in range(5):
+            lib.add_annotation(filler, f"decision making {i}")
+        for i in range(4):
+            lib.add_annotation(filler, f"indecision making {i}")
+        for i in range(6):
+            lib.add_annotation(filler, f"making bread {i}")
+        for require_all in (False, True):
+            everything = ids(ranked.search_annotations("decision making", limit=None, require_all=require_all))
+            assert len(everything) == (9 if require_all else 15)
+            for size in (1, 2, 3, 4, 7, 16):
+                pages = []
+                for offset in range(0, 17, size):
+                    pages += ids(ranked.search_annotations("decision making", limit=size, offset=offset,
+                                                           require_all=require_all))
+                assert pages == everything, (require_all, size)
+
+    def test_deleted_rows_ranked_first_keep_pages_whole(self, lib, ranked, filler, monkeypatch):
+        """Rows deleted in Apple Books (known to the index) that would rank
+        first are left out by the index itself: pages stay consistent and
+        the store is not fingerprinted again for them."""
+        gone = [lib.add_annotation(filler, "zebra zebra zebra zebra", deleted=True) for _ in range(5)]
+        live = [lib.add_annotation(filler, f"zebra plain row {i}") for i in range(7)]
+        stale = []
+        monkeypatch.setattr(search.AnnotationIndex, "mark_stale", lambda self: stale.append(1))
+        everything = ids(ranked.search_annotations("zebra", limit=None))
+        assert sorted(everything) == sorted(live)
+        pages = []
+        for offset in range(0, 9, 3):
+            pages += ids(ranked.search_annotations("zebra", limit=3, offset=offset))
+        assert pages == everything
+        with_deleted = ids(ranked.search_annotations("zebra", limit=None, include_deleted=True))
+        assert set(with_deleted[:5]) == set(gone)
+        assert stale == [] and index_of(ranked).builds == 1
+
+    def test_rows_deleted_since_the_check_beyond_the_ranked_hits(self, lib, ranked, clock):
+        """More hits gone from the store than a page ranked: the page is
+        filled from all the hits."""
+        book = lib.add_book("B")
+        rows = [lib.add_annotation(book, "alpha") for _ in range(6)]
+        assert ids(ranked.search_annotations("alpha", limit=2)) == [rows[5], rows[4]]
+        for pk in rows[3:]:
+            lib.execute("annotations", "DELETE FROM ZAEANNOTATION WHERE Z_PK = ?", (pk,))
+        assert ids(ranked.search_annotations("alpha", limit=2)) == [rows[2], rows[1]]
+        assert index_of(ranked)._ready.checked == float("-inf")
+
+    def test_a_row_deleted_since_the_check_with_an_offset(self, lib, ranked, clock):
+        book = lib.add_book("B")
+        rows = [lib.add_annotation(book, "alpha") for _ in range(6)]
+        assert ids(ranked.search_annotations("alpha", limit=2, offset=1)) == [rows[4], rows[3]]
+        lib.execute("annotations", "DELETE FROM ZAEANNOTATION WHERE Z_PK = ?", (rows[4],))
+        assert ids(ranked.search_annotations("alpha", limit=2, offset=1)) == [rows[3], rows[2]]
+
     @pytest.mark.parametrize("limit", [0, -1, True, False, 1.5, "5", [1]])
     def test_bad_limits(self, ranked, many, limit):
         with pytest.raises(InvalidArgumentError):
