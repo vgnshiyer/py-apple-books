@@ -119,9 +119,10 @@ class TestReasons:
         assert _prefs._read_goals(big) == (None, "too_large")
 
     @pytest.mark.parametrize("path", [
-        "/Users/someone/Library/Mobile Documents/com~apple~CloudDocs/com.apple.iBooksX.plist",
-        "/Users/someone/library/MOBILE DOCUMENTS/x.plist",
-        "/Users/someone/Library/CloudStorage/Provider/x.plist",
+        "/home/someone/Library/Mobile Documents/com~apple~CloudDocs/com.apple.iBooksX.plist",
+        "/home/someone/library/MOBILE DOCUMENTS/x.plist",
+        "/home/someone/Library/CloudStorage/Provider/x.plist",
+        "relative/Mobile Documents/x.plist",
     ])
     def test_icloud_path_is_never_touched(self, monkeypatch, path):
         def refuse(*args, **kwargs):
