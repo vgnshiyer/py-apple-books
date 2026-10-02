@@ -250,6 +250,27 @@ class TestGetSpineItemText:
             content.get_spine_item_text(item)
         assert repr(item) in str(exc.value) and "/" not in str(exc.value)
 
+    @pytest.mark.parametrize("sign", [1, -1])
+    @pytest.mark.parametrize("digits", [12, 4000, 5000])  # 5000: past str()'s 4,300-digit limit
+    def test_huge_index(self, tmp_path, sign, digits):
+        item = sign * 10**digits
+        content = BookContent(_epub_shapes.plain(tmp_path))
+        with pytest.raises(ChapterNotFoundError) as exc:
+            content.get_spine_item_text(item)
+        assert str(exc.value) == "No spine entry at that index in this book."
+
+    def test_an_int_subclass_index(self, tmp_path):
+        import enum
+
+        class Nth(enum.IntEnum):
+            SECOND = 1
+            FAR = 7
+
+        content = BookContent(_epub_shapes.plain(tmp_path))
+        assert content.get_spine_item_text(Nth.SECOND) == content.get_spine_item_text(1)
+        with pytest.raises(ChapterNotFoundError, match="^No spine entry at index 7 in this book.$"):
+            content.get_spine_item_text(Nth.FAR)
+
     @pytest.mark.parametrize("item", [1.0, None, b"ch1", ["ch1"]])
     def test_bad_type(self, tmp_path, item):
         with pytest.raises(InvalidArgumentError):
@@ -384,10 +405,27 @@ class TestIterSpineText:
             spine_xml='<itemref idref="c1"/><itemref idref="pic"/><itemref/><itemref idref="c2"/>'
                       '<itemref idref="c3"/>')
         (bundle / "OEBPS" / "c2.xhtml").unlink()
-        chunks = list(BookContent(bundle).iter_spine_text())
+        content = BookContent(bundle)
+        chunks = list(content.iter_spine_text())
         assert [(c.index, c.readable, c.text) for c in chunks] == [
             (0, True, "one"), (1, False, ""), (2, False, ""), (3, False, ""), (4, True, "three")]
         assert not chunks[1].complete and chunks[1].length == 0
+
+        def got(**kwargs):
+            return [(c.index, c.readable) for c in content.iter_spine_text(**kwargs)]
+
+        # An unreadable item at `until` (offset 0) is out of scope.
+        assert got(until=TextPosition(1, 0)) == [(0, True)]
+        assert got(until=TextPosition(3, 0)) == [(0, True), (1, False), (2, False)]
+        assert got(until=TextPosition(3, 2)) == [(0, True), (1, False), (2, False), (3, False)]
+        # Resuming inside an unreadable item doesn't report it again.
+        assert got(start=TextPosition(1, 3)) == [(2, False), (3, False), (4, True)]
+        assert got(start=TextPosition(3, 0)) == [(3, False), (4, True)]
+        assert got(start=TextPosition(3, 1)) == [(4, True)]
+        # start == until, inside or at the start of an unreadable item: nothing.
+        assert got(start=TextPosition(1, 0), until=TextPosition(1, 0)) == []
+        assert got(start=TextPosition(3, 0), until=TextPosition(3, 0)) == []
+        assert got(start=TextPosition(3, 2), until=TextPosition(3, 2)) == []
 
     def test_dataless_item_raises(self, tmp_path, monkeypatch):
         bundle = _epub_shapes.plain(tmp_path)

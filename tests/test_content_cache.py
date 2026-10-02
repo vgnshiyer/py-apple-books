@@ -9,18 +9,21 @@ from __future__ import annotations
 
 import gc
 import os
+import pickle
 import shutil
+import signal
 import sqlite3
 import threading
 import time
 import tracemalloc
+import warnings
 
 import pytest
 
 from py_apple_books import _epub_index
 from py_apple_books import content as content_module
 from py_apple_books.content import BookContent, clear_content_cache
-from py_apple_books.exceptions import AppleBooksError, UnsafeEpubEntryError
+from py_apple_books.exceptions import AppleBooksError, DRMProtectedError, UnsafeEpubEntryError
 from py_apple_books.testing import write_epub_bundle
 from tests import _epub_shapes
 from tests._epub_shapes import SHAPES
@@ -64,6 +67,63 @@ def small_cache(monkeypatch):
         monkeypatch.setattr(_epub_index, "_CACHE", cache)
         return cache
     return make
+
+
+class _Begins:
+    """Every ``_IndexCache.begin``: ``(kind, builder)`` pairs, and
+    :meth:`wait_for` to wait until some number of waiters joined."""
+
+    def __init__(self):
+        self.calls = []
+        self._cond = threading.Condition()
+
+    def record(self, ident, builder):
+        with self._cond:
+            self.calls.append((ident[0], builder))
+            self._cond.notify_all()
+
+    def waiters(self):
+        return sum(1 for _, builder in self.calls if not builder)
+
+    def wait_for(self, waiters, timeout=10):
+        with self._cond:
+            return self._cond.wait_for(lambda: self.waiters() >= waiters, timeout)
+
+
+@pytest.fixture
+def begins(monkeypatch):
+    spy = _Begins()
+    real = _epub_index._IndexCache.begin
+
+    def begin(self, ident):
+        result = real(self, ident)
+        spy.record(ident, result[0])
+        return result
+
+    monkeypatch.setattr(_epub_index._IndexCache, "begin", begin)
+    return spy
+
+
+def _run_threads(count, target, timeout=30):
+    """Run ``target(n)`` in ``count`` threads started together; returns
+    ``(results, errors)``."""
+    barrier = threading.Barrier(count)
+    results, errors = [], []
+
+    def work(n):
+        try:
+            barrier.wait()
+            results.append(target(n))
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=work, args=(n,)) for n in range(count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout)
+    assert not any(t.is_alive() for t in threads)
+    return results, errors
 
 
 def _touch_ns(path, delta_ns=1):
@@ -216,7 +276,9 @@ class TestHits:
         monkeypatch.setattr(_epub_index, "_build_index", wrong)
         expected = ["One", "Two", "Three"]
         assert [c.title for c in BookContent(bundle).list_chapters()] == expected
-        assert [c.title for c in BookContent(bundle).list_chapters()] == expected
+        chapters = BookContent(bundle).list_chapters()
+        assert [c.title for c in chapters] == expected
+        assert [c.spine_index for c in chapters] == [0, 1, 2]
         assert _epub_index._verified_index(bundle) is None
 
     def test_an_index_failure_never_fails_list_chapters(self, tmp_path, monkeypatch):
@@ -228,7 +290,24 @@ class TestHits:
         monkeypatch.setattr(_epub_index, "_build_index", broken)
         chapters = BookContent(bundle).list_chapters()
         assert [c.title for c in chapters] == ["One", "Two", "Three"]
-        assert [c.spine_index for c in chapters] == [None, None, None]
+        # spine_index still comes from the package document the full load read.
+        assert [c.spine_index for c in chapters] == [0, 1, 2]
+
+    @pytest.mark.parametrize("name", sorted(SHAPES))
+    def test_spine_indexes_without_the_index_match_the_index(self, tmp_path, monkeypatch, name):
+        bundle = SHAPES[name](tmp_path)
+        expected = [c.spine_index for c in _epub_index._build_index(bundle, os.stat(bundle)).chapters]
+        monkeypatch.setattr(_epub_index, "_index_matching", lambda path, chapters: None)
+        assert [c.spine_index for c in BookContent(bundle).list_chapters()] == expected
+
+    def test_an_unpickled_instance_without_the_index_has_no_spine_indexes(self, tmp_path, monkeypatch):
+        content = BookContent(_epub_shapes.plain(tmp_path))
+        content._load_book()
+        clone = pickle.loads(pickle.dumps(content))
+        monkeypatch.setattr(_epub_index, "_index_matching", lambda path, chapters: None)
+        chapters = clone.list_chapters()
+        assert [c.title for c in chapters] == ["One", "Two", "Three"]
+        assert [c.spine_index for c in chapters] == [None, None, None]  # as documented
 
 
 # ---------------------------------------------------------------------------
@@ -486,12 +565,44 @@ class TestEviction:
         assert 1 <= cache.stats()["book"] <= 3
 
     def test_an_oversize_entry_is_returned_not_stored(self, tmp_path, small_cache, builds):
-        cache = small_cache(max_weight=100)
         bundle = _epub_shapes.plain(tmp_path)
+        small = _epub_index._anchor_table((bundle / "OEBPS" / "ch1.xhtml").read_bytes())
+        index = _epub_index._build_index(bundle, os.stat(bundle))
+        builds.clear()
+        assert small.weight < 4 * small.weight < index.weight
+        cache = small_cache(max_weight=2 * small.weight)
+        # A small entry first: storing nothing for the oversize index must
+        # not flush it.
+        assert _epub_index._anchor_table_for(bundle, "OEBPS/ch1.xhtml") == small
+        assert cache.stats() == {"anchor": 1, "weight": small.weight}
         assert len(BookContent(bundle).list_spine_items()) == 3
-        assert cache.stats() == {"weight": 0}
+        assert cache.stats() == {"anchor": 1, "weight": small.weight}
         assert len(BookContent(bundle).list_chapters()) == 3
+        assert cache.stats() == {"anchor": 1, "weight": small.weight}
         assert len(builds) == 2
+
+    def test_an_instance_keeps_an_index_the_cache_cannot(self, tmp_path, small_cache, builds):
+        bundle = write_epub_bundle(tmp_path / "Long.epub",
+                                   [(f"c{i}", f"<p>text {i}</p>") for i in range(40)],
+                                   toc=[(f"Chapter {i}", f"c{i}.xhtml") for i in range(40)])
+        small_cache(max_weight=100)
+        content = BookContent(bundle)
+        assert len(list(content.iter_spine_text())) == 40
+        assert content.get_spine_item_text(3) == "text 3"
+        assert builds == ["Long.epub"]  # not one per item
+        # The checks still run on every call.
+        (bundle / "META-INF" / "rights.xml").write_text("<rights/>")
+        with pytest.raises(DRMProtectedError):
+            content.get_spine_item_text(4)
+        (bundle / "META-INF" / "rights.xml").unlink()
+        # A cleared cache, or a changed package document, reads it again.
+        clear_content_cache()
+        content.list_spine_items()
+        assert len(builds) == 2
+        _touch_ns(bundle / "OEBPS" / "content.opf")
+        content.list_spine_items()
+        content.list_spine_items()
+        assert len(builds) == 3
 
     def test_insert_after_clear_is_dropped(self):
         cache = _epub_index._IndexCache()
@@ -537,7 +648,7 @@ class TestThreads:
         assert len(builds) == 1
         assert all(r == results[0] for r in results)
 
-    def test_a_failed_build_lets_waiters_build(self, tmp_path, monkeypatch):
+    def test_a_failed_build_lets_waiters_build(self, tmp_path, monkeypatch, begins):
         bundle = _epub_shapes.plain(tmp_path)
         calls = []
         real = _epub_index._build_index
@@ -568,11 +679,194 @@ class TestThreads:
             time.sleep(0.001)
         t2 = threading.Thread(target=second)
         t2.start()
-        time.sleep(0.05)
+        assert begins.wait_for(1)  # t2 waits for t1's build
         gate.set()
         t1.join(10)
         t2.join(10)
         assert len(errors) == 1 and len(results) == 1 and len(results[0]) == 3
+        assert begins.calls == [("book", True), ("book", False)]
+        assert len(calls) == 2
+
+    def test_waiters_share_a_value_the_cache_cannot_keep(self, tmp_path, monkeypatch, small_cache, begins):
+        small_cache(max_weight=100)  # no index fits
+        bundle = _epub_shapes.plain(tmp_path)
+        builds = []
+        real = _epub_index._build_index
+        release = threading.Event()
+
+        def slow(root, root_st):
+            builds.append(1)
+            release.wait(10)
+            return real(root, root_st)
+
+        monkeypatch.setattr(_epub_index, "_build_index", slow)
+        threading.Thread(target=lambda: (begins.wait_for(7), release.set())).start()
+        results, errors = _run_threads(8, lambda n: BookContent(bundle).list_spine_items())
+        assert errors == [] and len(results) == 8 and all(r == results[0] for r in results)
+        assert len(builds) == 1
+
+    def test_a_clear_during_a_build_does_not_make_its_waiters_build(self, tmp_path, monkeypatch, begins):
+        bundle = _epub_shapes.plain(tmp_path)
+        builds = []
+        real = _epub_index._build_index
+        release = threading.Event()
+
+        def slow(root, root_st):
+            builds.append(1)
+            release.wait(10)
+            return real(root, root_st)
+
+        monkeypatch.setattr(_epub_index, "_build_index", slow)
+
+        def clear_then_release():
+            begins.wait_for(7)
+            clear_content_cache()
+            release.set()
+
+        threading.Thread(target=clear_then_release).start()
+        results, errors = _run_threads(8, lambda n: BookContent(bundle).list_spine_items())
+        assert errors == [] and len(results) == 8 and len(builds) == 1
+        # Nothing from before the clear was stored; a new call builds.
+        assert _epub_index._CACHE.stats() == {"weight": 0}
+        BookContent(bundle).list_spine_items()
+        assert len(builds) == 2
+
+    def test_a_waiter_rebuilds_when_the_files_changed_meanwhile(self, tmp_path, monkeypatch, begins):
+        bundle = _epub_shapes.plain(tmp_path)
+        builds = []
+        real = _epub_index._build_index
+        built, release = threading.Event(), threading.Event()
+
+        def slow(root, root_st):
+            builds.append(1)
+            index = real(root, root_st)
+            if len(builds) == 1:
+                built.set()
+                release.wait(10)
+            return index
+
+        monkeypatch.setattr(_epub_index, "_build_index", slow)
+
+        def edit_then_release():
+            # The first build has read the files, the other thread waits.
+            built.wait(10)
+            begins.wait_for(1)
+            nav = bundle / "OEBPS" / "nav.xhtml"
+            nav.write_text(nav.read_text().replace(">One<", ">First<"))
+            release.set()
+
+        threading.Thread(target=edit_then_release).start()
+        results, errors = _run_threads(2, lambda n: [c.toc_orders for c in BookContent(bundle).list_spine_items()])
+        assert errors == [] and len(builds) == 2
+        assert BookContent(bundle).list_chapters()[0].title == "First"
+
+    def test_eight_threads_one_anchor_parse(self, tmp_path, monkeypatch):
+        bundle = _epub_shapes.gutenberg(tmp_path)
+        parses = []
+        real = _epub_index._anchor_table
+
+        def slow(raw):
+            parses.append(1)
+            time.sleep(0.05)
+            return real(raw)
+
+        monkeypatch.setattr(_epub_index, "_anchor_table", slow)
+        results, errors = _run_threads(8, lambda n: _epub_index._anchor_table_for(bundle, "OEBPS/body.xhtml"))
+        assert errors == [] and len(results) == 8
+        assert len(parses) == 1 and all(r is results[0] for r in results)
+        assert set(results[0]) == {"ch1", "ch2", "ch3"}
+
+    def test_encryption_verdicts_never_flip_under_threads(self, tmp_path):
+        fonts = _epub_shapes.plain(tmp_path)
+        (fonts / "META-INF" / "encryption.xml").write_text(
+            '<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container" '
+            'xmlns:enc="http://www.w3.org/2001/04/xmlenc#"><enc:EncryptedData>'
+            '<enc:EncryptionMethod Algorithm="http://www.idpf.org/2008/embedding"/>'
+            '<enc:CipherData><enc:CipherReference URI="OEBPS/font.otf"/></enc:CipherData>'
+            '</enc:EncryptedData></encryption>')
+        locked = write_epub_bundle(tmp_path / "Locked.epub", [("c1", "<p>x</p>")], toc=[("One", "c1.xhtml")])
+        (locked / "META-INF" / "encryption.xml").write_text(
+            '<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container" '
+            'xmlns:enc="http://www.w3.org/2001/04/xmlenc#"><enc:EncryptedData>'
+            '<enc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes256-cbc"/>'
+            '<enc:CipherData><enc:CipherReference URI="OEBPS/c1.xhtml"/></enc:CipherData>'
+            '</enc:EncryptedData></encryption>')
+        assert _epub_index._gate_path(fonts).reason is None
+        assert _epub_index._gate_path(locked).reason == _epub_index.UnavailableReason.DRM
+
+        def work(n):
+            seen = set()
+            for i in range(60):
+                if (n + i) % 13 == 0:
+                    clear_content_cache()
+                seen.add((_epub_index._gate_path(fonts).reason, _epub_index._gate_path(locked).reason))
+            return seen
+
+        results, errors = _run_threads(12, work)
+        assert errors == [] and len(results) == 12
+        assert set().union(*results) == {(None, _epub_index.UnavailableReason.DRM)}
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+    def test_a_fork_during_a_build(self, tmp_path, monkeypatch):
+        """A child forked while a thread of its parent builds a book's
+        index doesn't wait for that build (its thread wasn't copied)."""
+        bundle = _epub_shapes.plain(tmp_path)
+        started, release = threading.Event(), threading.Event()
+        real = _epub_index._build_index
+
+        def paused(root, root_st):
+            if threading.current_thread() is not threading.main_thread():
+                started.set()
+                release.wait(20)
+            return real(root, root_st)
+
+        monkeypatch.setattr(_epub_index, "_build_index", paused)
+        worker = threading.Thread(target=lambda: BookContent(bundle).list_spine_items())
+        worker.start()
+        try:
+            assert started.wait(10)
+            read_end, write_end = os.pipe()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)  # fork() with other threads alive
+                pid = os.fork()
+            if pid == 0:  # pragma: no cover - child
+                status = 1
+                try:
+                    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+                    signal.alarm(10)  # a hang fails the test instead of the suite
+                    os.close(read_end)
+                    result = (len(BookContent(bundle).list_chapters()),
+                              len(BookContent(bundle).list_spine_items()),
+                              _epub_index._CACHE.stats().get("book"))
+                    os.write(write_end, repr(result).encode())
+                    status = 0
+                finally:
+                    os._exit(status)
+            os.close(write_end)
+            with os.fdopen(read_end, "rb") as pipe:
+                output = pipe.read()
+            _, status = os.waitpid(pid, 0)
+        finally:
+            release.set()
+            worker.join(10)
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+        assert output == repr((3, 3, 1)).encode()
+        # The parent's own build finished and was stored as usual.
+        assert _epub_index._CACHE.stats().get("book") == 1
+
+    def test_after_fork_in_child_resets_the_cache_state(self):
+        cache = _epub_index._IndexCache()
+        generation = cache.generation
+        cache.insert(("anchor", 1), "k", "v", 10, generation)
+        builder, flight, _ = cache.begin(("book", 1, 2))
+        assert builder
+        cache._after_fork_in_child()
+        assert cache.begin(("book", 1, 2))[0]  # nobody waits for the parent's build
+        assert cache.insert(("book", 1, 2), "k", "v", 10, generation) is False
+        assert cache.stats() == {"anchor": 1, "weight": 10}  # entries kept
+        cache._lock.acquire()  # a fork while another thread held the lock
+        cache._after_fork_in_child()
+        assert not cache._lock.locked() and cache.stats() == {"weight": 0}
 
     def test_clear_during_a_build_leaves_the_cache_empty(self, tmp_path, monkeypatch):
         bundle = _epub_shapes.plain(tmp_path)

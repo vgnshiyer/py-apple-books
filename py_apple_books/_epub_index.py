@@ -14,8 +14,10 @@ NCX) alone.
   wanted. The chapter list is computed by 1.10's own code on this book.
 * :class:`_IndexCache` keeps indexes, per-file anchor tables and
   ``encryption.xml`` verdicts process-wide: a weighted LRU (32 MiB
-  estimated, 4,096 entries), single-flight builds, emptied by
-  ``content.clear_content_cache()``. Keys come from file metadata only:
+  estimated, 4,096 entries), single-flight builds (threads that ask
+  while one builds share its value, stored or not), emptied by
+  ``content.clear_content_cache()``, reset for builds in progress in a
+  forked child. Keys come from file metadata only:
   the bundle's device, inode and modification time, and the inode,
   modification time and size of every file an index was read from (an
   anchor table: of its file). Nothing is written to disk or logged.
@@ -358,6 +360,33 @@ def _spine(opf: Any, manifest: Mapping, toc_targets: Set[str],
     return tuple(items)
 
 
+def _first_spine_index(spine: Iterable[SpineItem]) -> Dict[str, int]:
+    """normalized bundle-relative href -> the first spine index of that
+    file."""
+    first: Dict[str, int] = {}
+    for item in spine:
+        if item.href:
+            first.setdefault(posixpath.normpath(item.href), item.index)
+    return first
+
+
+def _with_spine_indexes(chapters: Iterable[Chapter], first: Mapping[str, int]) -> Tuple[Chapter, ...]:
+    """``chapters`` with :attr:`Chapter.spine_index` set from ``first``
+    (see :func:`_first_spine_index`)."""
+    return tuple(
+        replace(c, spine_index=first.get(posixpath.normpath(c.href))) if c.href else c
+        for c in chapters
+    )
+
+
+def _package_spine_indexes(opf: Any, ebooklib_dir: str, rel: Callable[[str], str]) -> Dict[str, int]:
+    """:func:`_first_spine_index` of a package document ebooklib parsed
+    (``EpubReader.container``, its folder ``EpubReader.opf_dir``): the
+    rule the index uses, for chapters read without it (see
+    ``BookContent._chapter_list``)."""
+    return _first_spine_index(_spine(opf, _manifest(opf, ebooklib_dir, rel), set(), {}))
+
+
 def _build_index(root: pathlib.Path, root_st: os.stat_result) -> _BookIndex:
     """Read the book's index (container, package and navigation files
     only) and build a :class:`_BookIndex`. Errors as a full load raises
@@ -396,14 +425,8 @@ def _build_index(root: pathlib.Path, root_st: os.stat_result) -> _BookIndex:
     manifest = _manifest(opf, reader.opf_dir or "", rel)
     toc_targets = _toc_page_targets(opf, book, opf_dir_str, rel)
     spine = _spine(opf, manifest, toc_targets, toc_orders)
-    first: Dict[str, int] = {}
-    for item in spine:
-        if item.href:
-            first.setdefault(posixpath.normpath(item.href), item.index)
-    chapters = tuple(
-        replace(c, spine_index=first.get(posixpath.normpath(c.href))) if c.href else c
-        for c in chapters
-    )
+    first = _first_spine_index(spine)
+    chapters = _with_spine_indexes(chapters, first)
     toc_page_ids = frozenset(
         [i for i, (_h, _m, _e, props) in manifest.items() if "nav" in props]
         + [item.item_id for item in spine if item.is_toc_page and item.item_id])
@@ -506,6 +529,20 @@ class _Entry:
         self.verified = verified
 
 
+class _InFlight:
+    """One build in progress (see :meth:`_IndexCache.begin`): other
+    threads wait for :attr:`done`; then :attr:`ok` tells whether the
+    builder got a value (:attr:`value`, stored in the cache or not) or
+    failed."""
+
+    __slots__ = ("done", "ok", "value")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.ok = False
+        self.value: Any = None
+
+
 class _IndexCache:
     """A weighted LRU with single-flight builds (see the module docstring).
 
@@ -513,6 +550,10 @@ class _IndexCache:
     (``'book'``, ``'anchor'``, ``'encryption'``). An entry heavier than
     :attr:`max_weight` is never stored. :meth:`clear` bumps a generation,
     so a build that started before it doesn't store its result.
+
+    A forked child starts with a new lock and no builds in progress (the
+    threads running them were not copied), and stores nothing a build
+    started in its parent returns (see :func:`_reset_after_fork`).
     """
 
     def __init__(self, max_weight: int = MAX_CACHE_BYTES, max_entries: int = MAX_CACHE_ENTRIES) -> None:
@@ -522,7 +563,7 @@ class _IndexCache:
         self._entries: "OrderedDict[tuple, _Entry]" = OrderedDict()
         self._weight = 0
         self._generation = 0
-        self._inflight: Dict[tuple, threading.Event] = {}
+        self._inflight: Dict[tuple, _InFlight] = {}
 
     @property
     def generation(self) -> int:
@@ -568,27 +609,48 @@ class _IndexCache:
                 self._weight -= evicted.weight
             return ident in self._entries
 
-    def begin(self, ident: tuple) -> Tuple[bool, threading.Event, int]:
-        """``(builder, event, generation)``: the first caller for an
-        ``ident`` builds it (and must call :meth:`end`); later callers wait
-        on ``event`` meanwhile."""
+    def begin(self, ident: tuple) -> Tuple[bool, _InFlight, int]:
+        """``(builder, flight, generation)``: the first caller for an
+        ``ident`` builds it (and must call :meth:`end`, after setting the
+        flight's outcome); later callers wait on ``flight.done``
+        meanwhile."""
         with self._lock:
-            event = self._inflight.get(ident)
-            if event is not None:
-                return False, event, self._generation
-            event = self._inflight[ident] = threading.Event()
-            return True, event, self._generation
+            flight = self._inflight.get(ident)
+            if flight is not None:
+                return False, flight, self._generation
+            flight = self._inflight[ident] = _InFlight()
+            return True, flight, self._generation
 
-    def end(self, ident: tuple, event: threading.Event) -> None:
+    def end(self, ident: tuple, flight: _InFlight) -> None:
         with self._lock:
-            if self._inflight.get(ident) is event:
+            if self._inflight.get(ident) is flight:
                 del self._inflight[ident]
-        event.set()
+        flight.done.set()
 
     def clear(self) -> None:
+        """Drop every entry. Builds in progress don't store their results,
+        and a later caller starts its own build instead of waiting for
+        one that began before the clear."""
         with self._lock:
             self._generation += 1
             self._entries.clear()
+            self._weight = 0
+            self._inflight = {}
+
+    def _after_fork_in_child(self) -> None:
+        """In a forked child (only the forking thread runs there): a new
+        lock (the old one may have been held by a thread that wasn't
+        copied), no builds in progress (their builders don't exist here,
+        so nobody would wake their waiters), and a new generation (a
+        build started in the parent stores nothing). Entries are kept,
+        their values are immutable; unless the lock was held at the
+        fork, when the entries may be half updated."""
+        held = self._lock.locked()
+        self._lock = threading.Lock()
+        self._inflight = {}
+        self._generation += 1
+        if held:
+            self._entries = OrderedDict()
             self._weight = 0
 
     def stats(self) -> Dict[str, int]:
@@ -611,20 +673,36 @@ def _clear_cache() -> None:
 _icloud.register_file_cache(_clear_cache)
 
 
+def _reset_after_fork() -> None:
+    """``os.register_at_fork`` hook: see
+    :meth:`_IndexCache._after_fork_in_child`."""
+    _CACHE._after_fork_in_child()
+
+
+if hasattr(os, "register_at_fork") and not globals().get("_fork_hook_registered"):
+    os.register_at_fork(after_in_child=_reset_after_fork)
+    _fork_hook_registered = True
+
+
 def _get_or_build(ident: tuple, lookup: Callable[[], Any],
-                  build: Callable[[], Tuple[Any, Any, int, bool]]) -> Any:
+                  build: Callable[[], Tuple[Any, Any, int, bool]],
+                  still_valid: Optional[Callable[[Any], bool]] = None) -> Any:
     """``lookup()`` if it finds a value; else ``build()``'s value, built
-    once however many threads ask at the same time: the first builds and
-    stores it, the others wait and look again (and build themselves if
-    the first failed). ``build()`` returns ``(value, key, weight,
-    storable)``."""
+    once however many threads ask at the same time: the first builds (and
+    stores it if it can), the others wait and take its value, whether it
+    was stored or not (if ``still_valid(value)``, when given, says it
+    still is); a waiter builds itself only if the first failed (or its
+    value is no longer valid). ``build()`` returns ``(value, key,
+    weight, storable)``."""
     cache = _CACHE
     found = lookup()
     if found is not None:
         return found
-    builder, event, generation = cache.begin(ident)
+    builder, flight, generation = cache.begin(ident)
     if not builder:
-        event.wait()
+        flight.done.wait()
+        if flight.ok and (still_valid is None or still_valid(flight.value)):
+            return flight.value
         found = lookup()
         if found is not None:
             return found
@@ -635,14 +713,15 @@ def _get_or_build(ident: tuple, lookup: Callable[[], Any],
         return value
     try:
         found = lookup()  # built and stored while this thread got here
-        if found is not None:
-            return found
-        value, key, weight, storable = build()
-        if storable:
-            cache.insert(ident, key, value, weight, generation)
-        return value
+        if found is None:
+            value, key, weight, storable = build()
+            if storable:
+                cache.insert(ident, key, value, weight, generation)
+            found = value
+        flight.value, flight.ok = found, True
+        return found
     finally:
-        cache.end(ident, event)
+        cache.end(ident, flight)
 
 
 # ---------------------------------------------------------------------------
@@ -682,7 +761,26 @@ def _index_for(root: pathlib.Path, root_st: os.stat_result) -> _BookIndex:
         index = _build_index(root, root_st)
         return index, index.key, index.weight, index.stable
 
-    return _get_or_build(_book_ident(root_st), lookup, build)
+    def still_valid(index: _BookIndex) -> bool:
+        # Another thread's build, which may not be stored (too heavy, or
+        # its files changed while it read them): its files must still be
+        # the ones it read.
+        return _current_key(root, root_st, index.keyed_files) == index.key
+
+    return _get_or_build(_book_ident(root_st), lookup, build, still_valid)
+
+
+def _held_index(root: pathlib.Path, root_st: os.stat_result,
+                held: Optional[_BookIndex]) -> Optional[_BookIndex]:
+    """``held`` (an index a ``BookContent`` kept from its last gate) if it
+    was read from this bundle as it is now (same key); else None.
+
+    :raises BookNotDownloadedError: as :func:`_current_key`.
+    """
+    if held is None or not held.stable or held.key[:3] != (root_st.st_dev, root_st.st_ino,
+                                                           root_st.st_mtime_ns):
+        return None
+    return held if _current_key(root, root_st, held.keyed_files) == held.key else None
 
 
 def _local_root(root: pathlib.Path) -> Optional[os.stat_result]:
@@ -841,7 +939,7 @@ def _drm_evidence(root: pathlib.Path) -> Optional[str]:
     return "encryption.xml" if verdict else None
 
 
-def _gate_steps(root: pathlib.Path) -> _Gated:
+def _gate_steps(root: pathlib.Path, held: Optional[_BookIndex] = None) -> _Gated:
     # (2) The bundle itself.
     if root.suffix.lower() != ".epub":
         return _not_epub(root)
@@ -862,10 +960,12 @@ def _gate_steps(root: pathlib.Path) -> _Gated:
     # after the DRM check, as a miss finds it while reading (after it).
     _content._check_dirs_local(root, "META-INF")
     pending: Optional[BookNotDownloadedError] = None
+    index: Optional[_BookIndex] = None
     try:
         entry = _lookup(root, st)
+        index = entry.value if entry is not None else _held_index(root, st, held)
     except BookNotDownloadedError as e:
-        entry, pending = None, e
+        pending = e
     # (5) DRM, on every call.
     evidence = _drm_evidence(root)
     if evidence is not None:
@@ -874,14 +974,21 @@ def _gate_steps(root: pathlib.Path) -> _Gated:
     if pending is not None:
         return _Gated(UnavailableReason.NOT_DOWNLOADED, error=pending)
     # (6) A miss reads the index.
-    index = entry.value if entry is not None else _index_for(root, st)
+    if index is None:
+        index = _index_for(root, st)
     return _Gated(None, key=index.key, index=index)
 
 
-def _gate_path(path: Any) -> _Gated:
+def _gate_path(path: Any, held: Optional[_BookIndex] = None) -> _Gated:
     """The checks a ``BookContent`` method of 1.11 runs before reading the
     bundle at ``path``, and the book's index if they pass. The same result
     whether the index is cached or not.
+
+    ``held``: an index the caller kept from an earlier gate of the same
+    bundle; used, when the cache doesn't have the bundle's index (any
+    more), if its files are unchanged, so an index that can't stay in the
+    cache (too heavy, evicted) isn't read again on every call. Every
+    check still runs.
 
     In order, with downloads of evicted files turned off throughout:
     (2) the bundle: not ``.epub`` or not a folder → ``NOT_EPUB``; missing,
@@ -896,7 +1003,7 @@ def _gate_path(path: Any) -> _Gated:
     root = pathlib.Path(path)
     with _icloud.no_materialize():
         try:
-            return _gate_steps(root)
+            return _gate_steps(root, held)
         except BookNotDownloadedError as e:
             return _Gated(UnavailableReason.NOT_DOWNLOADED, error=e)
         except AppleBooksError as e:

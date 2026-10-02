@@ -665,8 +665,10 @@ class Chapter:
         file in the book's spine (its first, if the spine lists the file
         more than once), the number ``Location.spine_index`` and
         :attr:`SpineItem.index` use; None when the file isn't in the
-        spine, or for a :class:`Chapter` built without it. Not part of
-        equality, hashing or ``repr``, so chapters compare as in 1.10.
+        spine, or for a :class:`Chapter` built without it (by hand, by
+        1.10, or by a :class:`BookContent` unpickled with its book
+        already read whose index can't be used). Not part of equality,
+        hashing or ``repr``, so chapters compare as in 1.10.
     """
 
     id: str
@@ -862,6 +864,14 @@ class BookContent(_ResolveMixin, _ReadingMixin):
         # get_spine_item_text() default text by manifest id: at most one
         # book's text, dropped with the instance.
         self._spine_text_memo: Dict[str, str] = {}
+        # (cache generation, index) of the last gate of the new APIs:
+        # reused while the cache isn't cleared and the index's files are
+        # unchanged, if the cache doesn't keep it (see _gated_index).
+        self._index_memo: Optional[Tuple[int, Any]] = None
+        # (parsed package document, its folder as ebooklib names it) of the
+        # book this instance read, for Chapter.spine_index when the index
+        # can't give the chapter list (see _chapter_list).
+        self._package: Optional[Tuple[Any, str]] = None
 
     # Kept by pickle and copy; everything else is runtime state.
     _PICKLED = ("path", "_book", "_book_id", "_opf_dir_cache")
@@ -1010,7 +1020,23 @@ class BookContent(_ResolveMixin, _ReadingMixin):
         book = self._load_book()
         chapters = tuple(self._chapters_from_loaded_book(book))
         index = _epub_index._index_matching(self.path, chapters)
-        return index.chapters if index is not None else chapters
+        if index is not None:
+            return index.chapters
+        return self._with_spine_indexes(chapters)
+
+    def _with_spine_indexes(self, chapters: Tuple[Chapter, ...]) -> Tuple[Chapter, ...]:
+        """``chapters`` (1.10's list, read without the index) with
+        :attr:`Chapter.spine_index` set by the index's rule, from the
+        package document this instance read; as they are if it didn't
+        keep it (an unpickled instance) or the rule fails."""
+        package = self._package
+        if package is None:
+            return chapters
+        try:
+            first = _epub_index._package_spine_indexes(package[0], package[1], self._to_bundle_relative)
+        except Exception:  # noqa: BLE001 (spine_index is then None, as for 1.10 chapters)
+            return chapters
+        return _epub_index._with_spine_indexes(chapters, first)
 
     def _chapters_from_loaded_book(self, book: epub.EpubBook) -> List[Chapter]:
         """1.10's chapter list from the loaded book: the ToC, else the
@@ -1078,7 +1104,7 @@ class BookContent(_ResolveMixin, _ReadingMixin):
         :raises AppleBooksError: the file can't be read.
         """
         if isinstance(item, bool) or (isinstance(item, int) and item < 0):
-            raise ChapterNotFoundError(f"No spine entry at index {item!r} in this book.")
+            raise _no_spine_entry(item)
         if not isinstance(item, (str, int)):
             raise InvalidArgumentError(
                 f"item must be a manifest id (str) or a spine index (int), "
@@ -1086,12 +1112,12 @@ class BookContent(_ResolveMixin, _ReadingMixin):
         index = self._gated_index()
         if isinstance(item, int):
             if item >= len(index.spine):
-                raise ChapterNotFoundError(f"No spine entry at index {item} in this book.")
+                raise _no_spine_entry(item)
             entry = index.spine[item]
+            missing = f"No text document at spine index {int(item)} in this book."
             if entry.item_id is None or not entry.readable:
-                raise ChapterNotFoundError(f"No text document at spine index {item} in this book.")
+                raise ChapterNotFoundError(missing)
             item_id = entry.item_id
-            missing = f"No text document at spine index {item} in this book."
         else:
             item_id = item
             missing = f"No text document with id {quote_name(item)} in this book."
@@ -1136,7 +1162,12 @@ class BookContent(_ResolveMixin, _ReadingMixin):
             :class:`~py_apple_books.positions.TextPosition`, or a
             :class:`~py_apple_books.positions.ResolvedBoundary` (its
             ``position``; a ``ReadBoundary`` must be placed first, with
-            ``resolve_boundary``). Default: the end of the book.
+            ``resolve_boundary``). Default: the end of the book. A
+            boundary is checked against :attr:`book_id`: an instance made
+            from a path alone (``book_id`` None) can't tell which book a
+            boundary was resolved for, and takes its position as is, so
+            use one from :meth:`PyAppleBooks.get_book_content` for a
+            boundary from the library.
         :param include_nonlinear: Also yield items marked
             ``linear="no"``.
         :param include_toc_pages: Also yield table-of-contents pages.
@@ -1210,13 +1241,22 @@ class BookContent(_ResolveMixin, _ReadingMixin):
     def _gated_index(self) -> "_epub_index._BookIndex":
         """The book's index, after the checks every new content API runs
         (see :func:`py_apple_books._epub_index._gate_path`); raises what
-        they find."""
+        they find. The index this instance got last is passed to the gate
+        (one book's index, dropped with the instance or when the cache is
+        cleared)."""
         self._require_epub()
-        gated = _epub_index._gate_path(self.path)
+        generation = _epub_index._CACHE.generation
+        memo = self._index_memo
+        held = memo[1] if memo is not None and memo[0] == generation else None
+        gated = _epub_index._gate_path(self.path, held)
         if gated.reason is not None:
             if gated.reason == UnavailableReason.NOT_EPUB:
                 self._require_epub()
             raise gated.error
+        # Kept so that a book whose index can't stay in the cache (too
+        # heavy, or evicted) isn't read again by every call (each item of
+        # iter_spine_text); the gate still runs every check each time.
+        self._index_memo = (generation, gated.index)
         return gated.index
 
     def _read_spine_text(self, index: "_epub_index._BookIndex", item_id: str, missing: str) -> str:
@@ -1376,7 +1416,8 @@ class BookContent(_ResolveMixin, _ReadingMixin):
             return book
         with self._lock:
             if self._book is None:
-                book, container = self._read_book()
+                book, container, package = self._read_book()
+                self._package = package
                 if self._opf_dir_cache is None:
                     self._opf_dir_cache = (
                         _opf_dir_from_container_bytes(container)
@@ -1386,8 +1427,10 @@ class BookContent(_ResolveMixin, _ReadingMixin):
                 self._book = book
             return self._book
 
-    def _read_book(self) -> Tuple[epub.EpubBook, Optional[bytes]]:
-        """The parsed book, and its ``META-INF/container.xml`` bytes."""
+    def _read_book(self) -> Tuple[epub.EpubBook, Optional[bytes], Optional[Tuple[Any, str]]]:
+        """The parsed book, its ``META-INF/container.xml`` bytes, and its
+        parsed package document with the package's folder (as ebooklib
+        names it)."""
         # Same steps as epub.read_epub(), with the contained reader.
         reader = _ContainedEpubReader(str(self.path))
         try:
@@ -1403,7 +1446,9 @@ class BookContent(_ResolveMixin, _ReadingMixin):
             raise AppleBooksError(
                 f"Could not read EPUB {quote_title(self.path.name)}: {detail(e)}"
             ) from e
-        return book, reader.container_bytes
+        opf = getattr(reader, "container", None)
+        package = (opf, reader.opf_dir or "") if opf is not None else None
+        return book, reader.container_bytes, package
 
     def _opf_dir(self) -> pathlib.PurePosixPath:
         """Cached OPF directory relative to the EPUB bundle root.
@@ -1836,6 +1881,17 @@ def _parse_ncx_bytes(
 
     walk(nav_map.findall(f"{{{_NS_NCX}}}navPoint"), 0)
     return chapters
+
+
+def _no_spine_entry(item: int) -> ChapterNotFoundError:
+    """The error for a spine index that names no entry: the index in the
+    message when it is short, else none (a huge int has no short text,
+    and past 4,300 digits no text at all)."""
+    if isinstance(item, bool):
+        return ChapterNotFoundError(f"No spine entry at index {item!r} in this book.")
+    if -10**12 < item < 10**12:
+        return ChapterNotFoundError(f"No spine entry at index {int(item)} in this book.")
+    return ChapterNotFoundError("No spine entry at that index in this book.")
 
 
 # ---------------------------------------------------------------------------
