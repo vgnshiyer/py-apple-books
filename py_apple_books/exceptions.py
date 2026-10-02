@@ -1,6 +1,6 @@
 """Exceptions raised by py_apple_books.
 
-Hierarchy (1.10)::
+Hierarchy (1.10; the classes marked 1.11 are new)::
 
     AppleBooksError
     ├── NotFoundError                      (also LookupError)
@@ -15,6 +15,8 @@ Hierarchy (1.10)::
     │   └── NotInLibraryError
     ├── DRMProtectedError
     ├── UnsafeEpubEntryError
+    ├── NotEpubError                       (1.11)
+    ├── ContextUnavailableError            (1.11)
     ├── DBError
     │   ├── DBConnectionError
     │   │   ├── LibraryNotFoundError
@@ -182,7 +184,47 @@ class UnsafeEpubEntryError(AppleBooksError):
     (FIFO, device node), or is implausibly large. Reading it could expose
     unrelated local files or block forever, so the read is refused — a
     crafted book fails to load instead.
+
+    ``entry`` (1.11) is the entry name as the book wrote it, in full; the
+    message shortens a name over 80 characters. None when unknown.
     """
+
+    def __init__(self, *args, entry=None):
+        super().__init__(*args)
+        self.entry = entry
+
+
+class NotEpubError(AppleBooksError):
+    """Raised by an EPUB-only :class:`~py_apple_books.content.BookContent`
+    method (chapter listing and reading) when the book is not an EPUB
+    bundle directory: a PDF, a zipped ``.epub`` or anything else. New in
+    1.11; 1.10 raised a plain :class:`AppleBooksError` with the same
+    message, which still catches it.
+    """
+
+
+class ContextUnavailableError(AppleBooksError):
+    """Raised when the text around an annotation can't be shown for a
+    reason of the annotation itself (the book is readable). ``reason``
+    is one of the class constants below (the matching
+    ``py_apple_books.positions.UnavailableReason`` values);
+    ``annotation_id`` the annotation's id, when known.
+    """
+
+    NO_LOCATION = "no_location"
+    NO_HIGHLIGHT_TEXT = "no_highlight_text"
+    ORPHANED = "orphaned"
+    EMPTY_CHAPTER = "empty_chapter"
+    HIGHLIGHT_NOT_FOUND = "highlight_not_found"
+
+    def __init__(self, message: str, reason: str = None, annotation_id=None):
+        super().__init__(message)
+        self.reason = reason
+        self.annotation_id = annotation_id
+
+    def __reduce__(self):
+        message = self.args[0] if self.args else ""
+        return (type(self), (message, self.reason, self.annotation_id), self.__dict__)
 
 
 # -- database -----------------------------------------------------------------

@@ -3,12 +3,14 @@ import inspect
 import pathlib
 import re
 import sqlite3
+import stat
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-from py_apple_books import collection_writer
+from typing import Dict, List, Optional, Tuple, Union
+from py_apple_books import _icloud, collection_writer
 from py_apple_books._api._common import (  # noqa: F401 (re-exported: 1.10 private names)
     _annotation_scope,
+    _book_arg,
     _book_by_id,
     _book_scope,
     _books_by_asset,
@@ -52,7 +54,11 @@ from py_apple_books.models import (
     ReadingStatus,
 )
 from py_apple_books.models.annotation import _ALL_ANNOTATIONS, _LIVE_ANNOTATIONS  # noqa: F401 (1.10 names)
-from py_apple_books.models.book import CONTENT_TYPE_SERIES_CONTAINER, SERIES_DATA_SOURCE  # noqa: F401 (1.10 names)
+from py_apple_books.models.book import (  # noqa: F401 (1.10 names)
+    CONTENT_TYPE_SERIES_CONTAINER,
+    SERIES_DATA_SOURCE,
+    STATE_CLOUD_ONLY,
+)
 from py_apple_books.models.manager import ModelIterable, normalize_limit, normalize_offset
 from py_apple_books.utils import APPLE_EPOCH_OFFSET, snap_window
 from py_apple_books.write_safety import _backup_dir_for, _own_backup_dir, _writes_home_store
@@ -625,22 +631,39 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
         )
 
     # -- content actions --
-    def get_book_content(self, book_id: int) -> BookContent:
+    def get_book_content(self, book_id: Union[int, str, Book]) -> BookContent:
         """Return a :class:`BookContent` handle for reading a book's full text.
 
-        Performs three pre-checks before returning:
+        Performs these pre-checks before returning, in order:
 
         1. The book's file is recorded in the library (``ZPATH`` is set).
-        2. The file is locally downloaded, not an iCloud placeholder.
-        3. The file is not DRM-protected: no FairPlay ``sinf.xml``, no
+        2. The file is on this Mac, checked without downloading anything
+           (1.11): Books doesn't record the book as stored only in iCloud
+           (``ZSTATE`` 3; refused before any file is touched); the file or
+           bundle isn't an iCloud placeholder and has no iCloud stub next
+           to it; and no file or folder inside the bundle is a
+           placeholder (an ``lstat`` walk that never lists a placeholder
+           folder).
+        3. The file is locally downloaded, not an iCloud placeholder
+           (:func:`~py_apple_books.content.is_downloaded`).
+        4. The file is not DRM-protected: no FairPlay ``sinf.xml``, no
            Adobe ``rights.xml``, and no ``META-INF/encryption.xml`` that
            encrypts more than fonts (see
            :attr:`BookContent.is_drm_protected`).
 
+        Reads that would still reach an evicted file later fail with
+        :class:`BookNotDownloadedError` rather than download it.
+
+        :param book_id: The book's id, or (1.11) a :class:`Book`. A
+            ``Book`` read from this library is used as is (no query),
+            unless its ``path`` or ``state`` wasn't read (``only=``):
+            then it is read again by id, as is a ``Book`` from another
+            library.
         :raises BookNotDownloadedError: if the book has no local file
-            (``path`` is None) or exists only as an iCloud placeholder. The
-            fix in both cases is to open the book in Apple Books to trigger
-            a download.
+            (``path`` is None), is stored only in iCloud, or is partly
+            evicted (some of its files are only in iCloud). The fix in
+            each case is to open the book in Apple Books to trigger a
+            download.
         :raises NotInLibraryError: (a :class:`BookNotDownloadedError`)
             if the row is an Apple Books Store series item you don't own
             (:attr:`Book.is_store_series_item`) and has no local file:
@@ -653,7 +676,10 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
             not an :class:`AppleBooksError`, for 1.x compatibility.
         """
         try:
-            book = self.get_book_by_id(book_id)
+            if isinstance(book_id, Book):
+                book = _book_arg(book_id, needs=("path", "state"), get_book=self.get_book_by_id)
+            else:
+                book = self.get_book_by_id(book_id)
         except BookNotFoundError as e:
             # 1.x compatibility: this has always raised a bare IndexError
             # for an unknown id, and apple-books-mcp <= 0.8.2 catches
@@ -666,38 +692,36 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
         # plain object. A row with a local file is always tried.
         if getattr(book, "is_store_series_item", False) and not getattr(book, "path", None):
             raise NotInLibraryError(
-                f"'{book.title}' is an Apple Books Store series item that "
+                f"{_quoted_title(book)} is an Apple Books Store series item that "
                 f"isn't in your library (an unowned volume or a series "
                 f"container), so there is no book file to read."
             )
 
         if not book.path:
             raise BookNotDownloadedError(
-                f"'{book.title}' has not been downloaded to this Mac. "
+                f"{_quoted_title(book)} has not been downloaded to this Mac. "
                 f"Open it in Apple Books to download a local copy, then "
                 f"try again."
             )
 
-        content = BookContent(pathlib.Path(book.path))
+        path = pathlib.Path(book.path)
+        _require_local_files(book, path)
+        content = BookContent(path, book_id=getattr(book, "id", None))
 
         if not content.is_downloaded:
-            raise BookNotDownloadedError(
-                f"'{book.title}' is stored in iCloud and has not been "
-                f"downloaded to this Mac. Open it in Apple Books to trigger "
-                f"a download, then try again."
-            )
+            raise BookNotDownloadedError(_stored_in_icloud_message(book))
 
         if content.is_drm_protected:
             # Only sinf.xml proves a FairPlay Store purchase; anything
             # else is an imported EPUB carrying its own DRM.
             if content._drm_evidence() == "sinf.xml":
                 raise DRMProtectedError(
-                    f"'{book.title}' is a DRM-protected Apple Books Store "
+                    f"{_quoted_title(book)} is a DRM-protected Apple Books Store "
                     f"purchase (FairPlay). Its text content cannot be read "
                     f"directly; only imported EPUBs and PDFs are readable."
                 )
             raise DRMProtectedError(
-                f"'{book.title}' is an encrypted EPUB (DRM). Its text "
+                f"{_quoted_title(book)} is an encrypted EPUB (DRM). Its text "
                 f"content cannot be read directly; only DRM-free EPUBs "
                 f"are readable."
             )
@@ -839,6 +863,58 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
             chars_before,
             chars_after,
         )
+
+
+def _quoted_title(book) -> str:
+    """A book's title in a :meth:`PyAppleBooks.get_book_content` message,
+    exactly as 1.10 wrote it (``'<title>'``), at any length.
+
+    Titles are not shortened here (entry and file names in content
+    errors are, see :mod:`py_apple_books._messages`): apple-books-mcp
+    0.8.2 shows these messages verbatim, so shortening a long title would
+    change its output for books that are fully downloaded (DRM-protected
+    or Store series books), and 0.9.0 already shortens quoted names
+    itself.
+    """
+    return f"'{book.title}'"
+
+
+def _stored_in_icloud_message(book) -> str:
+    return (
+        f"{_quoted_title(book)} is stored in iCloud and has not been "
+        f"downloaded to this Mac. Open it in Apple Books to trigger "
+        f"a download, then try again."
+    )
+
+
+def _require_local_files(book, path: pathlib.Path) -> None:
+    """The iCloud gates of :meth:`PyAppleBooks.get_book_content` (1.11),
+    before ``du`` runs: ``ZSTATE`` 3 (before any file access); the book's
+    file or bundle being an iCloud placeholder or having an iCloud stub
+    next to it (1.10's "stored in iCloud" message); then anything inside
+    the bundle being one (the partial-download message). Errors other
+    than a refused download are left to the 1.10 checks that follow.
+    """
+    if getattr(book, "state", None) == STATE_CLOUD_ONLY:
+        raise BookNotDownloadedError(_stored_in_icloud_message(book))
+    with _icloud.no_materialize():
+        try:
+            if _icloud.icloud_stub(path):
+                raise BookNotDownloadedError(_stored_in_icloud_message(book))
+            st = _icloud.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                st = _icloud.stat(path)
+        except (OSError, ValueError) as e:
+            if _icloud.is_materialize_error(e):
+                raise BookNotDownloadedError(_stored_in_icloud_message(book)) from None
+            return
+        if _icloud.is_dataless(st):
+            raise BookNotDownloadedError(_stored_in_icloud_message(book))
+        if not stat.S_ISDIR(st.st_mode):
+            return
+        found = _icloud.walk_bundle_local(path)
+    if found in (_icloud.FileState.DATALESS, _icloud.FileState.ICLOUD_STUB):
+        raise BookNotDownloadedError(_icloud.PARTIAL_DOWNLOAD_MESSAGE)
 
 
 def _in_library(method):
