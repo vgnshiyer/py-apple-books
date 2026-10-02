@@ -386,18 +386,18 @@ class TestLimits:
                 + "".join(f'<!ENTITY a{i} "&a{i - 1 if i else ""};&a{i - 1 if i else ""};">' for i in range(30))
                 + ']><package><metadata><dc:subject xmlns:dc="x">&a29;</dc:subject></metadata></package>')
         path = bundle(tmp_path, bomb.encode("utf-16"))
-        started = time.perf_counter()
+        started = time.process_time()  # CPU time: no expansion work (wall time varies with load)
         assert read(path).state == _opf.UNREADABLE
-        assert time.perf_counter() - started < 0.5
+        assert time.process_time() - started < 0.5
 
     def test_tiny_elements(self, tmp_path):
         body = "<x/>" * (2 * 1024 * 1024)  # 8 MiB
         path = bundle(tmp_path, opf(body))
         tracemalloc.start()
-        started = time.perf_counter()
+        started = time.process_time()
         try:
             assert read(path).state == _opf.UNREADABLE
-            elapsed = time.perf_counter() - started
+            elapsed = time.process_time() - started
             peak = tracemalloc.get_traced_memory()[1]
         finally:
             tracemalloc.stop()
@@ -419,9 +419,9 @@ class TestLimits:
         path = bundle(tmp_path, opf("<dc:description>" + "&lt;p&gt;word word word&lt;/p&gt;" * 100_000
                                     + "</dc:description>"))
         assert path.joinpath("OEBPS/content.opf").stat().st_size < _opf.OPF_MAX_BYTES
-        started = time.perf_counter()
+        started = time.process_time()
         got = fields(path)
-        assert time.perf_counter() - started < 1
+        assert time.process_time() - started < 1
         assert len(got.description) <= _opf.DESCRIPTION_MAX
 
     def test_over_the_read_budget(self, tmp_path):
@@ -477,7 +477,8 @@ class TestFailSoft:
         os.mkfifo(path / "OEBPS" / "content.opf")
         started = time.perf_counter()
         assert read(path).state == _opf.UNREADABLE
-        assert time.perf_counter() - started < 0.5
+        # Wall time: a blocking open would wait for a writer forever.
+        assert time.perf_counter() - started < 5
 
     def test_unknown_encoding(self, tmp_path):
         package = opf("<dc:subject>A</dc:subject>").replace('encoding="UTF-8"', 'encoding="x-nonexistent"')
