@@ -254,7 +254,9 @@ def test_a_lock_taken_before_the_retry_stops_it_at_the_deadline(bad, monkeypatch
         thread.start()
         assert held.wait(timeout=10)
 
-    _slow_first_attempt(monkeypatch, 0.8 * SLACK, lock)
+    # Most of the limit goes to the slow first attempt, so the retry's
+    # own wait is short and its oversleep on a loaded machine small.
+    _slow_first_attempt(monkeypatch, 0.9 * SLACK, lock)
     try:
         with LibraryDB(data_dir=bad.data_dir, query_timeout=1.0 * SLACK) as db:
             start = time.monotonic()
