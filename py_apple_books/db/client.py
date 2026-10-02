@@ -553,6 +553,21 @@ class _Schema(NamedTuple):
 # set from, for messages.
 _deadline: contextvars.ContextVar = contextvars.ContextVar("py_apple_books_deadline", default=None)
 
+# Held by the thread of a forked child that sets a library's inherited
+# state aside (LibraryDB._check_fork); the child's other threads wait
+# for it. Made anew in every child: a fork copies it in whatever state
+# it is in.
+_fork_lock = threading.Lock()
+
+
+def _new_fork_lock() -> None:
+    global _fork_lock
+    _fork_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_new_fork_lock)
+
 
 class LibraryDB:
     """One Apple Books library: its two stores and a pool of read-only
@@ -782,10 +797,15 @@ class LibraryDB:
 
     def _check_fork(self) -> None:
         pid = os.getpid()
-        if pid != self._pid:
-            # A forked child: the parent's connections and locks aren't
-            # ours. Set the connections aside unused and unclosed.
-            self._pid = pid
+        if pid == self._pid:
+            return
+        with _fork_lock:
+            if pid == self._pid:
+                return  # another thread of this child did it
+            # A forked child: the parent's connections, derived objects
+            # and locks aren't ours. Set them aside unused and unclosed.
+            # The pid goes last: until then the child's other threads
+            # wait above instead of using what the parent left.
             self._inherited = self._inherited + self._idle
             self._idle = []
             self._derived_inherited = self._derived_inherited + list(self._derived.values())
@@ -793,6 +813,7 @@ class LibraryDB:
             self._lock = threading.RLock()
             self._slots = _Slots(self.max_connections)
             self._generation += 1
+            self._pid = pid
 
     def _connect(self, paths: StorePaths, check_same_thread: bool,
                  busy: float = _BUSY_TIMEOUT) -> sqlite3.Connection:

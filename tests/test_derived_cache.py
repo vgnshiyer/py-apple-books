@@ -9,7 +9,7 @@ import warnings
 
 import pytest
 
-from py_apple_books.db import LibraryDB
+from py_apple_books.db import LibraryDB, client
 
 COUNT_BOOKS = "SELECT count(*) FROM ZBKLIBRARYASSET"
 
@@ -366,3 +366,74 @@ def test_fork_child(lib_db):
     assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
     assert output == repr((True, 1, [True], 0, 1)).encode()
     assert lib_db._derived_cache("index", Derived) is parents and parents.discarded == 0
+
+
+class _PausingDict(dict):
+    """A dict whose ``values()`` waits for ``proceed``, after setting
+    ``entered``: the moment a child's first thread is setting the
+    parent's objects aside."""
+
+    def __init__(self, data, entered, proceed):
+        super().__init__(data)
+        self.entered, self.proceed = entered, proceed
+
+    def values(self):
+        self.entered.set()
+        assert self.proceed.wait(timeout=10)
+        return super().values()
+
+
+def test_a_childs_threads_wait_while_the_parents_objects_are_set_aside(tmp_path):
+    """Two threads of a child use the library first at the same time
+    (simulated by changing the recorded pid): the second waits until the
+    first has set the parent's objects aside, so it never gets one."""
+    db = LibraryDB(data_dir=tmp_path / "nowhere")
+    parents = db._derived_cache("index", Derived)
+    entered, proceed = threading.Event(), threading.Event()
+    db._derived = _PausingDict(db._derived, entered, proceed)
+    db._pid = -1  # a child
+    got = []
+
+    def use():
+        got.append(db._derived_cache("index", Derived))
+
+    first, second = threading.Thread(target=use), threading.Thread(target=use)
+    first.start()
+    try:
+        assert entered.wait(timeout=10)  # first is moving the parent's objects
+        second.start()
+        second.join(timeout=0.2)
+        assert second.is_alive() and got == []
+    finally:
+        proceed.set()
+        first.join(timeout=10)
+        if second.ident is not None:
+            second.join(timeout=10)
+    assert len(got) == 2 and got[0] is got[1] and got[0] is not parents
+    assert db._derived_inherited == [parents] and db._pid == os.getpid()
+
+
+@pytest.mark.skipif(not hasattr(os, "register_at_fork"), reason="needs os.fork")
+def test_a_child_gets_a_new_fork_lock(lib_db):
+    """A fork copies the lock a child's first use takes in whatever state
+    it is in (held, here); the child replaces it."""
+    lib_db.fixture.add_book("Synthetic Book")
+    parents = lib_db._derived_cache("index", Derived)
+    with client._fork_lock:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)  # fork() with other threads alive
+            pid = os.fork()
+        if pid == 0:  # pragma: no cover - child
+            status = 1
+            try:
+                if client._fork_lock.acquire(timeout=5):
+                    client._fork_lock.release()
+                    mine = lib_db._derived_cache("index", Derived)
+                    if mine is not parents and mine.count_books(lib_db) == 1:
+                        status = 0
+                else:
+                    status = 2
+            finally:
+                os._exit(status)
+    _, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
