@@ -500,10 +500,11 @@ class AnnotationIndex:
     its next lock wait or build chunk and raises ``_Dead``. A call's
     last attempt finishes on the databases, a build included, on the
     one index the last attempts share (:func:`_finisher`). So repeated
-    ``close()`` calls during searches run at most about two builds at
-    once (the library's current index and the shared one), not one more
-    per call. In a forked child the index is never used (``dead``); the
-    library makes a new one.
+    ``close()`` calls during searches run at most two full builds at
+    once (the library's current index's and the shared one's), plus at
+    most one chunk in flight on each index discarded meanwhile, not one
+    more full build per call. In a forked child the index is never used
+    (``dead``); the library makes a new one.
     """
 
     def __init__(self):
