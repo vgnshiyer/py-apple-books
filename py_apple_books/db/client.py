@@ -107,9 +107,9 @@ _COMPAT_WARNING = (
     "AppleBooksDBClient.conn is deprecated and will be removed in 2.0; "
     "use LibraryDB.open_connection()"
 )
-#: Logged (once per :class:`LibraryDB`) when a query first meets a text
-#: cell that isn't valid UTF-8.
-INVALID_TEXT_WARNING = (
+# Logged (once per LibraryDB) when a query first meets a text cell that
+# isn't valid UTF-8.
+_INVALID_TEXT_WARNING = (
     "Some text in the Apple Books library isn't valid UTF-8; it is shown with U+FFFD in "
     "place of the invalid bytes."
 )
@@ -597,8 +597,8 @@ class LibraryDB:
 
     Text that isn't valid UTF-8 (which sqlite3 refuses to read) doesn't
     fail queries: the first statement that meets such a cell is run
-    again with U+FFFD in place of the invalid bytes, a warning
-    (:data:`INVALID_TEXT_WARNING`) is logged once, and from then on
+    again with U+FFFD in place of the invalid bytes, a warning is
+    logged once (logger ``py_apple_books.db``), and from then on
     every query of this library reads text that way. The connections
     :meth:`connection` and :meth:`open_connection` hand out read text as
     sqlite3 does by default.
@@ -1174,7 +1174,7 @@ class LibraryDB:
         with self._lock:
             first, self._lenient_text = not self._lenient_text, True
         if first:
-            logger.warning(INVALID_TEXT_WARNING)
+            logger.warning(_INVALID_TEXT_WARNING)
 
     def _run(self, fn: Callable[[sqlite3.Connection], _T]) -> _T:
         return self._run_pooled(lambda pooled: fn(pooled.conn))

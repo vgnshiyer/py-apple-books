@@ -27,7 +27,7 @@ from py_apple_books.collection_writer import (
 )
 from py_apple_books.db import LibraryDB
 from py_apple_books.db import client
-from py_apple_books.db.client import INVALID_TEXT_WARNING, AppleBooksDBClient
+from py_apple_books.db.client import _INVALID_TEXT_WARNING, AppleBooksDBClient
 from py_apple_books.exceptions import (
     CollectionNotFoundError,
     DBQueryError,
@@ -55,7 +55,7 @@ def _set_text(lib, store, table, column, pk, raw: bytes) -> None:
 
 
 def _warnings(caplog):
-    return [r for r in caplog.records if r.getMessage() == INVALID_TEXT_WARNING]
+    return [r for r in caplog.records if r.getMessage() == _INVALID_TEXT_WARNING]
 
 
 def _assert_scrubbed(e, column="ZTITLE"):
@@ -302,6 +302,30 @@ def test_threads_share_one_switch(bad, caplog):
         assert all(p.conn.text_factory is str for p in db._idle)
     finally:
         db.close()
+
+
+def test_threads_switching_at_once_warn_once(db, caplog):
+    """Threads whose statements all meet invalid text before any of
+    them has switched the library: each switches it, one warns."""
+    barrier = threading.Barrier(8)
+    errors = []
+
+    def worker():
+        try:
+            barrier.wait(timeout=30)
+            db._make_lenient()
+        except BaseException as e:  # pragma: no cover - reported below
+            errors.append(e)
+
+    with caplog.at_level(logging.WARNING, logger="py_apple_books"):
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        db._make_lenient()
+    assert not errors and db._lenient_text
+    assert len(_warnings(caplog)) == 1
 
 
 # -- errors never quote the cell ----------------------------------------------------
