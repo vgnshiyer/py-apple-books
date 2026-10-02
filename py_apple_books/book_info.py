@@ -491,6 +491,11 @@ def _new_io_lock() -> None:
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_new_io_lock)
 
+
+class _NeedsRead(Exception):
+    """The memo can't answer a lookup without reading a file (private)."""
+
+
 # _FileMemo.unusable values.
 _DRIFTED = "drifted"  # kept while the file is unchanged
 _REFUSED = "refused"  # retried at the next look at the folder
@@ -513,9 +518,10 @@ class _BookInfoIndex:
     (``db._derived_cache('book_info', ...)``, so ``close()`` and a fork
     drop it). Holds no reference to the library and no open connection.
 
-    ``_build`` serializes the folder checks and file reads of lookups;
-    ``_lock`` guards the fields and is held only around reads and writes
-    of them (never during I/O).
+    ``_build`` serializes the folder checks and file reads of lookups (a
+    lookup the memo fully answers doesn't take it); ``_lock`` guards the
+    fields and is held only around reads and writes of them (never
+    during I/O).
     """
 
     def __init__(self, folder: str):
@@ -540,6 +546,15 @@ class _BookInfoIndex:
     def lookup(self, ids: Sequence[str], deadline: float) -> Dict[str, Tuple[str, _Row]]:
         """``{id: (file name, row)}`` for the ids found, reading what the
         memo lacks until ``deadline``. Never raises for cache problems."""
+        with self._lock:
+            checked = self._checked
+        if checked is not None and time.monotonic() - checked < BOOK_INFO_RECHECK:
+            # No folder check due: if the memo answers every id, no I/O is
+            # needed, so don't wait behind a lookup that is reading files.
+            try:
+                return self._resolve(ids, None, memo_only=True)
+            except _NeedsRead:
+                pass
         wait = deadline - time.monotonic()
         if not self._build.acquire(timeout=max(0.0, wait)):
             # Another thread is reading the files: answer from what is
@@ -582,11 +597,14 @@ class _BookInfoIndex:
                            if name in sigs and memo.unusable != _REFUSED}
             self._checked = now
 
-    def _resolve(self, ids: Sequence[str], deadline: Optional[float]) -> Dict[str, Tuple[str, _Row]]:
+    def _resolve(self, ids: Sequence[str], deadline: Optional[float], *,
+                 memo_only: bool = False) -> Dict[str, Tuple[str, _Row]]:
         """Merge the files' rows, newest file first: for each id the newest
         file with a title wins, else the newest with an author. Reads
         files (``deadline`` not None, under ``_build``) only for ids that
-        still lack a title and the file's memo doesn't answer."""
+        still lack a title and the file's memo doesn't answer. With
+        ``memo_only``, raises :class:`_NeedsRead` instead of reading or
+        of falling back to a changed file's last good rows."""
         with self._lock:
             names = self._names
         need = [i for i in ids if _bindable(i)]
@@ -594,7 +612,7 @@ class _BookInfoIndex:
         for name in names:
             if not need:
                 break
-            rows = self._file_rows(name, need, deadline)
+            rows = self._file_rows(name, need, deadline, memo_only)
             for i, row in rows.items():
                 if row is None:
                     continue
@@ -604,7 +622,8 @@ class _BookInfoIndex:
             need = [i for i in need if not (i in found and found[i][1].title is not None)]
         return found
 
-    def _file_rows(self, name: str, ids: List[str], deadline: Optional[float]) -> Dict[str, Optional[_Row]]:
+    def _file_rows(self, name: str, ids: List[str], deadline: Optional[float],
+                   memo_only: bool = False) -> Dict[str, Optional[_Row]]:
         """The rows of one file for ``ids``: from its memo while the file
         is unchanged, else read (when ``deadline`` allows); on a failed
         read, the last good rows."""
@@ -615,6 +634,8 @@ class _BookInfoIndex:
             fresh = memo is not None and memo.sig == self._sigs.get(name)
             if fresh and memo.unusable:
                 return {}
+            if memo_only and not (fresh and all(i in memo.rows for i in ids)):
+                raise _NeedsRead
             for i in ids:
                 if fresh and i in memo.rows:
                     rows[i] = memo.rows[i]

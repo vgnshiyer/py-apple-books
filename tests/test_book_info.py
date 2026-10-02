@@ -810,6 +810,23 @@ def test_a_waiting_thread_answers_from_the_memo(three, reader, monkeypatch):
     assert list(got) == ["A"]  # B was never read: not known yet
 
 
+def test_remembered_ids_are_answered_without_waiting(three, reader, spy, monkeypatch):
+    first = reader.get_cached_book_info(["A", "B", "C", "T", "Z"])
+    index = index_of(reader)
+    spy.reset()
+    with index._build:  # another thread is reading the files, for up to 2 s
+        start = time.monotonic()
+        assert reader.get_cached_book_info(["T", "A", "Z"]) == {k: first[k] for k in ("T", "A")}
+        assert time.monotonic() - start < 0.5
+        # Once the folder check is due, the lookup waits for its turn.
+        monkeypatch.setattr(book_info, "BOOK_INFO_RECHECK", 0.0)
+        start = time.monotonic()
+        with reader.query_deadline(0.3):
+            assert reader.get_cached_book_info("A") == {"A": first["A"]}
+        assert time.monotonic() - start >= 0.25
+    assert spy.uris == []
+
+
 def test_two_libraries_on_one_folder(three):
     one, two = PyAppleBooks(three.data_dir), PyAppleBooks(three.data_dir)
     try:
