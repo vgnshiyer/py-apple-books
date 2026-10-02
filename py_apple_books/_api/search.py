@@ -13,7 +13,8 @@ from typing import Callable, List, Optional, Union
 
 from py_apple_books._api._common import _book_arg, _book_scope, strict_limit, strict_offset
 from py_apple_books.db.clause import Clause, Not, Q, Where, WhereGroup, _text
-from py_apple_books.db.client import current_library
+from py_apple_books.db.client import ANNOTATIONS_NOT_FOUND, current_library
+from py_apple_books.exceptions import AnnotationStoreNotFoundError
 from py_apple_books.models.book import Book
 from py_apple_books.models.manager import ModelIterable
 from py_apple_books.search import _MAX_TERMS, AnnotationHit, _plan, _search_annotations
@@ -110,7 +111,7 @@ class _SearchAPI:
             or a bad ``limit`` or ``offset``.
         :raises BookNotFoundError: no book has ``book_id``.
         :raises AnnotationStoreNotFoundError: there is no annotation
-            store.
+            store (whatever the query).
         :raises QueryTimeoutError: a statement of the search or of its
             index build ran past the query timeout, or the wait for
             another thread's build did (the timeout bounds each
@@ -125,11 +126,14 @@ class _SearchAPI:
         asset_id = None
         if book_id is not None:
             asset_id = _book_arg(book_id, needs=("asset_id",), get_book=self.get_book_by_id).asset_id
-            if asset_id is None:
-                return []
-        if plan is None:
+        db = current_library()
+        if not db.has_annotations():
+            # Even when there is nothing to search for, as
+            # search_annotation_by_text.
+            raise AnnotationStoreNotFoundError(ANNOTATIONS_NOT_FOUND)
+        if plan is None or (book_id is not None and asset_id is None):
             return []
-        return _search_annotations(current_library(), plan, limit=limit, offset=offset, asset_id=asset_id,
+        return _search_annotations(db, plan, limit=limit, offset=offset, asset_id=asset_id,
                                    require_all=bool(require_all), include_deleted=bool(include_deleted))
 
     def search_books(self, query: str, *, limit: Optional[int] = None, order_by: Optional[str] = None,

@@ -467,6 +467,13 @@ class TestScope:
         with pytest.raises(BookNotFoundError):
             ranked.search_annotations("", book_id=999999)  # checked even for an empty query
 
+    def test_a_book_without_an_asset_id_has_no_hits(self, lib, ranked, filler):
+        lib.add_annotation(filler, "zebra")
+        book = lib.add_book("No asset id")
+        lib.execute("library", "UPDATE ZBKLIBRARYASSET SET ZASSETID = NULL WHERE Z_PK = ?", (book["id"],))
+        assert ranked.search_annotations("zebra", book_id=book["id"]) == []
+        assert ranked.search_annotations("", book_id=book["id"]) == []
+
     def test_book_id_with_deleted(self, lib, ranked, filler):
         gone = lib.add_annotation(filler, "zebra gone", deleted=True)
         assert ranked.search_annotations("zebra", book_id=filler["id"]) == []
@@ -486,14 +493,22 @@ class TestScope:
     def test_no_annotation_store(self, make_library):
         lib = make_library()
         book = lib.add_book("B")
+        no_asset = lib.add_book("No asset id")
+        lib.execute("library", "UPDATE ZBKLIBRARYASSET SET ZASSETID = NULL WHERE Z_PK = ?", (no_asset["id"],))
         shutil.rmtree(lib.annotation_path.parent)
         api = PyAppleBooks(data_dir=lib.data_dir)
         try:
-            with pytest.raises(AnnotationStoreNotFoundError):
-                api.search_annotations("zebra")
-            assert api.search_annotations("") == []
-            with pytest.raises(AnnotationStoreNotFoundError):
-                api.search_annotations("zebra", book_id=book["id"])
+            # Whatever the query and the book, as search_annotation_by_text.
+            for query in ("zebra", "", "   ", "\u200b"):
+                with pytest.raises(AnnotationStoreNotFoundError):
+                    api.search_annotations(query)
+                with pytest.raises(AnnotationStoreNotFoundError):
+                    api.search_annotation_by_text(query)
+                for book_id in (book["id"], no_asset["id"]):
+                    with pytest.raises(AnnotationStoreNotFoundError):
+                        api.search_annotations(query, book_id=book_id)
+            with pytest.raises(BookNotFoundError):  # the book is checked first
+                api.search_annotations("", book_id=999999)
         finally:
             api.close()
 
