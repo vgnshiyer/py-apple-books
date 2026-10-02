@@ -104,7 +104,10 @@ class ChapterMatch(str, Enum):
     #: The file holds several ToC entries, but where they start couldn't
     #: be compared with the location (the file is unreadable, not
     #: downloaded, too large or unparseable, or this comparison is turned
-    #: off); there is no chapter, and the spine file is still known.
+    #: off); there is no chapter, and the spine file is still known. Also
+    #: given for a location that would be ``PRECEDING`` when the file
+    #: before it holds several entries whose order in that file can't be
+    #: read, so the last of them isn't known.
     SECTION_UNKNOWN = "section_unknown"
 
     def __str__(self) -> str:
