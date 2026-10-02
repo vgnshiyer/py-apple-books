@@ -405,8 +405,11 @@ def _build_index(root: pathlib.Path, root_st: os.stat_result) -> _BookIndex:
         + [item.item_id for item in spine if item.is_toc_page and item.item_id])
     keyed_files = tuple(sorted(reader.keyed))
     key = _key(root_st, ((name, *reader.keyed[name]) for name in keyed_files))
-    weight = (4096 + 2 * reader.bytes_read + 512 * len(book.items)
-              + 256 * (len(chapters) + len(spine))
+    # Calibrated with tracemalloc on synthetic books of 2 to 500 files
+    # (about 2 KB per manifest item, ToC entry and spine entry together,
+    # plus the navigation files kept as read): within ~25 % above.
+    weight = (8192 + 2 * reader.bytes_read + 1024 * len(book.items)
+              + 512 * (len(chapters) + len(spine))
               + sum(len(c.id) + len(c.title) + len(c.href) + len(c.fragment) for c in chapters))
     return _BookIndex(
         key=key,
@@ -993,7 +996,7 @@ def _anchor_table_for(root: Any, href: str) -> Optional[Mapping[str, Tuple[int, 
         if table is None:
             return None, ident, 0, False
         same = ("anchor", read_st.st_dev, read_st.st_ino, read_st.st_mtime_ns, read_st.st_size) == ident
-        weight = 512 + sum(96 + len(k) + 8 * len(v) for k, v in table.items())
+        weight = 512 + sum(200 + len(k) + 8 * len(v) for k, v in table.items())
         return MappingProxyType(table), ident, weight, stable and same
 
     return _get_or_build(ident, lookup, build)
