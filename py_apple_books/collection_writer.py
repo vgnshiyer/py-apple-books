@@ -162,6 +162,9 @@ def _strict_text(value: bytes) -> str:
     except UnicodeDecodeError:
         pass
     # Out of the except block: the UnicodeDecodeError holds the bytes.
+    # And not in this frame, which the WriteError's traceback keeps: a
+    # tool showing frame locals would show them.
+    del value
     raise WriteError(_INVALID_TEXT_MESSAGE)
 
 

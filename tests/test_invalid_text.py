@@ -13,6 +13,7 @@ import logging
 import sqlite3
 import threading
 import time
+import traceback
 import uuid
 
 import pytest
@@ -52,6 +53,13 @@ def _set_text(lib, store, table, column, pk, raw: bytes) -> None:
     lib.execute(store, f"UPDATE {table} SET {column} = CAST(? AS TEXT) WHERE Z_PK = ?", (raw, pk))
     [(kind,)] = lib.execute(store, f"SELECT typeof({column}) FROM {table} WHERE Z_PK = ?", (pk,))
     assert kind == "text"
+
+
+def _assert_no_cell_in_frames(e):
+    """No frame kept by the traceback of ``e`` holds the cell in a local
+    (tools that show frame locals would show it)."""
+    shown = "".join(traceback.TracebackException.from_exception(e, capture_locals=True).format())
+    assert "SECRET" not in shown
 
 
 def _warnings(caplog):
@@ -510,6 +518,7 @@ def test_write_sessions_refuse_other_invalid_text_without_quoting_it(writable):
     assert str(exc.value) == ("Some text this write needs to read in the Books library database "
                               "isn't valid UTF-8; nothing was changed.")
     assert exc.value.__cause__ is None and exc.value.__context__ is None
+    _assert_no_cell_in_frames(exc.value)
     assert _raw(lib, "SELECT Z_MAX FROM Z_PRIMARYKEY ORDER BY Z_ENT") == before
     # Valid text reads as sqlite3 reads it.
     with WriteSession(**_kwargs(lib)) as session:
@@ -541,6 +550,7 @@ def test_invalid_store_metadata_refuses_a_write(writable, model_check, caplog):
     assert str(exc.value) == ("Some text this write needs to read in the Books library database "
                               "isn't valid UTF-8; nothing was changed.")
     assert exc.value.__cause__ is None and exc.value.__context__ is None
+    _assert_no_cell_in_frames(exc.value)
     assert "SECRET" not in caplog.text
     assert _raw(lib, row, (pk,)) == before
 
