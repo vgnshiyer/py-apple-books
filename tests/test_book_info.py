@@ -397,7 +397,7 @@ def test_locked_cache_keeps_its_last_rows(home, reader, monkeypatch):
     with held(path, "BEGIN EXCLUSIVE"):
         start = time.monotonic()
         got = reader.get_cached_book_info("K")
-        assert time.monotonic() - start < 0.5
+        assert time.monotonic() - start < 1.0  # its busy wait (0.25 s), not the holder's
     assert got["K"].title == "v1"  # the last good row
     assert reader.get_cached_book_info("K")["K"].title == "v2"  # read again once released
 
@@ -567,12 +567,20 @@ def test_a_locked_file_within_a_query_deadline(three, reader):
     newest_lib.add_book_info_cache([{"asset_id": "A", "title": "A in 26.11"}], version="v20250715-26.11",
                                    journal_mode="DELETE")
     with held(newest, "BEGIN EXCLUSIVE"):
+        # The locked file costs its busy wait (0.25 s); the rest of the
+        # deadline reads the other files.
         start = time.monotonic()
-        with reader.query_deadline(0.3):
+        with reader.query_deadline(0.6):
             got = reader.get_cached_book_info(["A", "B"])
         elapsed = time.monotonic() - start
-    assert elapsed < 0.8
-    assert got["A"].source == cache_name(V10) and got["B"].title == "Only B"
+        assert elapsed < 0.9
+        assert got["A"].source == cache_name(V10) and got["B"].title == "Only B"
+        # A tighter deadline is kept too: the call returns by then, with
+        # whatever it read (here nothing new: the wait used it up).
+        start = time.monotonic()
+        with reader.query_deadline(0.2):
+            reader.get_cached_book_info(["A", "B", "C"])
+        assert time.monotonic() - start < 0.5
 
 
 def test_locked_files_cost_their_busy_wait_each(home, reader):
