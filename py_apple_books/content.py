@@ -39,6 +39,10 @@ repeat :meth:`BookContent.list_chapters` calls and the spine API
 :meth:`BookContent.get_spine_item_text`,
 :meth:`BookContent.iter_spine_text`), which then read only the files
 whose text is asked for. :func:`clear_content_cache` empties it.
+
+:meth:`BookContent.get_chapter` can also follow the reading order across
+files (1.11, ``span='section'`` or ``span='chapter'``; see
+:mod:`py_apple_books._spans`); its default text is 1.10's.
 """
 
 import copy
@@ -58,7 +62,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set,
 
 from ebooklib import epub
 
-from py_apple_books import _icloud
+from py_apple_books import _icloud, _spans
 from py_apple_books._content_reading import _ReadingMixin
 from py_apple_books._content_resolve import _ResolveMixin
 from py_apple_books._messages import detail, quote_name, quote_title
@@ -880,6 +884,9 @@ class BookContent(_ResolveMixin, _ReadingMixin):
         # book this instance read, for Chapter.spine_index when the index
         # can't give the chapter list (see _chapter_list).
         self._package: Optional[Tuple[Any, str]] = None
+        # get_chapter()'s span modes: the loaded book's manifest by id and
+        # reading order (see _spans.Plan), built once.
+        self._span_plan: Optional[_spans.Plan] = None
 
     # Kept by pickle and copy; everything else is runtime state.
     _PICKLED = ("path", "_book", "_book_id", "_opf_dir_cache")
@@ -1296,17 +1303,21 @@ class BookContent(_ResolveMixin, _ReadingMixin):
 
     # -- chapter reading ----------------------------------------------------
 
-    def get_chapter(self, chapter_id: str) -> str:
+    def get_chapter(self, chapter_id: str, *, span: str = "file", normalize_unicode: bool = False) -> str:
         """Return the plain-text content of a chapter or sub-section.
 
-        ``chapter_id`` is a manifest item id — i.e. any spine entry in
-        the EPUB. Two lookup paths:
+        With the default ``span='file'``, the text 1.10 returned.
+        ``chapter_id`` is a chapter id or order from :meth:`list_chapters`,
+        or a manifest item id — i.e. any spine entry in the EPUB. Two
+        lookup paths:
 
-        1. **ToC chapter** — the id matches one of :meth:`list_chapters`
-           entries. Returns text scoped to that navPoint's fragment
-           when the XHTML file hosts multiple navPoints (Project
+        1. **ToC chapter** — the first of :meth:`list_chapters` entries
+           whose id, or whose order as a string, is ``chapter_id``.
+           Returns the text of that entry's file from its fragment on,
+           cut where another entry of the same file begins (Project
            Gutenberg layout), so sibling sections don't leak into one
-           another.
+           another. A chapter that continues in the next file is not
+           followed there (see ``span``).
         2. **Any other spine entry** (sub-sections not in the ToC) —
            falls through to ebooklib's manifest lookup directly and
            returns the whole file's text. This handles EPUBs whose
@@ -1314,22 +1325,74 @@ class BookContent(_ResolveMixin, _ReadingMixin):
            chapter has a ``chXX_sub01`` fine-section file that the ToC
            doesn't list).
 
-        HTML → plain text extraction is done with :mod:`bs4` using the
-        stdlib ``html.parser`` backend.
+        **Spans** (1.11). ``span='section'`` and ``span='chapter'`` follow
+        the book's reading order (the spine, without entries marked
+        ``linear="no"``) across files instead: the text starts where the
+        entry begins (its fragment's element, matched by ``id`` and then
+        by ``<a name>``, or the start of its file) and runs through the
+        following files up to where the next table-of-contents entry
+        begins: of any depth for ``'section'``, of the entry's depth or
+        shallower for ``'chapter'`` (a part then includes its chapters).
+        Each file's text is extracted as above; the files' texts are
+        joined with a blank line. ``chapter_id`` is resolved differently
+        in these modes: (1) a chapter's order in ASCII digits without
+        leading zeros (``"5"``), (2) the first chapter with that id,
+        (3) a manifest id: a file in the reading order spans from its
+        start to the next entry of any depth; another text file (a note
+        marked ``linear="no"``, a file outside the spine) gives its
+        whole text; an image or other binary file raises
+        :class:`ChapterNotFoundError`. An entry with no text of its own
+        (an image page, a part heading whose first chapter starts in the
+        same file, an entry that names no file) gives ``""``; an entry
+        whose file isn't in the reading order gives its ``'file'`` text.
 
-        :param chapter_id: Manifest item id from :meth:`list_chapters`
-            or from a :class:`~py_apple_books.models.location.Location`.
+        A location's ``chapter_id`` (``Location.chapter_id``) is the
+        manifest id of the file the location is in, which is not always
+        the chapter it is in: in a book whose converter split chapters
+        across files (Calibre's ``index_split_NNN``), it can be the id of
+        the next chapter, which begins later in that file. Read a
+        location's own file with :meth:`get_spine_item_text`, or find its
+        chapter first and pass that chapter's order with ``span``.
+
+        HTML → plain text extraction is done with :mod:`bs4` using the
+        stdlib ``html.parser`` backend. Spans read the files of the book
+        loaded for :meth:`list_chapters` / ``get_chapter``; each file is
+        read at most once per call.
+
+        :param chapter_id: Chapter id or order from :meth:`list_chapters`,
+            or a manifest item id (e.g. from a
+            :class:`~py_apple_books.models.location.Location`).
+        :param span: ``'file'`` (default), ``'section'`` or ``'chapter'``
+            (1.11).
+        :param normalize_unicode: Remove soft hyphens, zero-width spaces
+            and BOMs and compose accents
+            (:func:`py_apple_books.text.normalize_unicode`), then tidy the
+            whitespace again (1.11).
         :return: Plain text of the chapter, with paragraph breaks
             preserved.
+        :raises InvalidChoiceError: ``span`` is not one of the three
+            (an :class:`InvalidArgumentError`), checked before anything
+            else.
         :raises ChapterNotFoundError: if no ToC chapter or spine entry
-            matches ``chapter_id`` (an :class:`AppleBooksError`).
+            matches ``chapter_id`` (an :class:`AppleBooksError`); in the
+            span modes also for an image or other binary file.
         :raises AppleBooksError: if the book is not an EPUB or the
             chapter can't be read.
         """
+        mode = _spans.check_span(span)
         self._require_epub()
-
         wanted_id = str(chapter_id)
+        if mode == "file":
+            text = self._file_chapter_text(wanted_id)
+        else:
+            text = self._span_chapter_text(wanted_id, mode)
+        if normalize_unicode:
+            text = normalize_whitespace(_normalize_unicode(text))
+        return text
 
+    def _file_chapter_text(self, wanted_id: str) -> str:
+        """:meth:`get_chapter` with ``span='file'``: 1.10's lookup and
+        text."""
         # Path 1: match a ToC chapter (enables fragment scoping).
         chapters = self.list_chapters()
         match: Optional[Chapter] = None
@@ -1339,25 +1402,108 @@ class BookContent(_ResolveMixin, _ReadingMixin):
                 break
 
         if match is not None:
-            html_bytes = self._read_chapter_bytes(match.href)
-            # Other navPoint fragments in the same file become stop
-            # anchors so sibling sections don't bleed into one another.
-            stop_anchors: Set[str] = {
-                ch.fragment
-                for ch in chapters
-                if ch.href == match.href
-                and ch.fragment
-                and ch.fragment != match.fragment
-            }
-            return extract_chapter_text(
-                html_bytes,
-                start_anchor=match.fragment or None,
-                stop_anchors=stop_anchors,
-            )
+            return self._toc_entry_text(match, chapters)
 
         # Path 2: fall back to raw spine — works for sub-sections that
         # aren't in the ToC. ebooklib's manifest knows every spine item.
         return self._spine_item_text(wanted_id)
+
+    def _toc_entry_text(self, match: Chapter, chapters: List[Chapter]) -> str:
+        """1.10's text of ToC entry ``match``: its file from its fragment
+        on, up to another entry's fragment in the same file."""
+        html_bytes = self._read_chapter_bytes(match.href)
+        # Other navPoint fragments in the same file become stop
+        # anchors so sibling sections don't bleed into one another.
+        stop_anchors: Set[str] = {
+            ch.fragment
+            for ch in chapters
+            if ch.href == match.href
+            and ch.fragment
+            and ch.fragment != match.fragment
+        }
+        return extract_chapter_text(
+            html_bytes,
+            start_anchor=match.fragment or None,
+            stop_anchors=stop_anchors,
+        )
+
+    def _span_chapter_text(self, wanted_id: str, mode: str) -> str:
+        """:meth:`get_chapter` in a span mode (see :mod:`py_apple_books._spans`)."""
+        chapters = self.list_chapters()
+        plan = self._spans_plan()
+        match: Optional[Chapter] = None
+        order = _spans.is_order(wanted_id, len(chapters))
+        if order is not None:
+            match = next((ch for ch in chapters if ch.order == order), None)
+        if match is None:
+            match = next((ch for ch in chapters if ch.id == wanted_id), None)
+
+        if match is not None:
+            href = _spans.norm_href(match.href)
+            if href is None:
+                return ""  # an entry that names no file (a heading)
+            step = plan.step_of_href.get(href)
+            if step is None:
+                return self._toc_entry_text(match, chapters)
+            start = _spans.Start(step, match.fragment, match.order, match.depth)
+        else:
+            item = plan.items.get(wanted_id)
+            if item is None:
+                raise _no_chapter(wanted_id)
+            if not _is_text_media_type(getattr(item, "media_type", None)):
+                raise ChapterNotFoundError(f"No text document with id {quote_name(wanted_id)} in this book.")
+            step = plan.step_of_id.get(wanted_id)
+            if step is None:
+                return self._spine_item_text(wanted_id)
+            start = _spans.Start(step, "", None, None)
+        return _spans.span_text(plan, chapters, start, mode, self._span_item_bytes)
+
+    def _spans_plan(self) -> "_spans.Plan":
+        """The span plan of the loaded book (its manifest by id and its
+        reading order), built once; threads sharing the instance build it
+        once."""
+        plan = self._span_plan
+        if plan is not None:
+            return plan
+        book = self._load_book()
+        with self._lock:
+            if self._span_plan is None:
+                self._span_plan = _spans.build_plan(
+                    book.get_items(), self._spine_entries(book),
+                    self._to_bundle_relative, _span_has_text)
+            return self._span_plan
+
+    def _spine_entries(self, book: epub.EpubBook) -> List[Tuple[Optional[str], bool]]:
+        """``(idref, linear)`` per element of the loaded book's spine: from
+        the package document this instance read, by the rule
+        :meth:`list_spine_items` uses; from ebooklib's view of the spine
+        for an instance unpickled with its book already read."""
+        package = self._package
+        if package is not None:
+            spine = _epub_index._spine(package[0], {}, set(), {})
+            return [(entry.item_id, entry.linear) for entry in spine]
+        entries: List[Tuple[Optional[str], bool]] = []
+        for entry in book.spine:
+            idref, linear = entry if isinstance(entry, tuple) else (entry, "yes")
+            if isinstance(idref, str):
+                entries.append((idref, str(linear or "yes").strip().lower() != "no"))
+        return entries
+
+    def _span_item_bytes(self, step: "_spans.Step") -> bytes:
+        """The bytes of a reading-order file, as :meth:`get_chapter` reads
+        them: ``get_content()`` of the item ebooklib loaded, else the bytes
+        it loaded (where 1.10 read the same file from disk)."""
+        item = step.item
+        with _icloud.no_materialize():
+            try:
+                return item.get_content()
+            except Exception:  # noqa: BLE001 (1.10 then read the file as is)
+                content = getattr(item, "content", None)
+                if isinstance(content, (bytes, str)):
+                    return content
+                raise AppleBooksError(
+                    f"Could not read chapter file {quote_name(step.href)}."
+                ) from None
 
     # -- internal helpers ---------------------------------------------------
 
@@ -1374,13 +1520,7 @@ class BookContent(_ResolveMixin, _ReadingMixin):
         book = self._load_book()
         item = book.get_item_with_id(item_id)
         if item is None:
-            # No method names: the text reaches MCP clients, whose tools
-            # are named differently.
-            raise ChapterNotFoundError(
-                f"No chapter or spine entry with id {quote_name(item_id)} in this "
-                f"book. Pass an id from the book's table of contents, or "
-                f"a chapter's 1-based order (e.g. \"5\")."
-            )
+            raise _no_chapter(item_id)
         try:
             with _icloud.no_materialize():
                 html_bytes = item.get_content()
@@ -1889,6 +2029,24 @@ def _parse_ncx_bytes(
 
     walk(nav_map.findall(f"{{{_NS_NCX}}}navPoint"), 0)
     return chapters
+
+
+def _no_chapter(chapter_id: str) -> ChapterNotFoundError:
+    """1.10's error for a chapter id :meth:`BookContent.get_chapter`
+    can't place."""
+    # No method names: the text reaches MCP clients, whose tools are
+    # named differently.
+    return ChapterNotFoundError(
+        f"No chapter or spine entry with id {quote_name(chapter_id)} in this "
+        f"book. Pass an id from the book's table of contents, or "
+        f"a chapter's 1-based order (e.g. \"5\")."
+    )
+
+
+def _span_has_text(item: Any, href: str) -> bool:
+    """Whether a reading-order file has text spans extract: a text media
+    type (see :func:`_is_text_media_type`), inside the bundle."""
+    return _is_text_media_type(getattr(item, "media_type", None)) and not _escapes_bundle(href)
 
 
 def _no_spine_entry(item: int) -> ChapterNotFoundError:
