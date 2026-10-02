@@ -37,6 +37,9 @@ def test_one_pdf_extra_on_quartz_passes(check_dist):
     assert problems(check_dist, BASE + [PDF], ["pdf"]) == []
     single_quotes = "pyobjc-framework-quartz>=11.1; extra == 'pdf'"
     assert problems(check_dist, BASE + [single_quotes], ["pdf"]) == []
+    # "or" inside a quoted value is not an operator.
+    quoted_or = 'pyobjc-framework-Quartz>=11.1; platform_version != "or" and extra == "pdf"'
+    assert problems(check_dist, BASE + [quoted_or], ["pdf"]) == []
 
 
 @pytest.mark.parametrize("requires, provides", [
@@ -46,6 +49,10 @@ def test_one_pdf_extra_on_quartz_passes(check_dist):
     (BASE + ['pyobjc-core>=11; extra == "pdf"'], ["pdf"]),  # another distribution
     (BASE + ['rich; extra == "cli"'], ["cli"]),  # another extra
     (BASE + ['tomli; python_version < "3.11"'], []),  # a conditional dependency
+    # The extra plus an "or": Quartz would be required without the extra.
+    (BASE + ['pyobjc-framework-Quartz>=11.1; extra == "pdf" or python_version >= "3"'], ["pdf"]),
+    (BASE + ['pyobjc-framework-Quartz>=11.1; sys_platform == "darwin" or extra == "pdf"'], ["pdf"]),
+    (BASE + ["pyobjc-framework-Quartz>=11.1; (extra == 'pdf' or os_name == 'posix')"], ["pdf"]),
     (BASE[:1], []),  # one missing
     (BASE + ["lxml"], []),  # one added
 ])

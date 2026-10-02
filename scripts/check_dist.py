@@ -83,6 +83,7 @@ ADDED_ALLOWED = [
 ]
 
 _EXTRA_MARKER = re.compile(r"""\bextra\s*==\s*['"]([^'"]+)['"]""")
+_QUOTED = re.compile(r"'[^']*'" r'|"[^"]*"')  # quoted marker values
 
 
 def static_version():
@@ -199,7 +200,11 @@ def check_wheel(wheel, version, errors):
 def check_requirements(requires, provides_extra, errors):
     """Unconditional requirements are exactly ``REQUIRES_DIST``; each
     extra in ``EXTRAS`` has at most one requirement, on its one
-    distribution, and is declared in Provides-Extra; nothing else."""
+    distribution, and is declared in Provides-Extra; nothing else.
+
+    An extra's marker may add environment clauses with ``and`` only:
+    with an ``or`` (``extra == "pdf" or python_version >= "3"``) the
+    requirement would apply without the extra."""
     unconditional, by_extra = set(), {}
     for req in requires:
         spec, _, marker = req.partition(';')
@@ -211,6 +216,10 @@ def check_requirements(requires, provides_extra, errors):
         if len(extras) != 1 or extras[0] not in EXTRAS:
             errors.append(f'METADATA Requires-Dist {req!r}: only the extras {sorted(EXTRAS)} '
                           f'may add requirements')
+            continue
+        if re.search(r'\bor\b', _QUOTED.sub("''", marker)):
+            errors.append(f'METADATA Requires-Dist {req!r}: an extra\'s marker may only add '
+                          f'clauses with "and"')
             continue
         by_extra.setdefault(extras[0], []).append(name)
     if unconditional != REQUIRES_DIST:
