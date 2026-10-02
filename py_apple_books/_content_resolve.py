@@ -103,8 +103,10 @@ _NOWHERE = _Target(None, None, ())
 def _target_of(location: Any) -> _Target:
     """The :class:`_Target` of a ``resolve()`` argument: a
     :class:`~py_apple_books.models.location.Location`, a CFI string or
-    an int spine index (the start of that item). Malformed CFIs and
-    negative ints give a target that names no item.
+    an int spine index (the start of that item). A negative int, or a
+    CFI with neither a spine step nor a bracket hint, gives a target
+    that names no item; a CFI whose content path is malformed keeps its
+    spine step and hint, with ``steps`` None.
 
     :raises InvalidArgumentError: anything else (a bool included).
     """
@@ -369,8 +371,12 @@ class _ResolveMixin:
             location; see :class:`~py_apple_books.positions.ChapterMatch`
             for how it was chosen), the spine index and the manifest id
             of the location's file. None when the location names no item
-            of this book's spine (also for a malformed CFI or a negative
-            index).
+            of this book's spine: a negative index, or a CFI whose spine
+            step and bracket hint name none (a CFI that isn't one
+            included). A CFI whose path inside the file is malformed
+            still gives its file, with the match ``SECTION_UNKNOWN`` when
+            the file holds several entries. Never raises for a malformed
+            CFI.
 
         The file is the one the CFI's bracket hint names, when that is a
         manifest id in the spine; else the one at its spine step. A
