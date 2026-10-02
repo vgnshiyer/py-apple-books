@@ -11,18 +11,21 @@ import contextlib
 import copy
 import dataclasses
 import datetime as dt
+import os
 import pickle
 import threading
 from decimal import Decimal
 from fractions import Fraction
+from types import SimpleNamespace
 
 import pytest
 
-from py_apple_books import PyAppleBooks
+from py_apple_books import PyAppleBooks, _icloud
 from py_apple_books import content as content_module
 from py_apple_books.content import BookContent
 from py_apple_books.db import LibraryDB, use_library
 from py_apple_books.exceptions import (
+    BookNotDownloadedError,
     BookNotFoundError,
     InvalidArgumentError,
     InvalidChoiceError,
@@ -749,6 +752,98 @@ class TestResolveMemo:
         for i in range(600):
             content.resolve_boundary(boundary(P.PROGRESS, progress=1.0 + i / 10))
         assert len(content.__dict__["_reading_resolved_memo"]) <= 256
+
+
+# ---------------------------------------------------------------------------
+# An evicted item (iCloud placeholder)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def evict(monkeypatch):
+    """``evict(path)`` makes ``path`` look like an iCloud placeholder
+    (``SF_DATALESS``) to ``os.lstat``/``os.stat``, as in
+    tests/test_content_gate.py: a real one can't be made here."""
+    marked = set()
+
+    def wrap(real):
+        def call(path, *args, dir_fd=None, **kwargs):
+            st = real(path, *args, dir_fd=dir_fd, **kwargs)
+            if dir_fd is None and isinstance(path, (str, os.PathLike)) and os.fspath(path) in marked:
+                fields = {name: getattr(st, name) for name in dir(st) if name.startswith("st_")}
+                fields["st_flags"] = getattr(st, "st_flags", 0) | _icloud.SF_DATALESS
+                return SimpleNamespace(**fields)
+            return st
+        return call
+
+    monkeypatch.setattr(os, "lstat", wrap(os.lstat))
+    monkeypatch.setattr(os, "stat", wrap(os.stat))
+
+    def mark(bundle, name):
+        path = next(os.path.join(root, name) for root, _dirs, files in os.walk(bundle) if name in files)
+        marked.update((path, os.path.realpath(path)))
+        return path
+
+    return mark
+
+
+class TestEvictedItem:
+    """A later item evicted to iCloud: what reads it refuses with
+    ``BookNotDownloadedError`` and never opens it (so never downloads
+    it); what doesn't need it never touches it."""
+
+    def test_position_at_percent_refuses(self, tmp_path, evict):
+        content = BookContent(book_bundle(tmp_path))
+        evicted = evict(content.path, "c3.xhtml")
+        with _fs_audit.record() as rec:
+            with pytest.raises(BookNotDownloadedError):
+                content.position_at_percent(50)
+            with pytest.raises(BookNotDownloadedError):
+                content.position_at_percent(5)  # the table needs every linear item
+        assert rec.under(evicted) == []
+        assert "_reading_linear_memo" not in content.__dict__
+
+    @pytest.mark.parametrize("b", [
+        boundary(P.PROGRESS, progress=40.0),
+        boundary(P.FURTHEST, bookmark=cfi(1, "c1"), progress=10.0, high_water=90.0),
+        boundary(P.READING_POSITION, bookmark=cfi(3, "notes"), progress=40.0),
+    ], ids=["progress", "furthest", "nonlinear-bookmark-to-progress"])
+    def test_resolve_refuses(self, tmp_path, evict, b):
+        content = BookContent(book_bundle(tmp_path))
+        evicted = evict(content.path, "c3.xhtml")
+        with _fs_audit.record() as rec:
+            with pytest.raises(BookNotDownloadedError):
+                content.resolve_boundary(b)
+        assert rec.under(evicted) == []
+        assert not content.__dict__.get("_reading_resolved_memo")
+
+    @pytest.mark.parametrize("b, index", [
+        (boundary(P.READING_POSITION, bookmark=cfi(2, "c2"), progress=90.0), 2),
+        (boundary(P.RECENT_HIGHLIGHT, highlight=cfi(5, "c4"), progress=10.0), 5),
+        (boundary(P.NONE), 0),
+    ], ids=["bookmark", "highlight", "none"])
+    def test_an_item_placement_reads_no_text(self, tmp_path, evict, monkeypatch, b, index):
+        content = BookContent(book_bundle(tmp_path))
+        content.list_spine_items()
+        evicted = evict(content.path, "c3.xhtml")
+
+        def refuse(self, *args, **kwargs):
+            raise AssertionError("an item placement reads no item text")
+
+        monkeypatch.setattr(BookContent, "get_spine_item_text", refuse)
+        with _fs_audit.record() as rec:
+            assert content.resolve_boundary(b).position == TextPosition(index, 0)
+        assert rec.under(evicted) == []
+
+    def test_search_up_to_the_boundary(self, tmp_path, evict):
+        content = BookContent(book_bundle(tmp_path))
+        evicted = evict(content.path, "c3.xhtml")
+        read = content.resolve_boundary(boundary(P.READING_POSITION, bookmark=cfi(4, "c3")))
+        with _fs_audit.record() as rec:
+            assert len(content.search("b", until=read, limit=None, count_total=True).hits) == 100
+            with pytest.raises(BookNotDownloadedError):
+                content.search("b", until=read, count_withheld=True)
+        assert rec.under(evicted) == []
 
 
 class TestThreadsAndPickling:
