@@ -107,6 +107,45 @@ _COMPAT_WARNING = (
     "AppleBooksDBClient.conn is deprecated and will be removed in 2.0; "
     "use LibraryDB.open_connection()"
 )
+# Logged (once per LibraryDB) when a query first meets a text cell that
+# isn't valid UTF-8.
+_INVALID_TEXT_WARNING = (
+    "Some text in the Apple Books library isn't valid UTF-8; it is shown with U+FFFD in "
+    "place of the invalid bytes."
+)
+
+# How sqlite3 words the error for a TEXT cell that isn't valid UTF-8
+# (CPython's Modules/_sqlite/cursor.c; tests pin it on every supported
+# Python). The rest of its message quotes the cell, which must never
+# reach an error message.
+_DECODE_ERROR = "Could not decode to UTF-8"
+_DECODE_ERROR_COLUMN = re.compile(r"Could not decode to UTF-8 column '([A-Za-z0-9_$]{1,128})' with text '")
+
+
+def _decode_lenient(value: bytes) -> str:
+    """``text_factory`` of a library holding invalid UTF-8: U+FFFD in
+    place of each invalid byte sequence; valid text reads as with
+    ``str``."""
+    return value.decode("utf-8", "replace")
+
+
+def _is_decode_error(e: BaseException) -> bool:
+    """Whether ``e`` is sqlite3 failing to decode a TEXT cell as UTF-8."""
+    if not isinstance(e, sqlite3.OperationalError) or not e.args:
+        return False
+    message = e.args[0]
+    return isinstance(message, str) and message.startswith(_DECODE_ERROR)
+
+
+def _scrub_sqlite_message(e: BaseException) -> str:
+    """``str(e)``, except for a decode error, which is rebuilt from its
+    known prefix without the cell text sqlite3 appends: ``"Could not
+    decode to UTF-8 column '<name>'"``, or without the name if it isn't
+    a plain identifier."""
+    if not _is_decode_error(e):
+        return str(e)
+    match = _DECODE_ERROR_COLUMN.match(e.args[0])
+    return f"{_DECODE_ERROR} column '{match[1]}'" if match else _DECODE_ERROR
 
 
 class _UseDefault:
@@ -514,6 +553,21 @@ class _Schema(NamedTuple):
 # set from, for messages.
 _deadline: contextvars.ContextVar = contextvars.ContextVar("py_apple_books_deadline", default=None)
 
+# Held by the thread of a forked child that sets a library's inherited
+# state aside (LibraryDB._check_fork); the child's other threads wait
+# for it. Made anew in every child: a fork copies it in whatever state
+# it is in.
+_fork_lock = threading.Lock()
+
+
+def _new_fork_lock() -> None:
+    global _fork_lock
+    _fork_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_new_fork_lock)
+
 
 class LibraryDB:
     """One Apple Books library: its two stores and a pool of read-only
@@ -555,6 +609,14 @@ class LibraryDB:
     A forked child makes its own connections. Fork only while no other
     thread is running a query: SQLite's internal locks are copied in
     whatever state they were in.
+
+    Text that isn't valid UTF-8 (which sqlite3 refuses to read) doesn't
+    fail queries: the first statement that meets such a cell is run
+    again with U+FFFD in place of the invalid bytes, a warning is
+    logged once (logger ``py_apple_books.db``), and from then on
+    every query of this library reads text that way. The connections
+    :meth:`connection` and :meth:`open_connection` hand out read text as
+    sqlite3 does by default.
     """
 
     def __init__(self, data_dir=None, *, library_db=None, annotation_db=None,
@@ -591,6 +653,14 @@ class LibraryDB:
         # (identity, clock time) of the last stat() that found the store
         # files unchanged.
         self._verified: Tuple[Optional[tuple], float] = (None, 0.0)
+        # Set (for good, forks included) once a query met text that
+        # isn't valid UTF-8: pooled queries then decode with U+FFFD.
+        self._lenient_text = False
+        # Objects derived from this library (_derived_cache), by key. A
+        # forked child sets its parents' aside in _derived_inherited:
+        # kept referenced, never used or discarded.
+        self._derived: dict = {}
+        self._derived_inherited: list = []
 
     def __repr__(self) -> str:
         if not self._explicit:
@@ -727,15 +797,23 @@ class LibraryDB:
 
     def _check_fork(self) -> None:
         pid = os.getpid()
-        if pid != self._pid:
-            # A forked child: the parent's connections and locks aren't
-            # ours. Set the connections aside unused and unclosed.
-            self._pid = pid
+        if pid == self._pid:
+            return
+        with _fork_lock:
+            if pid == self._pid:
+                return  # another thread of this child did it
+            # A forked child: the parent's connections, derived objects
+            # and locks aren't ours. Set them aside unused and unclosed.
+            # The pid goes last: until then the child's other threads
+            # wait above instead of using what the parent left.
             self._inherited = self._inherited + self._idle
             self._idle = []
+            self._derived_inherited = self._derived_inherited + list(self._derived.values())
+            self._derived = {}
             self._lock = threading.RLock()
             self._slots = _Slots(self.max_connections)
             self._generation += 1
+            self._pid = pid
 
     def _connect(self, paths: StorePaths, check_same_thread: bool,
                  busy: float = _BUSY_TIMEOUT) -> sqlite3.Connection:
@@ -922,8 +1000,10 @@ class LibraryDB:
           read lock on the store, which can hold up Apple Books' writes.
         - Don't detach ``anno_db``, change PRAGMAs or register functions.
 
-        An open transaction is rolled back and a progress handler
-        removed when it is returned.
+        An open transaction is rolled back, a progress handler removed
+        and the ``text_factory`` set back to ``str`` when it is returned.
+        Text is read as sqlite3 does by default, even once this library's
+        queries read invalid UTF-8 leniently (see :class:`LibraryDB`).
         """
         self.paths()  # an expired fallback is resolved again first
         pooled, slots = self._acquire(deadline, None)
@@ -931,23 +1011,84 @@ class LibraryDB:
             self._limit_busy_wait(pooled, deadline)
             yield pooled.conn
         finally:
+            pooled.conn.text_factory = str
             with contextlib.suppress(sqlite3.Error):
                 pooled.conn.set_progress_handler(None, 0)
             self._release(pooled, slots)
 
     def close(self) -> None:
-        """Close the idle connections and forget the store paths and
-        schema. Connections checked out now are closed when returned.
-        The library stays usable; it reconnects on the next query."""
+        """Close the idle connections and forget the store paths, the
+        schema and what was derived from the stores. Connections checked
+        out now are closed when returned. The library stays usable; it
+        reconnects on the next query."""
         self._check_fork()
         with self._lock:
             idle, self._idle = self._idle, []
+            derived, self._derived = self._derived, {}
             self._paths = self._paths_expire = self._annotations_attempt = None
             self._schema = None
             self._verified = (None, 0.0)
             self._generation += 1
         for pooled in idle:
             _close_quietly(pooled.conn)
+        # Outside the lock: a discard() that blocks, against its
+        # contract, holds up this call only.
+        for obj in derived.values():
+            _discard_quietly(obj)
+
+    def _derived_cache(self, key: str, factory: Callable[[], _T]) -> _T:
+        """The object derived from this library under ``key``: the one
+        held, or a new one from ``factory()`` if there is none or the one
+        held is ``dead``.
+
+        A slot for per-library state built from the stores (an
+        annotation search index, a book-info memo) that :meth:`close`
+        and a fork must drop. The contract:
+
+        - ``factory()`` is O(1) and does no I/O: it runs under this
+          library's lock, which is held for the lookup and insert only.
+          The object does its work (queries, builds) later, under its
+          own locks; it parses no book file under this library's lock.
+        - The object has a ``dead`` property, true once it must not be
+          used (discarded, or in a forked child), and a ``discard()``
+          that marks it dead and leaves the release of what it holds to
+          its last user. :meth:`close` calls ``discard()``, outside this
+          library's lock, on every object it held.
+        - ``dead`` and ``discard()`` never block: a plain attribute, or
+          at most a lock held only around reads and writes of the
+          object's fields, never one held while the object queries or
+          builds. A lookup may run while its caller holds one of this
+          library's connections (inside :meth:`connection`, or in a
+          query), and with ``max_connections=1`` the thread holding a
+          build lock may be waiting for that very connection.
+        - Lock order: the object's build lock, then its field lock, then
+          this library's lock and connections (any query, or a block
+          inside :meth:`connection`); never the reverse. So an object
+          that queries must not be used inside :meth:`connection`.
+        - In a forked child the parent's objects are set aside, kept
+          referenced and never used or discarded (they may hold the
+          parent's connections); the child makes its own.
+        - The object keeps no reference to this library (it is passed in
+          per call), so a dropped library is still collected.
+        """
+        self._check_fork()
+        while True:
+            with self._lock:
+                obj = self._derived.get(key)
+                if obj is None:
+                    obj = self._derived[key] = factory()
+                    return obj
+            # Outside the lock: dead is the object's code, which must not
+            # block; read here, one that does (against the contract) at
+            # least doesn't hold up every other use of this library.
+            if not obj.dead:
+                return obj
+            with self._lock:
+                # Replaced only if no other thread did so meanwhile (or
+                # close() dropped it); otherwise look again.
+                if self._derived.get(key) is obj:
+                    obj = self._derived[key] = factory()
+                    return obj
 
     # -- execution --------------------------------------------------------
 
@@ -965,7 +1106,11 @@ class LibraryDB:
 
     def _run_pooled(self, fn: Callable[[_Pooled], _T]) -> _T:
         """Run ``fn`` on a checked-out connection within the deadline and
-        turn every failure into a typed :class:`DBError`."""
+        turn every failure into a typed :class:`DBError`.
+
+        ``fn`` may be called twice (see :meth:`_call`): it must have no
+        effect but the statements it runs.
+        """
         deadline, limit = self._statement_deadline()
         pooled = None
         try:
@@ -980,8 +1125,10 @@ class LibraryDB:
                     if pooled.busy != _BUSY_TIMEOUT or (
                             deadline is not None and deadline - time.monotonic() < _BUSY_TIMEOUT):
                         self._limit_busy_wait(pooled, deadline)
-                    return fn(pooled)
+                    return self._call(fn, pooled, deadline)
                 finally:
+                    # Strict again for the next checkout (connection()).
+                    conn.text_factory = str
                     if deadline is not None:
                         conn.set_progress_handler(None, 0)
             finally:
@@ -993,16 +1140,21 @@ class LibraryDB:
             raise
         except sqlite3.OperationalError as e:
             message = str(e)
-            if "interrupted" in message and deadline is not None:
-                raise QueryTimeoutError(
-                    f"Query took too long and was stopped (limit {limit:g} s).", timeout=limit) from e
-            if _gave_up_on_lock(e, deadline):
-                raise QueryTimeoutError(
-                    f"Timed out waiting for a locked database (limit {limit:g} s).", timeout=limit) from e
-            if (f"{ANNOTATION_SCHEMA}." in message or f"database {ANNOTATION_SCHEMA}" in message) \
-                    and pooled is not None and pooled.paths.annotations is None:
-                raise AnnotationStoreNotFoundError(ANNOTATIONS_NOT_FOUND) from e
-            raise DBQueryError(f"Error executing query: {e}") from e
+            # First: the cell text in a decode error's message could pass
+            # any of the tests below.
+            if _is_decode_error(e):
+                message = _scrub_sqlite_message(e)
+            else:
+                if "interrupted" in message and deadline is not None:
+                    raise QueryTimeoutError(
+                        f"Query took too long and was stopped (limit {limit:g} s).", timeout=limit) from e
+                if _gave_up_on_lock(e, deadline):
+                    raise QueryTimeoutError(
+                        f"Timed out waiting for a locked database (limit {limit:g} s).", timeout=limit) from e
+                if (f"{ANNOTATION_SCHEMA}." in message or f"database {ANNOTATION_SCHEMA}" in message) \
+                        and pooled is not None and pooled.paths.annotations is None:
+                    raise AnnotationStoreNotFoundError(ANNOTATIONS_NOT_FOUND) from e
+                raise DBQueryError(f"Error executing query: {e}") from e
         except sqlite3.DatabaseError as e:
             if "not a database" in str(e):
                 raise LibraryNotFoundError(NOT_A_DATABASE) from e
@@ -1011,6 +1163,46 @@ class LibraryDB:
             raise DBQueryError(f"Error executing query: {e}") from e
         except Exception as e:
             raise DBQueryError(f"Unexpected error while executing query: {e}") from e
+        # A decode error the lenient retry didn't cure (fn set its own
+        # text_factory): raised out of the except block, so the original,
+        # which quotes the cell, is neither its cause nor its context.
+        raise DBQueryError(f"Error executing query: {message}")
+
+    def _call(self, fn: Callable[[_Pooled], _T], pooled: _Pooled,
+              deadline: Optional[float]) -> _T:
+        """``fn(pooled)``, reading text leniently once this library is
+        known to hold invalid UTF-8.
+
+        A decode error makes the library lenient for good and runs ``fn``
+        once more, on the same connection and under the same deadline
+        (``deadline``: SQLite waits for a lock no longer than the time
+        left), with :func:`_decode_lenient` as the ``text_factory`` (the
+        caller sets it back to ``str``).
+        """
+        conn = pooled.conn
+        if self._lenient_text:
+            conn.text_factory = _decode_lenient
+            return fn(pooled)
+        try:
+            return fn(pooled)
+        except sqlite3.OperationalError as e:
+            if not _is_decode_error(e):
+                raise
+        # Out of the except block, so an error of the retry doesn't chain
+        # to the decode error, whose message quotes the cell.
+        self._make_lenient()
+        if deadline is not None:
+            self._limit_busy_wait(pooled, deadline)
+        conn.text_factory = _decode_lenient
+        return fn(pooled)
+
+    def _make_lenient(self) -> None:
+        """Read text with U+FFFD for invalid UTF-8 from now on; warn the
+        first time."""
+        with self._lock:
+            first, self._lenient_text = not self._lenient_text, True
+        if first:
+            logger.warning(_INVALID_TEXT_WARNING)
 
     def _run(self, fn: Callable[[sqlite3.Connection], _T]) -> _T:
         return self._run_pooled(lambda pooled: fn(pooled.conn))
@@ -1029,7 +1221,17 @@ class LibraryDB:
             without an annotation store, :class:`LibraryAccessDeniedError`).
         """
         params = () if params is None else params
-        return self._run(lambda conn: conn.execute(sql, adapt_params(params)).fetchall())
+        adapted = None
+
+        def run(conn: sqlite3.Connection) -> list:
+            # Adapted once: a retry (see _call) binds the same values, even
+            # when params is an iterator.
+            nonlocal adapted
+            if adapted is None:
+                adapted = adapt_params(params)
+            return conn.execute(sql, adapted).fetchall()
+
+        return self._run(run)
 
     # -- schema -----------------------------------------------------------
 
@@ -1094,6 +1296,15 @@ def _close_quietly(conn: sqlite3.Connection) -> None:
         conn.close()
     except Exception:
         pass
+
+
+def _discard_quietly(obj) -> None:
+    """``obj.discard()`` (see :meth:`LibraryDB._derived_cache`); a failure
+    is logged at DEBUG by type only."""
+    try:
+        obj.discard()
+    except Exception as e:
+        logger.debug("discarding a derived %s failed: %s", type(obj).__name__, type(e).__name__)
 
 
 # -- the library in use -------------------------------------------------------
@@ -1284,9 +1495,13 @@ class AppleBooksDBClient(DBClient):
         except AppleBooksError:
             raise
         except sqlite3.Error as e:
-            raise DBQueryError(f"Error executing query: {e}") from e
+            if not _is_decode_error(e):
+                raise DBQueryError(f"Error executing query: {e}") from e
+            message = _scrub_sqlite_message(e)
         except Exception as e:
             raise DBQueryError(f"Unexpected error while executing query: {e}") from e
+        # Out of the except block: the decode error quotes the cell.
+        raise DBQueryError(f"Error executing query: {message}")
 
     def _compat_conn(self) -> sqlite3.Connection:
         if self._conn is None:

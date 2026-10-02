@@ -1,0 +1,7 @@
+# describe_annotation {"annotation_id": "7"} isError=False
+Annotation 7
+  Book:     Removed book (asset ORPHANAS…), no longer in the library
+  Created:  2026-09-19 12:00
+  Color:    YELLOW
+
+  Highlighted: "orphan synthetic highlight"

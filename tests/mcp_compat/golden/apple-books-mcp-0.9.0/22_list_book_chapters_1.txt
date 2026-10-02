@@ -1,0 +1,6 @@
+# list_book_chapters {"book_id": 1} isError=False
+Chapters (2 total):
+<book_text book_id="1">
+  [  1] Chapter 1  (id=chap1)
+  [  2] Chapter 2  (id=chap2)
+</book_text>

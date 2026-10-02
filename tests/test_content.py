@@ -18,22 +18,28 @@ Bundle-containment (security) tests live in ``test_content_security.py``.
 
 from __future__ import annotations
 
+import copy
+import errno
 import os
 import pathlib
+import pickle
 import re
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from py_apple_books import PyAppleBooks
+from py_apple_books import content as content_module
 from py_apple_books.content import (
     BookContent,
     Chapter,
     _parse_ncx_bytes,
     is_downloaded,
 )
-from py_apple_books.exceptions import AppleBooksError, DRMProtectedError
+from py_apple_books.exceptions import AppleBooksError, DRMProtectedError, NotEpubError
 from py_apple_books.models.location import Location
 from py_apple_books.utils import extract_chapter_text, normalize_whitespace
 
@@ -816,3 +822,219 @@ class TestChapterDataclass:
         a = Chapter(id="a", title="A", href="a.xhtml", fragment="", order=1, depth=0)
         b = Chapter(id="a", title="A", href="a.xhtml", fragment="", order=1, depth=0)
         assert a == b
+
+
+# ---------------------------------------------------------------------------
+# BookContent: book_id, threads, pickling (1.11)
+# ---------------------------------------------------------------------------
+
+
+class TestBookContentBasics:
+    def test_book_id(self, simple_epub):
+        assert BookContent(simple_epub.path).book_id is None
+        content = BookContent(simple_epub.path, book_id=7)
+        assert content.book_id == 7
+        assert repr(content) == f"BookContent(path={str(simple_epub.path)!r})"
+        with pytest.raises(TypeError):
+            BookContent(simple_epub.path, 7)  # keyword-only
+        with pytest.raises(AttributeError):
+            content.book_id = 8
+
+    def test_construction_does_no_io(self, tmp_path):
+        from tests import _fs_audit
+
+        with _fs_audit.record() as rec:
+            content = BookContent(tmp_path / "nowhere" / "Book.epub", book_id=1)
+        assert rec.events == []
+        assert content.book_id == 1
+
+    def test_threads_share_one_load(self, simple_epub, monkeypatch):
+        loads, index_loads = [], []
+        real_load = content_module._ContainedEpubReader.load
+
+        def load(self):
+            # The full load; the book index (1.11) is read once more, by
+            # its own reader (a subclass), and only its few files.
+            (loads if type(self) is content_module._ContainedEpubReader else index_loads).append(
+                threading.get_ident())
+            time.sleep(0.05)
+            return real_load(self)
+
+        monkeypatch.setattr(content_module._ContainedEpubReader, "load", load)
+        content = BookContent(simple_epub.path)
+        barrier = threading.Barrier(8)
+        results, errors = [], []
+
+        def work():
+            try:
+                barrier.wait()
+                results.append(content.list_chapters())
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=work) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert errors == []
+        assert len(loads) == 1
+        assert len(index_loads) == 1
+        assert len(results) == 8 and all(r == results[0] for r in results)
+
+    def test_lock_is_not_held_across_extraction(self, simple_epub, monkeypatch):
+        content = BookContent(simple_epub.path, book_id=3)
+        chapters = content.list_chapters()
+        held = []
+        real = content_module.extract_chapter_text
+
+        def extract(*args, **kwargs):
+            held.append(content._lock.locked())
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(content_module, "extract_chapter_text", extract)
+        content.get_chapter(chapters[0].id)
+        assert held == [False]
+
+    def test_failed_load_is_retried(self, simple_epub, monkeypatch):
+        calls = []
+        real_load = content_module._ContainedEpubReader.load
+
+        def load(self):
+            calls.append(1)
+            if len(calls) == 1:
+                raise ValueError("transient")
+            return real_load(self)
+
+        monkeypatch.setattr(content_module._ContainedEpubReader, "load", load)
+        content = BookContent(simple_epub.path)
+        with pytest.raises(AppleBooksError, match="transient"):
+            content.list_chapters()
+        assert not content._lock.locked()
+        assert content.list_chapters()
+
+    @pytest.mark.parametrize("loaded", [False, True])
+    @pytest.mark.parametrize("how", ["pickle", "deepcopy", "copy"])
+    def test_pickle_and_copy(self, simple_epub, monkeypatch, loaded, how):
+        content = BookContent(simple_epub.path, book_id=5)
+        if loaded:
+            expected = content.list_chapters()
+        clone = {
+            "pickle": lambda c: pickle.loads(pickle.dumps(c)),
+            "deepcopy": copy.deepcopy,
+            "copy": copy.copy,
+        }[how](content)
+        assert type(clone) is BookContent
+        assert (clone.path, clone.book_id) == (content.path, 5)
+        assert clone._lock is not content._lock and not clone._lock.locked()
+        assert sorted(clone.__getstate__()) == ["_book", "_book_id", "_opf_dir_cache", "path"]
+        if loaded:
+            assert clone._book is not None
+            monkeypatch.setattr(content_module._ContainedEpubReader, "load",
+                                lambda self: pytest.fail("loaded again"))
+            assert clone.list_chapters() == expected
+        else:
+            assert clone._book is None
+            assert clone.list_chapters()
+
+    def test_runtime_state_is_not_pickled(self, simple_epub):
+        content = BookContent(simple_epub.path)
+        content._some_memo = {"x": 1}
+        state = content.__getstate__()
+        assert "_lock" not in state and "_some_memo" not in state
+        clone = pickle.loads(pickle.dumps(content))
+        assert not hasattr(clone, "_some_memo")
+
+    def test_state_of_a_1_10_instance(self, simple_epub):
+        # 1.10 pickled the plain __dict__: path, _book, _opf_dir_cache.
+        loaded = BookContent(simple_epub.path)
+        loaded.list_chapters()
+        for state in (
+            {"path": simple_epub.path, "_book": None, "_opf_dir_cache": None},
+            {"path": str(simple_epub.path), "_book": loaded._book,
+             "_opf_dir_cache": loaded._opf_dir_cache},
+            {"path": simple_epub.path, "_book": loaded._book, "_opf_dir_cache": None},
+        ):
+            content = BookContent.__new__(BookContent)
+            content.__setstate__(dict(state))
+            assert content.path == simple_epub.path
+            assert content.book_id is None
+            assert content.list_chapters() == loaded.list_chapters()
+            assert "Body paragraph" in content.get_chapter(loaded.list_chapters()[0].id)
+
+
+class TestNotEpub:
+    def test_pdf(self, tmp_path):
+        pdf = tmp_path / "Book.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n")
+        for call in (BookContent(pdf).list_chapters, lambda: BookContent(pdf).get_chapter("1"),
+                     lambda: BookContent(pdf)._spine_item_text("x")):
+            with pytest.raises(NotEpubError) as exc:
+                call()
+            assert str(exc.value) == (
+                "This book is a PDF; chapter listing/reading is only supported for EPUB books.")
+            assert isinstance(exc.value, AppleBooksError)
+
+    def test_other_file(self, tmp_path):
+        other = tmp_path / "Notes.txt"
+        other.write_text("x")
+        with pytest.raises(NotEpubError) as exc:
+            BookContent(other).list_chapters()
+        assert str(exc.value) == (
+            "'Notes.txt' is not an EPUB bundle directory; chapter "
+            "listing/reading is only supported for EPUB books.")
+
+
+class TestIsDownloadedICloud:
+    def _no_du(self):
+        return patch("py_apple_books.content.subprocess.run",
+                     side_effect=AssertionError("du must not run"))
+
+    def test_dataless_root_is_not_downloaded_before_du(self, simple_epub, monkeypatch):
+        from py_apple_books import _icloud
+
+        real = _icloud.lstat
+
+        def lstat(path, **kwargs):
+            st = real(path, **kwargs)
+            if os.fspath(path) == os.fspath(simple_epub.path):
+                return SimpleNamespace(st_mode=st.st_mode, st_size=st.st_size, st_blocks=0,
+                                       st_flags=_icloud.SF_DATALESS)
+            return st
+
+        monkeypatch.setattr(_icloud, "lstat", lstat)
+        with self._no_du():
+            assert is_downloaded(simple_epub.path) is False
+            assert BookContent(simple_epub.path).is_downloaded is False
+
+    def test_icloud_stub_next_to_the_root(self, tmp_path):
+        book = tmp_path / "Book.epub"
+        book.mkdir()
+        (book / "data").write_bytes(b"x" * 8192)
+        (tmp_path / ".Book.epub.icloud").write_bytes(b"")
+        with self._no_du():
+            assert is_downloaded(book) is False
+
+    def test_lookup_that_would_download(self, simple_epub, monkeypatch):
+        from py_apple_books import _icloud
+
+        def lstat(path, **kwargs):
+            raise OSError(errno.EDEADLK, "Resource deadlock avoided")
+
+        monkeypatch.setattr(_icloud, "lstat", lstat)
+        with self._no_du():
+            assert is_downloaded(simple_epub.path) is False
+
+    def test_local_bundle_still_runs_du(self, simple_epub):
+        assert is_downloaded(simple_epub.path) is True
+
+
+def test_clear_content_cache_clears_registered_caches(monkeypatch):
+    from py_apple_books import _icloud
+
+    monkeypatch.setattr(_icloud, "_cache_clearers", [])
+    cleared = []
+    _icloud.register_file_cache(lambda: cleared.append("index"))
+    _icloud.register_file_cache(lambda: cleared.append("metadata"))
+    content_module.clear_content_cache()
+    assert cleared == ["index", "metadata"]

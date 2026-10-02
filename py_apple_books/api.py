@@ -3,10 +3,28 @@ import inspect
 import pathlib
 import re
 import sqlite3
+import stat
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-from py_apple_books import collection_writer
+from datetime import date, datetime
+from typing import Dict, List, Optional, Tuple, Union
+from py_apple_books import _icloud, collection_writer
+from py_apple_books import engagement as _engagement
+from py_apple_books._api._common import (  # noqa: F401 (re-exported: 1.10 private names)
+    _annotation_scope,
+    _book_arg,
+    _book_by_id,
+    _book_scope,
+    _books_by_asset,
+    _id_text,
+    _owned_books_filter,
+)
+from py_apple_books._api.book_info import _BookInfoAPI
+from py_apple_books._api.engagement import _EngagementAPI
+from py_apple_books._api.metadata import _MetadataAPI
+from py_apple_books._api.pdf import _PdfAPI
+from py_apple_books._api.positions import _PositionsAPI
+from py_apple_books._api.reading import _ReadingAPI
+from py_apple_books._api.search import _SearchAPI
 from py_apple_books.content import BookContent, Chapter
 from py_apple_books.db.clause import Q
 from py_apple_books.db.client import (
@@ -36,7 +54,12 @@ from py_apple_books.models import (
     Collection,
     ReadingStatus,
 )
-from py_apple_books.models.book import CONTENT_TYPE_SERIES_CONTAINER, SERIES_DATA_SOURCE
+from py_apple_books.models.annotation import _ALL_ANNOTATIONS, _LIVE_ANNOTATIONS  # noqa: F401 (1.10 names)
+from py_apple_books.models.book import (  # noqa: F401 (1.10 names)
+    CONTENT_TYPE_SERIES_CONTAINER,
+    SERIES_DATA_SOURCE,
+    STATE_CLOUD_ONLY,
+)
 from py_apple_books.models.manager import ModelIterable, normalize_limit, normalize_offset
 from py_apple_books.utils import APPLE_EPOCH_OFFSET, snap_window
 from py_apple_books.write_safety import _backup_dir_for, _own_backup_dir, _writes_home_store
@@ -54,55 +77,13 @@ from py_apple_books.write_safety import _backup_dir_for, _own_backup_dir, _write
 # the bookmark itself, use :meth:`PyAppleBooks.get_current_reading_location`.
 _ANNOTATION_TYPE_READING_BOOKMARK = int(AnnotationType.READING_POSITION)
 
-# Scope of the user-facing annotation queries. Live: not soft-deleted
-# (ZANNOTATIONDELETED, NULL-safe), not a type-0 deletion tombstone and
-# not the reading-position row. ``include_deleted=True`` gives the
-# pre-1.10 set (everything but the reading-position row). Book.annotations
-# uses a copy of _LIVE_ANNOTATIONS (models can't import this module).
-_LIVE_ANNOTATIONS = {
-    "type__gt": int(AnnotationType.TOMBSTONE),
-    "type__ne": _ANNOTATION_TYPE_READING_BOOKMARK,
-    "is_deleted__isnot": 1,
-}
-_ALL_ANNOTATIONS = {"type__ne": _ANNOTATION_TYPE_READING_BOOKMARK}
-
-
-def _id_text(value) -> str:
-    """``value`` for an error message. An int too long for ``str()``
-    (``sys.get_int_max_str_digits()``) is a valid, if absurd, id."""
-    try:
-        return str(value)
-    except ValueError:
-        return "<an integer too long to print>"
-
-
-def _annotation_scope(include_deleted: bool) -> dict:
-    """Filter keywords for the user-facing annotation queries."""
-    return dict(_ALL_ANNOTATIONS if include_deleted else _LIVE_ANNOTATIONS)
-
-
-def _owned_books_filter() -> dict:
-    """Filter keywords for the books in the user's library.
-
-    Leaves out Apple Books Store series rows the user doesn't own: series
-    containers (``ZCONTENTTYPE`` 5), and Series-source volumes without
-    the redownload (ownership) flag. NULL-safe, so a row with no data
-    source or content type stays in. A predicate whose column the store
-    lacks is dropped, which shows those rows as 1.9.1 did: hiding a row
-    needs all the evidence. Same rule as :attr:`Book.is_store_series_item`.
-    """
-    scope = {}
-    if Book.manager.has_fields("content_type"):
-        scope["content_type__isnot"] = CONTENT_TYPE_SERIES_CONTAINER
-    if Book.manager.has_fields("data_source", "can_redownload"):
-        scope["where"] = Q(data_source__isnot=SERIES_DATA_SOURCE) | Q(can_redownload=1)
-    return scope
-
-
-def _book_scope(include_store_series: bool) -> dict:
-    """Filter keywords for a book list: all rows if ``include_store_series``,
-    else the owned ones."""
-    return {} if include_store_series else _owned_books_filter()
+# Scope of the user-facing annotation queries: _LIVE_ANNOTATIONS, or
+# _ALL_ANNOTATIONS with ``include_deleted=True`` (the pre-1.10 set,
+# everything but the reading-position row). Defined in
+# models/annotation.py, which Book.annotations and the 1.11 search read
+# too; these names are the same objects. The scope helpers
+# (_annotation_scope, _owned_books_filter, _book_scope, _id_text) live in
+# _api/_common.py, shared with the facade's mixins.
 
 
 # One reading-status rule, finished first: FINISHED is ZISFINISHED = 1
@@ -143,6 +124,13 @@ class LibraryStats:
     None). ``annotations_per_book`` holds ``(book id, title, count)``
     for every book with annotations, most annotated first (ties by id);
     the title is None for a book without one.
+
+    ``orphan_assets`` (1.11) breaks ``orphan_annotations`` down by the
+    asset id the annotations name: ``(asset id, count)`` for every asset
+    id no book row has; its counts add up to ``orphan_annotations``. Most
+    annotations first; among equal counts None comes last, and other ids
+    sort by type name, then value. The ids are as stored, so None, ``''``
+    and a bytes value are distinct entries.
     """
 
     total_books: int
@@ -152,6 +140,7 @@ class LibraryStats:
     total_annotations: int
     orphan_annotations: int
     annotations_per_book: Tuple[Tuple[int, Optional[str], int], ...] = ()
+    orphan_assets: Tuple[Tuple[Optional[str], int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -183,7 +172,8 @@ class StoreInfo:
     backup_dir: pathlib.Path
 
 
-class PyAppleBooks:
+class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _EngagementAPI,
+                   _BookInfoAPI, _PdfAPI):
     """Facade class for accessing Apple Books data.
 
     ``PyAppleBooks()`` reads the current user's library: the stores
@@ -389,10 +379,7 @@ class PyAppleBooks:
         :raises BookNotFoundError: no book has that id. An
             :class:`IndexError` subclass, so pre-1.10 handlers still work.
         """
-        try:
-            return Book.manager.filter(id=book_id)[0]
-        except IndexError:
-            raise BookNotFoundError(f"No book with id {_id_text(book_id)}.") from None
+        return _book_by_id(book_id)
 
     def get_book_by_title(self, title: str, *, limit: int = None, order_by: str = None,
                           offset: int = None, include_store_series: bool = False) -> ModelIterable:
@@ -521,14 +508,22 @@ class PyAppleBooks:
         )
         return list(matches)
 
-    def get_annotations_by_date_range(self, after: datetime = None, before: datetime = None,
+    def get_annotations_by_date_range(self, after: Union[datetime, date] = None,
+                                       before: Union[datetime, date] = None,
                                        limit: int = None, order_by: str = None, *,
                                        offset: int = None, include_deleted: bool = False) -> ModelIterable:
         """Get user annotations within a date range.
 
+        Both bounds are inclusive. A datetime is an instant (a naive one
+        is local time). A date (1.11) covers that whole local day:
+        ``after=date(2026, 1, 1)`` starts at local midnight, and
+        ``before=date(2026, 12, 31)`` includes all of 31 December.
+
         Args:
-            after: Only include annotations created after this datetime.
-            before: Only include annotations created before this datetime.
+            after: Only include annotations created at or after this datetime
+                (or from the start of this date).
+            before: Only include annotations created at or before this datetime
+                (or up to the end of this date).
             limit: Maximum number of results.
             order_by: Field to sort by (prefix with - for descending).
             offset: Number of results to skip.
@@ -536,9 +531,15 @@ class PyAppleBooks:
         """
         kwargs = _annotation_scope(include_deleted)
         if after:
-            kwargs["creation_date__gte"] = after.timestamp() - APPLE_EPOCH_OFFSET
+            if _engagement._is_day(after):
+                kwargs["creation_date__gte"] = _engagement._day_start(after)
+            else:
+                kwargs["creation_date__gte"] = after.timestamp() - APPLE_EPOCH_OFFSET
         if before:
-            kwargs["creation_date__lte"] = before.timestamp() - APPLE_EPOCH_OFFSET
+            if _engagement._is_day(before):
+                kwargs["creation_date__lt"] = _engagement._day_end(before)
+            else:
+                kwargs["creation_date__lte"] = before.timestamp() - APPLE_EPOCH_OFFSET
         return Annotation.manager.filter(**kwargs, limit=limit, order_by=order_by, offset=offset)
 
     # -- reading progress actions --
@@ -557,11 +558,27 @@ class PyAppleBooks:
                                    limit=limit, order_by=order_by, offset=offset)
 
     def get_finished_books(self, limit: int = None, order_by: str = None, *,
-                           offset: int = None) -> ModelIterable:
+                           offset: int = None, finished_after: Union[datetime, date] = None,
+                           finished_before: Union[datetime, date] = None) -> ModelIterable:
         """Get books marked as finished, whatever their progress (a
-        finished book is in neither of the other two lists)."""
+        finished book is in neither of the other two lists).
+
+        ``finished_after`` and ``finished_before`` (1.11) keep the books
+        whose finish date (:attr:`Book.finished_date`) is in that window,
+        bounds included: a datetime is an instant (naive means local
+        time), a date covers that whole local day. With either set,
+        books without a finish date are left out. Books records the date
+        a book was marked as finished, so books marked in bulk share one.
+
+        :raises InvalidArgumentError: a bound that isn't a date or a
+            datetime.
+        :raises UnsupportedSchemaError: (when the result is read) a bound
+            is set and the store has no finish date column.
+        """
+        bounds = _engagement._window_filters("finished_date", finished_after, finished_before,
+                                             names=("finished_after", "finished_before"))
         return Book.manager.filter(**_owned_books_filter(), **_STATUS_FILTERS[ReadingStatus.FINISHED],
-                                   limit=limit, order_by=order_by, offset=offset)
+                                   **bounds, limit=limit, order_by=order_by, offset=offset)
 
     def get_unstarted_books(self, limit: int = None, order_by: str = None, *,
                             offset: int = None) -> ModelIterable:
@@ -638,40 +655,57 @@ class PyAppleBooks:
         per_asset = Annotation.manager.filter(**_LIVE_ANNOTATIONS).count_by("asset_id")
         # Every book row, as annotation.book finds them: Store series
         # items included, and the lowest id for an asset id two rows share.
-        books: Dict[str, Book] = {}
-        for book in Book.manager.all(only=["id", "asset_id", "title"], order_by="id"):
-            if book.asset_id is not None:
-                books.setdefault(book.asset_id, book)
+        books = _books_by_asset()
         per_book = sorted(((books[asset].id, books[asset].title, n)
                            for asset, n in per_asset.items() if asset in books),
                           key=lambda entry: (-entry[2], entry[0]))
+        orphans = sorted(((asset, n) for asset, n in per_asset.items() if asset not in books),
+                         key=_orphan_order)
         return LibraryStats(
             total_books=sum(counts.values()),
             finished_books=counts[ReadingStatus.FINISHED],
             in_progress_books=counts[ReadingStatus.IN_PROGRESS],
             unstarted_books=counts[ReadingStatus.UNSTARTED],
             total_annotations=sum(per_asset.values()),
-            orphan_annotations=sum(n for asset, n in per_asset.items() if asset not in books),
+            orphan_annotations=sum(n for _, n in orphans),
             annotations_per_book=tuple(per_book),
+            orphan_assets=tuple(orphans),
         )
 
     # -- content actions --
-    def get_book_content(self, book_id: int) -> BookContent:
+    def get_book_content(self, book_id: Union[int, str, Book]) -> BookContent:
         """Return a :class:`BookContent` handle for reading a book's full text.
 
-        Performs three pre-checks before returning:
+        Performs these pre-checks before returning, in order:
 
         1. The book's file is recorded in the library (``ZPATH`` is set).
-        2. The file is locally downloaded, not an iCloud placeholder.
-        3. The file is not DRM-protected: no FairPlay ``sinf.xml``, no
+        2. The file is on this Mac, checked without downloading anything
+           (1.11): Books doesn't record the book as stored only in iCloud
+           (``ZSTATE`` 3; refused before any file is touched); the file or
+           bundle isn't an iCloud placeholder and has no iCloud stub next
+           to it; and no file or folder inside the bundle is a
+           placeholder (an ``lstat`` walk that never lists a placeholder
+           folder).
+        3. The file is locally downloaded, not an iCloud placeholder
+           (:func:`~py_apple_books.content.is_downloaded`).
+        4. The file is not DRM-protected: no FairPlay ``sinf.xml``, no
            Adobe ``rights.xml``, and no ``META-INF/encryption.xml`` that
            encrypts more than fonts (see
            :attr:`BookContent.is_drm_protected`).
 
+        Reads that would still reach an evicted file later fail with
+        :class:`BookNotDownloadedError` rather than download it.
+
+        :param book_id: The book's id, or (1.11) a :class:`Book`. A
+            ``Book`` read from this library is used as is (no query),
+            unless its ``path`` or ``state`` wasn't read (``only=``):
+            then it is read again by id, as is a ``Book`` from another
+            library.
         :raises BookNotDownloadedError: if the book has no local file
-            (``path`` is None) or exists only as an iCloud placeholder. The
-            fix in both cases is to open the book in Apple Books to trigger
-            a download.
+            (``path`` is None), is stored only in iCloud, or is partly
+            evicted (some of its files are only in iCloud). The fix in
+            each case is to open the book in Apple Books to trigger a
+            download.
         :raises NotInLibraryError: (a :class:`BookNotDownloadedError`)
             if the row is an Apple Books Store series item you don't own
             (:attr:`Book.is_store_series_item`) and has no local file:
@@ -684,7 +718,10 @@ class PyAppleBooks:
             not an :class:`AppleBooksError`, for 1.x compatibility.
         """
         try:
-            book = self.get_book_by_id(book_id)
+            if isinstance(book_id, Book):
+                book = _book_arg(book_id, needs=("path", "state"), get_book=self.get_book_by_id)
+            else:
+                book = self.get_book_by_id(book_id)
         except BookNotFoundError as e:
             # 1.x compatibility: this has always raised a bare IndexError
             # for an unknown id, and apple-books-mcp <= 0.8.2 catches
@@ -697,38 +734,36 @@ class PyAppleBooks:
         # plain object. A row with a local file is always tried.
         if getattr(book, "is_store_series_item", False) and not getattr(book, "path", None):
             raise NotInLibraryError(
-                f"'{book.title}' is an Apple Books Store series item that "
+                f"{_quoted_title(book)} is an Apple Books Store series item that "
                 f"isn't in your library (an unowned volume or a series "
                 f"container), so there is no book file to read."
             )
 
         if not book.path:
             raise BookNotDownloadedError(
-                f"'{book.title}' has not been downloaded to this Mac. "
+                f"{_quoted_title(book)} has not been downloaded to this Mac. "
                 f"Open it in Apple Books to download a local copy, then "
                 f"try again."
             )
 
-        content = BookContent(pathlib.Path(book.path))
+        path = pathlib.Path(book.path)
+        _require_local_files(book, path)
+        content = BookContent(path, book_id=getattr(book, "id", None))
 
         if not content.is_downloaded:
-            raise BookNotDownloadedError(
-                f"'{book.title}' is stored in iCloud and has not been "
-                f"downloaded to this Mac. Open it in Apple Books to trigger "
-                f"a download, then try again."
-            )
+            raise BookNotDownloadedError(_stored_in_icloud_message(book))
 
         if content.is_drm_protected:
             # Only sinf.xml proves a FairPlay Store purchase; anything
             # else is an imported EPUB carrying its own DRM.
             if content._drm_evidence() == "sinf.xml":
                 raise DRMProtectedError(
-                    f"'{book.title}' is a DRM-protected Apple Books Store "
+                    f"{_quoted_title(book)} is a DRM-protected Apple Books Store "
                     f"purchase (FairPlay). Its text content cannot be read "
                     f"directly; only imported EPUBs and PDFs are readable."
                 )
             raise DRMProtectedError(
-                f"'{book.title}' is an encrypted EPUB (DRM). Its text "
+                f"{_quoted_title(book)} is an encrypted EPUB (DRM). Its text "
                 f"content cannot be read directly; only DRM-free EPUBs "
                 f"are readable."
             )
@@ -872,6 +907,67 @@ class PyAppleBooks:
         )
 
 
+def _orphan_order(entry) -> tuple:
+    """Sort key of a ``LibraryStats.orphan_assets`` entry: most
+    annotations first, then None last, then by type name and value, so
+    raw keys of mixed types (None, str, bytes) never compare across
+    types."""
+    key, count = entry
+    return (-count, key is None, type(key).__name__, key if key is not None else "")
+
+
+def _quoted_title(book) -> str:
+    """A book's title in a :meth:`PyAppleBooks.get_book_content` message,
+    exactly as 1.10 wrote it (``'<title>'``), at any length.
+
+    Titles are not shortened here (entry and file names in content
+    errors are, see :mod:`py_apple_books._messages`): apple-books-mcp
+    0.8.2 shows these messages verbatim, so shortening a long title would
+    change its output for books that are fully downloaded (DRM-protected
+    or Store series books), and 0.9.0 already shortens quoted names
+    itself.
+    """
+    return f"'{book.title}'"
+
+
+def _stored_in_icloud_message(book) -> str:
+    return (
+        f"{_quoted_title(book)} is stored in iCloud and has not been "
+        f"downloaded to this Mac. Open it in Apple Books to trigger "
+        f"a download, then try again."
+    )
+
+
+def _require_local_files(book, path: pathlib.Path) -> None:
+    """The iCloud gates of :meth:`PyAppleBooks.get_book_content` (1.11),
+    before ``du`` runs: ``ZSTATE`` 3 (before any file access); the book's
+    file or bundle being an iCloud placeholder or having an iCloud stub
+    next to it (1.10's "stored in iCloud" message); then anything inside
+    the bundle being one (the partial-download message). Errors other
+    than a refused download are left to the 1.10 checks that follow.
+    """
+    if getattr(book, "state", None) == STATE_CLOUD_ONLY:
+        raise BookNotDownloadedError(_stored_in_icloud_message(book))
+    with _icloud.no_materialize():
+        try:
+            if _icloud.icloud_stub(path):
+                raise BookNotDownloadedError(_stored_in_icloud_message(book))
+            st = _icloud.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                st = _icloud.stat(path)
+        except (OSError, ValueError) as e:
+            if _icloud.is_materialize_error(e):
+                raise BookNotDownloadedError(_stored_in_icloud_message(book)) from None
+            return
+        if _icloud.is_dataless(st):
+            raise BookNotDownloadedError(_stored_in_icloud_message(book))
+        if not stat.S_ISDIR(st.st_mode):
+            return
+        found = _icloud.walk_bundle_local(path)
+    if found in (_icloud.FileState.DATALESS, _icloud.FileState.ICLOUD_STUB):
+        raise BookNotDownloadedError(_icloud.PARTIAL_DOWNLOAD_MESSAGE)
+
+
 def _in_library(method):
     """``method``, run with its instance's library as the current one
     (``PyAppleBooks.__library``, mangled)."""
@@ -886,10 +982,21 @@ def _bind_library(cls) -> None:
     """Make every public method of ``cls`` read its instance's library
     (:func:`use_library`; the current one for ``PyAppleBooks()``). Results
     keep reading it after the call: models and iterables hold the library
-    they were read from."""
+    they were read from.
+
+    Only the methods ``cls`` defines itself (``vars``) are wrapped, so
+    binding a class and then its subclass (or the facade and each of its
+    mixins) wraps every method once."""
     for name, attr in list(vars(cls).items()):
         if not name.startswith("_") and inspect.isfunction(attr):
             setattr(cls, name, _in_library(attr))
 
 
-_bind_library(PyAppleBooks)
+# The facade's mixins (py_apple_books/_api), in base-class order. Their
+# methods are bound like the facade's own, so an inherited method reads
+# the instance's library too.
+_MIXINS = PyAppleBooks.__bases__
+
+for _cls in (PyAppleBooks, *_MIXINS):
+    _bind_library(_cls)
+del _cls

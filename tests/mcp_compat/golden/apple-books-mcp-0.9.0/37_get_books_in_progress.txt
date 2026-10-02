@@ -1,0 +1,5 @@
+# get_books_in_progress {"limit": 1, "offset": 1} isError=False
+[7] Locked Store Book by Store Author
+  Progress: In Progress (25.0%) | Last Read: 2026-09-12
+
+Showing 2–2 of 2 books (end).

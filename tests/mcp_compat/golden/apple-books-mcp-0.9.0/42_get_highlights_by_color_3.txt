@@ -1,0 +1,5 @@
+# get_highlights_by_color {"color": "yellow", "limit": 1, "offset": 1, "order_by": "oldest"} isError=False
+Synthetic Book (Test Author) — 1 yellow highlight:
+  [1] a synthetic highlight — Chapter 1 (ch=chap1)
+
+Showing 2–2 of 2 yellow highlights (end).

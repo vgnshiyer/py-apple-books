@@ -1,0 +1,8 @@
+# describe_book {"book_id": "1"} isError=False
+Synthetic Book by Test Author
+  Book id: 1
+  Genre:    Fiction
+  Progress: In Progress (42.0%) | Last Read: 2026-09-20
+  Annotations: 5
+  Readable text: yes (EPUB)
+  Open in Books: ibooks://assetid/8BE83570810E5357845372A57CDA8FCB

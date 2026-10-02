@@ -194,6 +194,9 @@ def test_a_thread_in_a_tight_loop_does_not_starve_a_waiter(lib_db):
             db.execute("SELECT 1")
             done[0] += 1
 
+    # This thread's first statement does one-time per-thread setup before
+    # it joins the queue; measure the steady state.
+    assert db.execute("SELECT 1") == [(1,)]
     thread = _start(loop)
     try:
         while done[0] < 100:

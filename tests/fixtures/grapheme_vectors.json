@@ -1,0 +1,524 @@
+[
+ {
+  "note": "devanagari words and conjuncts",
+  "text": "\u0928\u092e\u0938\u094d\u0924\u0947 \u0926\u0941\u0928\u093f\u092f\u093e \u0915\u094d\u0937\u0924\u094d\u0930\u093f\u092f \u0939\u093f\u0928\u094d\u0926\u0940",
+  "boundaries": [
+   0,
+   1,
+   2,
+   6,
+   7,
+   9,
+   11,
+   13,
+   14,
+   17,
+   21,
+   22,
+   23,
+   25,
+   29
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "devanagari conjunct run",
+  "text": "\u0915\u094d\u0937\u0924\u094d\u0930\u093f\u092f\u0915\u094d\u0937\u0924\u094d\u0930\u093f\u092f",
+  "boundaries": [
+   0,
+   3,
+   7,
+   8,
+   11,
+   15,
+   16
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "devanagari virama then independent vowel",
+  "text": "\u0915\u094d\u0905",
+  "boundaries": [
+   0,
+   2,
+   3
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "devanagari ZWJ inside a conjunct",
+  "text": "\u0915\u094d\u200d\u0937",
+  "boundaries": [
+   0,
+   4
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "bengali",
+  "text": "\u09ac\u09be\u0982\u09b2\u09be \u09ad\u09be\u09b7\u09be \u0995\u09cd\u09b7",
+  "boundaries": [
+   0,
+   3,
+   5,
+   6,
+   8,
+   10,
+   11,
+   14
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "gujarati",
+  "text": "\u0a97\u0ac1\u0a9c\u0ab0\u0abe\u0aa4\u0ac0 \u0a95\u0acd\u0ab7",
+  "boundaries": [
+   0,
+   2,
+   3,
+   5,
+   7,
+   8,
+   11
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "oriya",
+  "text": "\u0b13\u0b21\u0b3c\u0b3f\u0b06 \u0b15\u0b4d\u0b37",
+  "boundaries": [
+   0,
+   1,
+   4,
+   5,
+   6,
+   9
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "telugu",
+  "text": "\u0c24\u0c46\u0c32\u0c41\u0c17\u0c41 \u0c15\u0c4d\u0c37",
+  "boundaries": [
+   0,
+   2,
+   4,
+   6,
+   7,
+   10
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "malayalam",
+  "text": "\u0d2e\u0d32\u0d2f\u0d3e\u0d33\u0d02 \u0d15\u0d4d\u0d37",
+  "boundaries": [
+   0,
+   1,
+   2,
+   4,
+   6,
+   7,
+   10
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "tamil (virama does not link)",
+  "text": "\u0ba4\u0bae\u0bbf\u0bb4\u0bcd \u0bae\u0bca\u0bb4\u0bbf \u0b95\u0bcd\u0bb7",
+  "boundaries": [
+   0,
+   1,
+   3,
+   5,
+   6,
+   8,
+   10,
+   11,
+   13,
+   14
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "kannada (virama does not link)",
+  "text": "\u0c95\u0ca8\u0ccd\u0ca8\u0ca1 \u0c95\u0ccd\u0cb7",
+  "boundaries": [
+   0,
+   1,
+   3,
+   4,
+   5,
+   6,
+   8,
+   9
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "sinhala with ZWJ after virama",
+  "text": "\u0dc1\u0dca\u200d\u0dbb\u0dd3 \u0dbd\u0d82\u0d9a\u0dcf",
+  "boundaries": [
+   0,
+   3,
+   5,
+   6,
+   8,
+   10
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "khmer coeng",
+  "text": "\u1781\u17d2\u1798\u17c2\u179a \u1780\u17d2\u179f",
+  "boundaries": [
+   0,
+   4,
+   5,
+   6,
+   9
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "myanmar, a vowel sign that does not extend",
+  "text": "\u1019\u103c\u1014\u103a\u1019\u102c \u1000\u102c \u1000\u103a\u1039\u1001",
+  "boundaries": [
+   0,
+   2,
+   4,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10,
+   14
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "thai with SARA AM",
+  "text": "\u0e20\u0e32\u0e29\u0e32\u0e44\u0e17\u0e22\u0e17\u0e35\u0e48\u0e2a\u0e27\u0e22\u0e07\u0e32\u0e21 \u0e01\u0e33",
+  "boundaries": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   10,
+   11,
+   12,
+   13,
+   14,
+   15,
+   16,
+   17,
+   19
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "hebrew points",
+  "text": "\u05d1\u05b0\u05bc\u05e8\u05b5\u05d0\u05e9\u05b4\u05c1\u05d9\u05ea \u05d1\u05b8\u05bc\u05e8\u05b8\u05d0 \u05d0\u05b1\u05dc\u05b9\u05d4\u05b4\u05d9\u05dd",
+  "boundaries": [
+   0,
+   3,
+   5,
+   6,
+   9,
+   10,
+   11,
+   12,
+   15,
+   17,
+   18,
+   19,
+   21,
+   23,
+   25,
+   26,
+   27
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "arabic marks and ligature",
+  "text": "\ufdfa \u0639\u064e\u0631\u064e\u0628\u0650\u064a\u0651",
+  "boundaries": [
+   0,
+   1,
+   2,
+   4,
+   6,
+   8,
+   10
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "arabic prepended number sign",
+  "text": "\u0600\u0661\u0662 x",
+  "boundaries": [
+   0,
+   2,
+   3,
+   4,
+   5
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "vietnamese decomposed",
+  "text": "Tie\u0302\u0301ng Vie\u0323\u0302t ra\u0302\u0301t \u0111e\u0323p",
+  "boundaries": [
+   0,
+   1,
+   2,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10,
+   13,
+   14,
+   15,
+   16,
+   19,
+   20,
+   21,
+   22,
+   24,
+   25
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "hangul decomposed",
+  "text": "\u1112\u1161\u11ab\u1100\u116e\u11a8\u110b\u1165\u1110\u1166\u11a8\u1109\u1173\u1110\u1173",
+  "boundaries": [
+   0,
+   3,
+   6,
+   8,
+   11,
+   13,
+   15
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "hangul syllable plus jamo",
+  "text": "\uac00\u11a8\uac01\u11a8\uac00\u1161\u1100\uac00",
+  "boundaries": [
+   0,
+   2,
+   4,
+   6,
+   8
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "emoji ZWJ family, modifier, flags",
+  "text": "a\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66b\ud83d\udc4d\ud83c\udffdc\ud83c\uddef\ud83c\uddf5\ud83c\uddfa\ud83c\uddf8d",
+  "boundaries": [
+   0,
+   1,
+   8,
+   9,
+   11,
+   12,
+   14,
+   16,
+   17
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "odd regional indicators",
+  "text": "\ud83c\uddef\ud83c\uddf5\ud83c\uddfax",
+  "boundaries": [
+   0,
+   2,
+   3,
+   4
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "rainbow flag",
+  "text": "\ud83c\udff3\ufe0f\u200d\ud83c\udf08 flag",
+  "boundaries": [
+   0,
+   4,
+   5,
+   6,
+   7,
+   8,
+   9
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "eye in speech bubble",
+  "text": "\ud83d\udc41\ufe0f\u200d\ud83d\udde8\ufe0f!",
+  "boundaries": [
+   0,
+   5,
+   6
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "tag sequence flag",
+  "text": "\ud83c\udff4\udb40\udc67\udb40\udc62\udb40\udc65\udb40\udc6e\udb40\udc67\udb40\udc7f.",
+  "boundaries": [
+   0,
+   7,
+   8
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "keycaps",
+  "text": "1\ufe0f\u20e3 #\ufe0f\u20e3",
+  "boundaries": [
+   0,
+   3,
+   4,
+   7
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "lone modifier and ZWJ after a letter",
+  "text": "a\ud83c\udffd a\u200db \u200d\ud83d\udc4d",
+  "boundaries": [
+   0,
+   2,
+   3,
+   5,
+   6,
+   8,
+   9
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "kana voicing marks, halfwidth too",
+  "text": "\u304b\u3099 \uff76\uff9e\uff77\uff9e",
+  "boundaries": [
+   0,
+   2,
+   3,
+   5,
+   7
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "CR LF and controls",
+  "text": "x\r\ny\rz\n\u0301",
+  "boundaries": [
+   0,
+   1,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "soft hyphen, ZWSP, BOM, word joiner",
+  "text": "soft\u00adhyphen zero\u200bwidth \ufeffbom a\u2060b",
+  "boundaries": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10,
+   11,
+   12,
+   13,
+   14,
+   15,
+   16,
+   17,
+   18,
+   19,
+   20,
+   21,
+   22,
+   23,
+   24,
+   25,
+   26,
+   27,
+   28,
+   29,
+   30,
+   31
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "combining marks on Latin",
+  "text": "e\u0301\u0327x\u20dd\u0300",
+  "boundaries": [
+   0,
+   3,
+   6
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "CJK and punctuation",
+  "text": "\u7b2c\u4e00\u7ae0\u3002\u672c\u6587\uff01",
+  "boundaries": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7
+  ],
+  "regex": "2026.9.10"
+ },
+ {
+  "note": "CJK extension H",
+  "text": "\ud884\udf50\ud884\udf51\u3099",
+  "boundaries": [
+   0,
+   1,
+   3
+  ],
+  "regex": "2026.9.10",
+  "min_unidata": "15.0.0"
+ },
+ {
+  "note": "kawi conjunct",
+  "text": "\ud807\udf12\ud807\udf42\ud807\udf12",
+  "boundaries": [
+   0,
+   3
+  ],
+  "regex": "2026.9.10",
+  "min_unidata": "15.0.0"
+ }
+]

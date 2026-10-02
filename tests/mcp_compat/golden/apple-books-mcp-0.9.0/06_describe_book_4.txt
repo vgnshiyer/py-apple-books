@@ -1,0 +1,2 @@
+# describe_book {"book_id": "999999"} isError=True
+Error executing tool describe_book: No book with id 999999. Use search_books or list_all_books to find book ids.

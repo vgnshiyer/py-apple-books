@@ -1,0 +1,175 @@
+"""The :class:`~py_apple_books.PyAppleBooks` mixin for ranked annotation
+search and multi-word book search (new in 1.11).
+
+- ``search_annotations``: ranked search over highlights and notes, on
+  the private index in :mod:`py_apple_books.search`.
+- ``search_books``: books whose title or author holds every word of a
+  query, in one SQL statement.
+
+See ``py_apple_books._api`` for the rules mixin code follows.
+"""
+
+from typing import Callable, List, Optional, Union
+
+from py_apple_books._api._common import _book_arg, _book_scope, strict_limit, strict_offset
+from py_apple_books.db.clause import Clause, Not, Q, Where, WhereGroup, _text
+from py_apple_books.db.client import ANNOTATIONS_NOT_FOUND, current_library
+from py_apple_books.exceptions import AnnotationStoreNotFoundError
+from py_apple_books.models.book import Book
+from py_apple_books.models.manager import ModelIterable
+from py_apple_books.search import _MAX_TERMS, AnnotationHit, _plan, _search_annotations
+from py_apple_books.text import fold_for_match
+
+# Apple Books' placeholder for a book without an author (a Private Use
+# Area glyph, then ASCII letters only: U+E83A + 'UnknownAuthor'), as GLOB
+# patterns: both hold exactly for a fullmatch of
+# models.book._UNKNOWN_AUTHOR_PLACEHOLDER, which Book reads as None.
+_PLACEHOLDER_GLOB = "[\ue000-\uf8ff][A-Za-z]*"
+_NOT_ONLY_LETTERS_GLOB = "?*[^A-Za-z]*"
+
+
+def _title_or_author() -> Callable[[object], Clause]:
+    """A function of ``value``: the clause for ``value`` (``__search``) in
+    the title or the author of a book.
+
+    The author is searched as :class:`Book` shows it: Apple Books'
+    unknown-author placeholder is no author (its letters would match
+    'thor', 'now', 'author', ...). Only titles where the store has no
+    author column.
+    """
+    manager = Book.manager
+    if not manager.has_fields("author"):
+        return lambda value: Q(title__search=value).resolve(manager)
+    column = manager._get_db_field("author")
+    real_author = Not(WhereGroup([Where(column, _PLACEHOLDER_GLOB, "GLOB"),
+                                  Where(column, _NOT_ONLY_LETTERS_GLOB, "NOT GLOB")]))
+
+    def terms(value) -> Clause:
+        return WhereGroup([Q(title__search=value).resolve(manager),
+                           WhereGroup([Q(author__search=value).resolve(manager), real_author])], "OR")
+
+    return terms
+
+
+class _SearchAPI:
+    """Private mixin of :class:`~py_apple_books.PyAppleBooks`."""
+
+    def search_annotations(self, query: str, *, limit: Optional[int] = 20, offset: Optional[int] = None,
+                           book_id: Union[int, str, Book, None] = None, require_all: bool = False,
+                           include_deleted: bool = False) -> List[AnnotationHit]:
+        """Search highlights and notes by relevance, best first.
+
+        Matches the highlighted text, the note and the surrounding text,
+        each folded as every search folds it
+        (:func:`py_apple_books.text.fold_for_match`: case, accents, quote
+        and dash style ignored), in this order:
+
+        1. annotations containing every word of the query, best first
+           (full-text ranking: a word in the highlight counts most, one
+           in the note less, one only in the surrounding text least;
+           English words also match their other forms, "habits" finds
+           "habit");
+        2. annotations containing the whole query as written;
+        3. unless ``require_all``, annotations containing some of the
+           words;
+        4. only if nothing matched so far, annotations containing every
+           word inside a longer word; then, unless ``require_all``, those
+           containing every word of 3 or more characters (a query with
+           no such word skips this step).
+
+        Equal scores list the newer annotation id first. Common English
+        words (the, of, ...) are left out of a multi-word query; double
+        quotes search for a phrase. A query in a script written without
+        spaces between words (Chinese, Japanese, Korean, Thai, Lao,
+        Khmer, Myanmar) or of punctuation only is matched as text
+        contained in the annotation. For a query of 3 or more
+        characters once folded (a space at either end counts), the
+        results with ``limit=None`` include every annotation
+        :meth:`search_annotation_by_text` returns.
+
+        Scope as in :meth:`search_annotation_by_text`: user highlights,
+        notes and bookmarks, deleted ones only with ``include_deleted``,
+        never the reading-position row.
+
+        The search runs on an index of the library's annotations, built
+        in memory on first use and rebuilt when they change (checked at
+        most once a second; :meth:`close` drops it).
+
+        :param query: the text to look for. '', whitespace, or characters
+            that all fold away return ``[]``.
+        :param limit: hits to return (an integer >= 1), or None for all.
+        :param offset: hits of the ranked list to skip (>= 0), for paging.
+        :param book_id: only this book's annotations: its id, or a
+            :class:`Book`.
+        :param require_all: leave out the hits that match only some of
+            the words.
+        :param include_deleted: also search annotations deleted in Apple
+            Books.
+        :returns: :class:`~py_apple_books.search.AnnotationHit` objects.
+        :raises InvalidArgumentError: a query longer than
+            :data:`~py_apple_books.search.MAX_QUERY_LENGTH` characters,
+            or a bad ``limit`` or ``offset``.
+        :raises BookNotFoundError: no book has ``book_id``.
+        :raises AnnotationStoreNotFoundError: there is no annotation
+            store (whatever the query).
+        :raises QueryTimeoutError: a statement of the search or of its
+            index build ran past the query timeout, or the wait for
+            another thread's build did (the timeout bounds each
+            statement: use ``query_deadline()`` to bound the whole call).
+            A build stopped this way is continued by the next search.
+        :raises DBQueryError: the index failed ("Ranked annotation search
+            failed."), or reading the store did.
+        """
+        limit = strict_limit(limit)
+        offset = strict_offset(offset) or 0
+        plan = _plan(query)
+        asset_id = None
+        if book_id is not None:
+            asset_id = _book_arg(book_id, needs=("asset_id",), get_book=self.get_book_by_id).asset_id
+        db = current_library()
+        if not db.has_annotations():
+            # Even when there is nothing to search for, as
+            # search_annotation_by_text.
+            raise AnnotationStoreNotFoundError(ANNOTATIONS_NOT_FOUND)
+        if plan is None or (book_id is not None and asset_id is None):
+            return []
+        return _search_annotations(db, plan, limit=limit, offset=offset, asset_id=asset_id,
+                                   require_all=bool(require_all), include_deleted=bool(include_deleted))
+
+    def search_books(self, query: str, *, limit: Optional[int] = None, order_by: Optional[str] = None,
+                     offset: Optional[int] = None, include_store_series: bool = False) -> ModelIterable:
+        """Get the books whose title or author contains every word of
+        ``query``, each word in either (``"history smith"`` finds a
+        history book by an author named Smith), ignoring case, accents and
+        quote/dash style as :meth:`get_book_by_title` does. Store series
+        items you don't own are left out unless ``include_store_series``.
+
+        The query is folded, then split at spaces; at most 32 distinct
+        words are used. Word order doesn't matter, and a word may be part
+        of a longer one. '' matches every book with a title or an author;
+        a query whose characters all fold away matches none. The author
+        is the one :attr:`Book.author` shows: a book Apple Books lists as
+        "Unknown Author" has none. Where the store has no author column,
+        only titles are searched. One SQL
+        statement, unordered (storage order) by default, as the other
+        book searches.
+
+        :raises InvalidArgumentError: a bad ``limit`` (an integer >= 1,
+            or None for all) or ``offset``.
+        """
+        limit = strict_limit(limit)
+        offset = strict_offset(offset)
+        terms = _title_or_author()
+        folded = fold_for_match(_text(query))
+        words = list(dict.fromkeys(word for word in (folded or "").split(" ") if word))[:_MAX_TERMS]
+        if words:
+            where = WhereGroup([terms(word) for word in words])
+        else:
+            # '', whitespace, or characters that fold away: the query as
+            # given, under the __search lookup's own rules.
+            where = terms(query)
+        scope = _book_scope(include_store_series)
+        owned = scope.pop("where", None)
+        if owned is not None:
+            where = WhereGroup([owned.resolve(Book.manager), where])
+        return Book.manager.filter(where=where, **scope, limit=limit, order_by=order_by, offset=offset)

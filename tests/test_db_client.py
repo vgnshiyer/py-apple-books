@@ -6,6 +6,7 @@ import datetime
 import os
 import pathlib
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -338,6 +339,10 @@ def test_fork_child(lib_db):
     if pid == 0:  # pragma: no cover - child
         status = 1
         try:
+            # A deadlock in the child ends it (SIGALRM's default action)
+            # and fails the test, instead of hanging the suite.
+            signal.signal(signal.SIGALRM, signal.SIG_DFL)
+            signal.alarm(20)
             os.close(read_end)
             with use_library(lib_db):
                 result = (lib_db.execute(COUNT_BOOKS), [b.title for b in PyAppleBooks().list_books()])

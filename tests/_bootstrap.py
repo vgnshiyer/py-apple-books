@@ -6,7 +6,8 @@ the backup directory), so the fake HOME must exist before anything
 imports the package. This module therefore never imports py_apple_books:
 it finds the schema SQL through importlib's finder (which doesn't
 execute the package) and builds the stores with plain sqlite3.
-``conftest.py`` calls it at import time.
+``conftest.py`` calls it at import time. Importing this module also
+installs the suite's audit hook (``tests/_fs_audit.py``).
 """
 
 from __future__ import annotations
@@ -14,18 +15,45 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import sysconfig
 import pathlib
 import re
 import sqlite3
 import uuid
 from typing import Dict, Optional
 
+from tests import _fs_audit
+
+# The shared audit hook (tests/_fs_audit.py) goes in before anything can
+# import py_apple_books, so record() and block() see every event of the
+# package, including those of its first import.
+_fs_audit.install()
+
 DOCUMENTS = "Library/Containers/com.apple.iBooksX/Data/Documents"
 ENV_PREFIX = "APPLE_BOOKS_"
 
 # Test-control switches (they select tests, not a library), restored
 # after every other APPLE_BOOKS_* variable is removed.
-TEST_CONTROL_VARS = ("APPLE_BOOKS_LIVE_TESTS", "APPLE_BOOKS_FUZZ_ITERATIONS", "APPLE_BOOKS_SLOW_TESTS")
+TEST_CONTROL_VARS = ("APPLE_BOOKS_LIVE_TESTS", "APPLE_BOOKS_FUZZ_ITERATIONS", "APPLE_BOOKS_SLOW_TESTS",
+                     "APPLE_BOOKS_TIME_SLACK")
+
+# APPLE_BOOKS_SLOW_TESTS: run the scale tests at release-gate sizes and
+# hold the timing tests to their strict budgets (soft by default: CI
+# machines vary).
+SLOW = os.environ.get("APPLE_BOOKS_SLOW_TESTS", "") not in ("", "0")
+
+# APPLE_BOOKS_TIME_SLACK: how much slower than a developer Mac this machine
+# may be (default 3 where CI is set, as on GitHub's runners, else 1). Tests
+# that bound a wait scale every duration they set (busy waits, budgets,
+# deadlines) and their bounds by it, so they check the same ratios anywhere.
+TIME_SLACK = float(os.environ.get("APPLE_BOOKS_TIME_SLACK") or (3 if os.environ.get("CI") else 1))
+
+# A free-threaded build (3.13t, 3.14t): objects carry more per-object
+# overhead there, which the caches' weight estimates don't yet count.
+FREE_THREADED = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+WEIGHT_ON_FREE_THREADED = (
+    "the cache weight estimates don't count free-threaded builds' larger "
+    "per-object overhead yet (1.12)")
 
 # The developer's environment as it was before isolate_environment().
 REAL_HOME: Optional[str] = os.environ.get("HOME")

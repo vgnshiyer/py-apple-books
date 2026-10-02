@@ -7,27 +7,43 @@ item. A crafted book could therefore read any local file (absolute or
 tests build such bundles by hand — the fixture factory in ``conftest.py``
 can't produce them — and check that every read stays inside the bundle,
 fails fast, and reports errors without absolute paths.
+
+1.11 adds: no read downloads an evicted iCloud file (placeholders are
+faked by patching ``os.lstat``/``os.stat``), the guarded per-file read of
+new APIs (``_read_entry_bytes``), and short messages for long names.
 """
 
 from __future__ import annotations
 
+import errno
 import os
 import pathlib
 import threading
 import zipfile
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import pytest
 from ebooklib import epub
 
+from py_apple_books import _icloud
 from py_apple_books import content as content_module
 from py_apple_books.content import (
     BookContent,
     _ContainedEpubReader,
     _opf_dir_from_container,
     _parse_ncx_bytes,
+    _read_entry_bytes,
+    _safe_bundle_path,
 )
-from py_apple_books.exceptions import AppleBooksError, UnsafeEpubEntryError
+from py_apple_books.exceptions import (
+    AppleBooksError,
+    BookNotDownloadedError,
+    ChapterNotFoundError,
+    NotEpubError,
+    UnsafeEpubEntryError,
+)
+from tests import _fs_audit
 
 
 CANARY = "CANARY-SECRET-aws_secret_access_key"
@@ -766,3 +782,656 @@ class TestPathFreeMessages:
             content._read_chapter_bytes("OEBPS/Text/gone.xhtml")
         assert "missing on disk" in str(exc.value)
         _assert_path_free(str(exc.value), lib)
+
+
+# ---------------------------------------------------------------------------
+# iCloud placeholders: no read downloads an evicted file (1.11)
+# ---------------------------------------------------------------------------
+#
+# A real placeholder can't be made here, so ``os.lstat``/``os.stat`` are
+# wrapped to report SF_DATALESS for chosen paths (``_icloud`` and
+# ``Path.resolve`` call them at run time), and to record every path
+# stat'ed. The I/O policy calls are replaced by a recorder.
+
+
+def _dataless_copy(st):
+    fields = {name: getattr(st, name) for name in dir(st) if name.startswith("st_")}
+    fields["st_flags"] = getattr(st, "st_flags", 0) | _icloud.SF_DATALESS
+    return SimpleNamespace(**fields)
+
+
+class _FakeICloud:
+    def __init__(self):
+        self.marked = set()
+        self.stats: List[str] = []
+
+    def mark(self, *paths):
+        """Make ``paths`` placeholders, and start recording afresh (so
+        stats made while building the bundle don't count)."""
+        for path in paths:
+            self.marked.add(os.fspath(path))
+            self.marked.add(os.path.realpath(path))
+        self.stats.clear()
+
+    def inside(self, folder) -> List[str]:
+        """The paths stat'ed strictly inside ``folder``. (A snapshot:
+        realpath() itself stats.)"""
+        stats = list(self.stats)
+        prefix = os.path.realpath(folder) + os.sep
+        return [p for p in stats if os.path.realpath(p).startswith(prefix)]
+
+
+@pytest.fixture
+def icloud(monkeypatch):
+    fake = _FakeICloud()
+    real_lstat, real_stat = os.lstat, os.stat
+
+    def wrap(real):
+        def call(path, *args, dir_fd=None, **kwargs):
+            if dir_fd is None and isinstance(path, (str, bytes, os.PathLike)):
+                fake.stats.append(os.fsdecode(path))
+            st = real(path, *args, dir_fd=dir_fd, **kwargs)
+            if dir_fd is None and isinstance(path, (str, os.PathLike)) and os.fspath(path) in fake.marked:
+                return _dataless_copy(st)
+            return st
+        return call
+
+    monkeypatch.setattr(os, "lstat", wrap(real_lstat))
+    monkeypatch.setattr(os, "stat", wrap(real_stat))
+    return fake
+
+
+@pytest.fixture
+def policy(monkeypatch):
+    """Recorder for the thread I/O policy: ``policy.off()`` is True while
+    downloads are turned off for the calling thread."""
+    values: Dict[int, int] = {}
+
+    def get(kind, scope):
+        assert scope == _icloud.IOPOL_SCOPE_THREAD
+        return values.get(threading.get_ident(), 0)
+
+    def set_(kind, scope, value):
+        assert scope == _icloud.IOPOL_SCOPE_THREAD
+        values[threading.get_ident()] = value
+        return 0
+
+    monkeypatch.setattr(_icloud, "_policy_loaded", True)
+    monkeypatch.setattr(_icloud, "_policy_fns", (get, set_))
+    return SimpleNamespace(
+        off=lambda: values.get(threading.get_ident(), 0) == _icloud.IOPOL_MATERIALIZE_DATALESS_FILES_OFF,
+        value=lambda: values.get(threading.get_ident(), 0),
+    )
+
+
+@pytest.fixture
+def reads(monkeypatch, policy):
+    """Every ``Path.read_bytes`` call as ``(path, policy was off)``."""
+    seen = []
+    real = pathlib.Path.read_bytes
+
+    def read_bytes(self):
+        seen.append((os.fspath(self), policy.off()))
+        return real(self)
+
+    monkeypatch.setattr(pathlib.Path, "read_bytes", read_bytes)
+    return seen
+
+
+def _icloud_bundle(lib) -> pathlib.Path:
+    return _write_bundle(
+        _bundle_path(lib),
+        manifest=[_NAV_ITEM, _CH1_ITEM, ("ch2", "Text/ch2.xhtml", _XHTML, "")],
+        files={
+            "OEBPS/nav.xhtml": _nav([("Text/ch1.xhtml", "One"), ("Text/ch2.xhtml", "Two")]),
+            "OEBPS/Text/ch1.xhtml": _CHAPTER.format(title="One"),
+            "OEBPS/Text/ch2.xhtml": _CHAPTER.format(title="Two"),
+            "OEBPS/Text/extra.xhtml": _CHAPTER.format(title="Extra"),
+        },
+        spine=["ch1", "ch2"],
+    )
+
+
+def _assert_partial(exc: BookNotDownloadedError) -> None:
+    assert type(exc) is BookNotDownloadedError
+    assert str(exc) == _icloud.PARTIAL_DOWNLOAD_MESSAGE
+    assert "/" not in str(exc) and "xhtml" not in str(exc)
+    # Raised fresh or ``from None``: no OSError (and its path) attached.
+    assert exc.__cause__ is None
+    assert exc.__context__ is None or exc.__suppress_context__
+
+
+class TestICloudPlaceholders:
+    def test_dataless_chapter_is_never_read(self, lib, icloud, reads):
+        bundle = _icloud_bundle(lib)
+        chapter = bundle / "OEBPS" / "Text" / "ch2.xhtml"
+        icloud.mark(chapter)
+        with _fs_audit.record() as rec:
+            with pytest.raises(BookNotDownloadedError) as exc:
+                BookContent(bundle).list_chapters()
+        _assert_partial(exc.value)
+        assert os.path.realpath(chapter) not in [os.path.realpath(p) for p, _ in reads]
+        assert rec.under(chapter, "open") == []
+
+    def test_dataless_folder_is_never_looked_into(self, lib, icloud, reads):
+        bundle = _icloud_bundle(lib)
+        oebps = bundle / "OEBPS"
+        icloud.mark(oebps)
+        with _fs_audit.record() as rec:
+            with pytest.raises(BookNotDownloadedError) as exc:
+                BookContent(bundle).list_chapters()
+        _assert_partial(exc.value)
+        assert icloud.inside(oebps) == []
+        assert rec.under(oebps) == []
+        assert [p for p, _ in reads if "OEBPS" in p] == []
+
+    def test_dataless_root(self, lib, icloud):
+        bundle = _icloud_bundle(lib)
+        icloud.mark(bundle)
+        with pytest.raises(BookNotDownloadedError) as exc:
+            BookContent(bundle).list_chapters()
+        _assert_partial(exc.value)
+        assert icloud.inside(bundle) == []
+
+    def test_dataless_meta_inf_fails_the_drm_gate_closed(self, lib, icloud):
+        bundle = _icloud_bundle(lib)
+        icloud.mark(bundle / "META-INF")
+        content = BookContent(bundle)
+        assert content.is_drm_protected is True
+        assert content._drm_evidence() == "encryption.xml"
+        assert icloud.inside(bundle / "META-INF") == []
+        with pytest.raises(BookNotDownloadedError):
+            content.list_chapters()
+
+    def test_dataless_encryption_xml_is_not_read(self, lib, icloud, reads):
+        bundle = _icloud_bundle(lib)
+        enc = bundle / "META-INF" / "encryption.xml"
+        enc.write_text(_FONT_ONLY_ENCRYPTION)
+        assert BookContent(bundle).is_drm_protected is False
+        reads.clear()
+        icloud.mark(enc)
+        assert BookContent(bundle).is_drm_protected is True
+        assert [p for p, _ in reads if p.endswith("encryption.xml")] == []
+
+    def test_dataless_chapter_on_the_disk_fallback(self, lib, icloud, reads):
+        bundle = _icloud_bundle(lib)
+        content = BookContent(bundle)
+        content.list_chapters()
+        icloud.mark(bundle / "OEBPS" / "Text" / "extra.xhtml")
+        reads.clear()
+        with pytest.raises(BookNotDownloadedError) as exc:
+            content._read_chapter_bytes("OEBPS/Text/extra.xhtml")
+        _assert_partial(exc.value)
+        assert reads == []
+
+    def test_dataless_container_is_not_parsed_as_empty(self, lib, icloud):
+        bundle = _icloud_bundle(lib)
+        icloud.mark(bundle / "META-INF" / "container.xml")
+        with pytest.raises(BookNotDownloadedError):
+            _opf_dir_from_container(bundle)
+
+    @pytest.mark.parametrize("code", [errno.EDEADLK, errno.ETIMEDOUT])
+    def test_read_that_would_download_fails_with_the_fixed_message(self, lib, monkeypatch, code):
+        bundle = _icloud_bundle(lib)
+        real = pathlib.Path.read_bytes
+
+        def read_bytes(self):
+            if self.name in ("ch2.xhtml", "extra.xhtml", "container.xml"):
+                raise OSError(code, os.strerror(code), os.fspath(self))
+            return real(self)
+
+        monkeypatch.setattr(pathlib.Path, "read_bytes", read_bytes)
+        for call in (
+            lambda: BookContent(bundle).list_chapters(),
+            lambda: BookContent(bundle).get_chapter("ch1"),
+            lambda: _opf_dir_from_container(bundle),
+        ):
+            with pytest.raises(BookNotDownloadedError) as exc:
+                call()
+            _assert_partial(exc.value)
+            assert "Could not read" not in str(exc.value)
+
+    @pytest.mark.parametrize("code", [errno.EDEADLK, errno.ETIMEDOUT])
+    def test_read_that_would_download_on_the_disk_fallback(self, lib, monkeypatch, code):
+        bundle = _icloud_bundle(lib)
+        content = BookContent(bundle)
+        content.list_chapters()
+        real = pathlib.Path.read_bytes
+
+        def read_bytes(self):
+            if self.name == "extra.xhtml":
+                raise OSError(code, os.strerror(code), os.fspath(self))
+            return real(self)
+
+        monkeypatch.setattr(pathlib.Path, "read_bytes", read_bytes)
+        with pytest.raises(BookNotDownloadedError) as exc:
+            content._read_chapter_bytes("OEBPS/Text/extra.xhtml")
+        _assert_partial(exc.value)
+
+    def test_spine_item_read_that_would_download(self, lib, monkeypatch):
+        content = BookContent(_icloud_bundle(lib))
+        item = content._load_book().get_item_with_id("ch1")
+
+        def get_content(*args, **kwargs):
+            raise OSError(errno.EDEADLK, "Resource deadlock avoided", "/x/y.xhtml")
+
+        monkeypatch.setattr(item, "get_content", get_content)
+        with pytest.raises(BookNotDownloadedError) as exc:
+            content._spine_item_text("ch1")
+        _assert_partial(exc.value)
+
+    def test_encryption_xml_read_that_would_download_fails_closed(self, lib, monkeypatch):
+        bundle = _icloud_bundle(lib)
+        (bundle / "META-INF" / "encryption.xml").write_text(_FONT_ONLY_ENCRYPTION)
+        real = pathlib.Path.read_bytes
+
+        def read_bytes(self):
+            if self.name == "encryption.xml":
+                raise OSError(errno.EDEADLK, "Resource deadlock avoided")
+            return real(self)
+
+        monkeypatch.setattr(pathlib.Path, "read_bytes", read_bytes)
+        assert BookContent(bundle).is_drm_protected is True
+
+    def test_every_legacy_read_runs_with_downloads_off(self, lib, reads, policy):
+        bundle = _icloud_bundle(lib)
+        (bundle / "META-INF" / "encryption.xml").write_text(_FONT_ONLY_ENCRYPTION)
+        before = policy.value()
+        content = BookContent(bundle)
+        assert content.is_drm_protected is False
+        assert content.list_chapters()
+        assert "Legit text of Two." in content.get_chapter("ch2")
+        assert "Legit text of One." in content._spine_item_text("ch1")
+        content._read_chapter_bytes("OEBPS/Text/extra.xhtml")
+        _opf_dir_from_container(bundle)
+        assert len(reads) >= 7
+        assert all(off for _, off in reads), [p for p, off in reads if not off]
+        assert policy.value() == before
+
+    def test_policy_is_restored_after_a_failed_read(self, lib, policy):
+        bundle = _icloud_bundle(lib)
+        (bundle / "OEBPS" / "Text" / "ch2.xhtml").unlink()
+        before = policy.value()
+        with pytest.raises(AppleBooksError):
+            BookContent(bundle).list_chapters()
+        assert policy.value() == before
+
+    def test_stat_results_without_flags(self, lib, monkeypatch):
+        # Linux stat results have no st_flags.
+        class NoFlags:
+            def __init__(self, st):
+                self._st = st
+
+            def __getattr__(self, name):
+                if name == "st_flags":
+                    raise AttributeError(name)
+                return getattr(self._st, name)
+
+        real_lstat, real_stat = _icloud.lstat, _icloud.stat
+        monkeypatch.setattr(_icloud, "lstat", lambda p, **kw: NoFlags(real_lstat(p, **kw)))
+        monkeypatch.setattr(_icloud, "stat", lambda p: NoFlags(real_stat(p)))
+        bundle = _icloud_bundle(lib)
+        content = BookContent(bundle)
+        assert [c.id for c in content.list_chapters()] == ["ch1", "ch2"]
+        assert "Legit text of One." in content.get_chapter("ch1")
+        assert content.is_drm_protected is False
+        assert _icloud.walk_bundle_local(bundle) is _icloud.FileState.LOCAL
+
+    def test_container_is_read_once(self, lib, monkeypatch, reads):
+        bundle = _icloud_bundle(lib)
+
+        def no_reread(root):
+            raise AssertionError("container.xml read again")
+
+        monkeypatch.setattr(content_module, "_opf_dir_from_container", no_reread)
+        content = BookContent(bundle)
+        chapters = content.list_chapters()
+        assert [c.href for c in chapters] == ["OEBPS/Text/ch1.xhtml", "OEBPS/Text/ch2.xhtml"]
+        assert content._opf_dir() == pathlib.PurePosixPath("OEBPS")
+        # Once, by the load itself.
+        assert len([p for p, _ in reads if p.endswith("container.xml")]) == 1
+
+
+# ---------------------------------------------------------------------------
+# _read_entry_bytes: the per-file read of new content APIs (1.11)
+# ---------------------------------------------------------------------------
+
+
+class TestReadEntryBytes:
+    def test_reads_the_entry(self, lib, policy, monkeypatch):
+        bundle = _icloud_bundle(lib)
+        expected = (bundle / "OEBPS" / "Text" / "ch1.xhtml").read_bytes()
+        offs = []
+        real_read = os.read
+
+        def read(fd, n):
+            offs.append(policy.off())
+            return real_read(fd, n)
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "read", read)
+            data = _read_entry_bytes(bundle, "OEBPS/Text/ch1.xhtml", 1 << 20)
+        assert data == expected
+        assert offs and all(offs)
+        assert _read_entry_bytes(str(bundle), "OEBPS/Text/../Text/ch1.xhtml", len(expected)) == expected
+        assert _read_entry_bytes(bundle, "OEBPS/Text/ch1.xhtml", len(expected)) == expected
+
+    def test_containment(self, lib):
+        bundle = _icloud_bundle(lib)
+        (bundle / "OEBPS" / "out.txt").symlink_to(lib / "outside" / "canary.txt")
+        (bundle / "OEBPS" / "in.xhtml").symlink_to("Text/ch1.xhtml")
+        for href in ("../../../outside/canary.txt", str(lib / "outside" / "canary.txt"),
+                     "OEBPS/out.txt", "OEBPS/Text", "/dev/zero"):
+            with pytest.raises(UnsafeEpubEntryError) as exc:
+                _read_entry_bytes(bundle, href, 1 << 20)
+            assert CANARY not in str(exc.value)
+            assert exc.value.entry == href
+        # A symlink inside the bundle is followed, as for 1.10's reads.
+        assert b"Legit text of One." in _read_entry_bytes(bundle, "OEBPS/in.xhtml", 1 << 20)
+        with pytest.raises(FileNotFoundError):
+            _read_entry_bytes(bundle, "OEBPS/Text/gone.xhtml", 1 << 20)
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX FIFOs")
+    def test_fifo_fails_fast(self, lib):
+        bundle = _icloud_bundle(lib)
+        os.mkfifo(bundle / "OEBPS" / "pipe.xhtml")
+        with pytest.raises(UnsafeEpubEntryError, match="not a regular file"):
+            _call_with_timeout(lambda: _read_entry_bytes(bundle, "OEBPS/pipe.xhtml", 1 << 20), 1.0)
+
+    def test_size_limits(self, lib, monkeypatch):
+        bundle = _icloud_bundle(lib)
+        size = (bundle / "OEBPS" / "Text" / "ch1.xhtml").stat().st_size
+        with pytest.raises(UnsafeEpubEntryError, match=f"larger than {size - 1} bytes"):
+            _read_entry_bytes(bundle, "OEBPS/Text/ch1.xhtml", size - 1)
+        monkeypatch.setattr(content_module, "_MAX_ENTRY_BYTES", 4)
+        with pytest.raises(UnsafeEpubEntryError, match="larger than 4 bytes"):
+            _read_entry_bytes(bundle, "OEBPS/Text/ch1.xhtml", 1 << 20)
+
+    def test_entry_growing_past_the_limit(self, lib, monkeypatch):
+        bundle = _icloud_bundle(lib)
+        real_fstat = os.fstat
+
+        def fstat(fd):
+            return SimpleNamespace(**{**{n: getattr(real_fstat(fd), n) for n in dir(real_fstat(fd))
+                                         if n.startswith("st_")}, "st_size": 8})
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "fstat", fstat)
+            with pytest.raises(UnsafeEpubEntryError, match="larger than 16 bytes"):
+                _read_entry_bytes(bundle, "OEBPS/Text/ch1.xhtml", 16)
+
+    def test_dataless_entry_and_folder(self, lib, icloud, monkeypatch):
+        bundle = _icloud_bundle(lib)
+        opened = []
+        real_open = os.open
+        monkeypatch.setattr(os, "open", lambda p, *a, **k: opened.append(os.fspath(p)) or real_open(p, *a, **k))
+        icloud.mark(bundle / "OEBPS" / "Text" / "ch1.xhtml")
+        with pytest.raises(BookNotDownloadedError) as exc:
+            _read_entry_bytes(bundle, "OEBPS/Text/ch1.xhtml", 1 << 20)
+        _assert_partial(exc.value)
+        assert opened == []
+        icloud.mark(bundle / "OEBPS" / "Text")
+        with pytest.raises(BookNotDownloadedError):
+            _read_entry_bytes(bundle, "OEBPS/Text/ch2.xhtml", 1 << 20)
+        assert icloud.inside(bundle / "OEBPS" / "Text") == []
+
+    def test_read_that_would_download(self, lib, monkeypatch):
+        bundle = _icloud_bundle(lib)
+
+        def read(fd, n):
+            raise OSError(errno.EDEADLK, "Resource deadlock avoided")
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "read", read)
+            with pytest.raises(BookNotDownloadedError) as exc:
+                _read_entry_bytes(bundle, "OEBPS/Text/ch1.xhtml", 1 << 20)
+        _assert_partial(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Long names in messages (1.11): shortened, never longer than 300
+# ---------------------------------------------------------------------------
+
+
+# 5,000-character entry names that reach a real file: "./" padding is
+# normalized away on disk but kept in the name the book wrote.
+_PAD = "./" * 2470
+
+
+def _long(rel: str) -> str:
+    head, _, tail = rel.rpartition("/")
+    return f"{head}/{_PAD}{tail}" if head else f"{_PAD}{tail}"
+
+
+def _assert_short(exc: BaseException, cls) -> None:
+    assert type(exc) is cls, type(exc)
+    message = str(exc)
+    assert len(message) < 300, len(message)
+    assert "…" in message
+    assert _PAD not in message
+
+
+class TestLongNames:
+    def _bundle(self, lib, href: str, extra: Optional[Dict[str, str]] = None) -> pathlib.Path:
+        assert len(href) >= 4900
+        return _write_bundle(
+            _bundle_path(lib),
+            manifest=[_NAV_ITEM, _CH1_ITEM, ("appx", href, "text/plain", "")],
+            files={
+                "OEBPS/nav.xhtml": _nav([("Text/ch1.xhtml", "One")]),
+                "OEBPS/Text/ch1.xhtml": _CHAPTER.format(title="One"),
+                **(extra or {}),
+            },
+            spine=["ch1"],
+        )
+
+    def test_escaping_href(self, lib):
+        href = "../" * 1650 + "outside/canary.txt"
+        with pytest.raises(UnsafeEpubEntryError) as exc:
+            BookContent(self._bundle(lib, href)).list_chapters()
+        _assert_short(exc.value, UnsafeEpubEntryError)
+        assert exc.value.entry == "OEBPS/" + href
+        assert "../../" in str(exc.value) and "canary.txt'" in str(exc.value)
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX FIFOs")
+    def test_fifo(self, lib):
+        bundle = self._bundle(lib, _long("appx.txt"))
+        os.mkfifo(bundle / "OEBPS" / "appx.txt")
+        with pytest.raises(UnsafeEpubEntryError) as exc:
+            _call_with_timeout(BookContent(bundle).list_chapters)
+        _assert_short(exc.value, UnsafeEpubEntryError)
+        assert exc.value.entry == "OEBPS/" + _long("appx.txt")
+        assert "not a regular file" in str(exc.value)
+
+    def test_oversized_sparse_file(self, lib):
+        bundle = self._bundle(lib, _long("appx.txt"))
+        with open(bundle / "OEBPS" / "appx.txt", "wb") as f:
+            f.seek(content_module._MAX_ENTRY_BYTES)
+            f.write(b"x")  # sparse, with one block at the end
+        with pytest.raises(UnsafeEpubEntryError) as exc:
+            BookContent(bundle).list_chapters()
+        _assert_short(exc.value, UnsafeEpubEntryError)
+        assert "larger than 256 MiB" in str(exc.value)
+        with pytest.raises(UnsafeEpubEntryError) as exc:
+            _safe_bundle_path(bundle, "OEBPS/" + _long("appx.txt"))
+        _assert_short(exc.value, UnsafeEpubEntryError)
+
+    def test_unreadable_file(self, lib):
+        if os.geteuid() == 0:
+            pytest.skip("root reads anything")
+        bundle = self._bundle(lib, _long("appx.txt"), {"OEBPS/appx.txt": "x"})
+        target = bundle / "OEBPS" / "appx.txt"
+        target.chmod(0)
+        try:
+            with pytest.raises(AppleBooksError) as exc:
+                BookContent(bundle).list_chapters()
+            _assert_short(exc.value, AppleBooksError)
+            assert "Permission denied" in str(exc.value)
+            content = BookContent(bundle)
+            with pytest.raises(AppleBooksError) as exc:
+                content._read_chapter_bytes("OEBPS/" + _long("appx.txt"))
+        finally:
+            target.chmod(0o644)
+
+    def test_missing_entry(self, lib):
+        with pytest.raises(AppleBooksError) as exc:
+            BookContent(self._bundle(lib, _long("gone.txt"))).list_chapters()
+        _assert_short(exc.value, AppleBooksError)
+
+    def test_missing_chapter_file(self, lib):
+        bundle = _icloud_bundle(lib)
+        content = BookContent(bundle)
+        content.list_chapters()
+        with pytest.raises(AppleBooksError) as exc:
+            content._read_chapter_bytes("OEBPS/Text/" + _PAD + "gone.xhtml")
+        _assert_short(exc.value, AppleBooksError)
+        assert "missing on disk" in str(exc.value)
+
+    def test_symlink_loop(self, lib):
+        bundle = self._bundle(lib, _long("loop/x.txt"))
+        (bundle / "OEBPS" / "loop").symlink_to("loop")
+        with pytest.raises(UnsafeEpubEntryError) as exc:
+            BookContent(bundle).list_chapters()
+        _assert_short(exc.value, UnsafeEpubEntryError)
+        assert "can't be resolved" in str(exc.value)
+
+    def test_unknown_spine_entry(self, lib):
+        content = BookContent(_icloud_bundle(lib))
+        for call in (lambda: content.get_chapter("x" * 5000), lambda: content._spine_item_text("x" * 5000)):
+            with pytest.raises(ChapterNotFoundError) as exc:
+                call()
+            _assert_long_free(exc.value)
+
+    def test_unreadable_spine_entry(self, lib, monkeypatch):
+        content = BookContent(_icloud_bundle(lib))
+        item = content._load_book().get_item_with_id("ch1")
+        home = os.path.expanduser("~")
+
+        def get_content(*args, **kwargs):
+            raise RuntimeError(f"bad bytes in {home}/" + "y" * 5000)
+
+        monkeypatch.setattr(item, "get_content", get_content)
+        with pytest.raises(AppleBooksError) as exc:
+            content._spine_item_text("ch1")
+        _assert_long_free(exc.value)
+        assert home not in str(exc.value)
+        assert str(exc.value).startswith("Could not read spine entry 'ch1': bad bytes in ~/")
+
+    def test_long_bundle_and_file_names(self, lib):
+        name = "B" * 240 + ".epub"
+        bundle = _write_bundle(lib / "a" / name, manifest=[], files={}, spine=[])
+        (bundle / "OEBPS" / "content.opf").write_text("<package")
+        with pytest.raises(AppleBooksError) as exc:
+            BookContent(bundle).list_chapters()
+        _assert_long_free(exc.value)
+        assert str(exc.value).startswith("Could not read EPUB '" + "B" * 60 + "…")
+        other = lib / "a" / ("N" * 240 + ".txt")
+        other.write_text("x")
+        with pytest.raises(NotEpubError) as exc:
+            BookContent(other).list_chapters()
+        _assert_long_free(exc.value)
+
+
+def _assert_long_free(exc: BaseException) -> None:
+    message = str(exc)
+    assert len(message) < 300, len(message)
+    assert "…" in message
+
+
+# ---------------------------------------------------------------------------
+# Names of up to 80 characters: messages exactly as 1.10 wrote them
+# ---------------------------------------------------------------------------
+
+
+# With "OEBPS/" in front, the longest is exactly 80 characters.
+_SHORT_NAMES = ["appx.txt", "it's.txt", "n" * 70 + ".txt"]
+
+
+class TestShortNamesUnchanged:
+    """The 1.10 message for each site, built with 1.10's formatting
+    (``{name!r}``, ``'{title}'``), for names of at most 80 characters."""
+
+    def _bundle(self, lib, href, extra=None):
+        return _write_bundle(
+            _bundle_path(lib),
+            manifest=[_NAV_ITEM, _CH1_ITEM, ("appx", href, "text/plain", "")],
+            files={
+                "OEBPS/nav.xhtml": _nav([("Text/ch1.xhtml", "One")]),
+                "OEBPS/Text/ch1.xhtml": _CHAPTER.format(title="One"),
+                **(extra or {}),
+            },
+            spine=["ch1"],
+        )
+
+    @pytest.mark.parametrize("name", _SHORT_NAMES)
+    def test_entry_sites(self, lib, name, monkeypatch):
+        entry = f"OEBPS/{name}"
+        bundle = self._bundle(lib, name)
+        # Missing.
+        with pytest.raises(AppleBooksError) as exc:
+            BookContent(bundle).list_chapters()
+        assert str(exc.value) == f"Could not read EPUB entry {entry!r}: No such file or directory"
+        # Not a regular file.
+        (bundle / "OEBPS" / name).mkdir()
+        with pytest.raises(UnsafeEpubEntryError) as exc:
+            BookContent(bundle).list_chapters()
+        assert str(exc.value) == f"EPUB entry {entry!r} is not a regular file."
+        with pytest.raises(UnsafeEpubEntryError) as exc:
+            _safe_bundle_path(bundle, entry)
+        assert str(exc.value) == f"EPUB entry {entry!r} is not a regular file."
+        (bundle / "OEBPS" / name).rmdir()
+        # Too large.
+        (bundle / "OEBPS" / name).write_text("x" * 20)
+        monkeypatch.setattr(content_module, "_MAX_ENTRY_BYTES", 10 * 1024 * 1024)
+        with open(bundle / "OEBPS" / name, "ab") as f:
+            f.truncate(11 * 1024 * 1024)
+        with pytest.raises(UnsafeEpubEntryError) as exc:
+            BookContent(bundle).list_chapters()
+        assert str(exc.value) == f"EPUB entry {entry!r} is larger than 10 MiB."
+        with pytest.raises(UnsafeEpubEntryError) as exc:
+            _safe_bundle_path(bundle, entry)
+        assert str(exc.value) == f"EPUB entry {entry!r} is larger than 10 MiB."
+        # Outside the bundle.
+        (bundle / "OEBPS" / name).unlink()
+        (bundle / "OEBPS" / name).symlink_to(lib / "outside" / "canary.txt")
+        with pytest.raises(UnsafeEpubEntryError) as exc:
+            BookContent(bundle).list_chapters()
+        assert str(exc.value) == f"EPUB entry {entry!r} points outside the book bundle."
+        assert exc.value.entry == entry
+        # Can't be resolved.
+        (bundle / "OEBPS" / name).unlink()
+        (bundle / "OEBPS" / name).symlink_to(name)
+        with pytest.raises(UnsafeEpubEntryError) as exc:
+            BookContent(bundle).list_chapters()
+        assert str(exc.value) == f"EPUB entry {entry!r} can't be resolved inside the book bundle."
+
+    @pytest.mark.parametrize("name", _SHORT_NAMES)
+    def test_chapter_and_spine_sites(self, lib, name):
+        bundle = self._bundle(lib, "Text/ch1.xhtml")
+        content = BookContent(bundle)
+        content.list_chapters()
+        href = f"OEBPS/{name}"  # 80 characters at most
+        with pytest.raises(AppleBooksError) as exc:
+            content._read_chapter_bytes(href)
+        assert str(exc.value) == (
+            f"Chapter file {href!r} is declared in the EPUB manifest but missing on disk.")
+        with pytest.raises(ChapterNotFoundError) as exc:
+            content.get_chapter(name)
+        assert str(exc.value) == (
+            f"No chapter or spine entry with id {name!r} in this book. Pass an id from "
+            f"the book's table of contents, or a chapter's 1-based order (e.g. \"5\").")
+
+    @pytest.mark.parametrize("stem", ["Book", "it's", "b" * 70])
+    def test_book_name_sites(self, lib, stem):
+        bundle = _write_bundle(lib / "a" / f"{stem}.epub", manifest=[], files={}, spine=[])
+        (bundle / "OEBPS" / "content.opf").write_text("<package")
+        with pytest.raises(AppleBooksError) as exc:
+            BookContent(bundle).list_chapters()
+        assert str(exc.value).startswith(f"Could not read EPUB '{stem}.epub': ")
+        other = lib / "a" / f"{stem}.txt"
+        other.write_text("x")
+        with pytest.raises(NotEpubError) as exc:
+            BookContent(other).list_chapters()
+        assert str(exc.value) == (
+            f"'{stem}.txt' is not an EPUB bundle directory; chapter "
+            f"listing/reading is only supported for EPUB books.")

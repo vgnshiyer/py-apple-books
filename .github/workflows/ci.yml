@@ -25,19 +25,25 @@ jobs:
     # Python, since pathlib's resolve() behaves differently before 3.13.
     name: test (${{ matrix.python }})
     runs-on: macos-latest
-    continue-on-error: ${{ matrix.prerelease }}
+    continue-on-error: ${{ matrix.optional }}
     strategy:
       fail-fast: false
       matrix:
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
-        prerelease: [false]
+        optional: [false]
         include:
-          # Next CPython, informational only: uv's newest pre-release build.
+          # Informational only, and skipped while uv has no build: the
+          # next CPython (uv's newest pre-release), and the free-threaded
+          # builds, which the library's caches and locks must survive.
           - python: "3.15"
-            prerelease: true
+            optional: true
+          - python: "3.13t"
+            optional: true
+          - python: "3.14t"
+            optional: true
     env:
       PYTHON: ${{ matrix.python }}
-      PRERELEASE: ${{ matrix.prerelease }}
+      OPTIONAL: ${{ matrix.optional }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -47,7 +53,7 @@ jobs:
         id: venv
         run: |
           if ! uv venv -p "$PYTHON"; then
-            if [ "$PRERELEASE" = true ]; then
+            if [ "$OPTIONAL" = true ]; then
               echo "::notice::uv has no Python $PYTHON build yet; skipping this leg."
               echo "skip=true" >> "$GITHUB_OUTPUT"
               exit 0
@@ -83,7 +89,7 @@ jobs:
 
   dist:
     # Builds the sdist and wheel the way publish.yml does, checks their
-    # contents against the 1.9.1 wheel, and runs the tests against the
+    # contents against the 1.10.0 wheel, and runs the tests against the
     # installed wheel rather than the source tree.
     name: dist (${{ matrix.python }})
     runs-on: macos-latest
@@ -102,10 +108,10 @@ jobs:
         run: uv build -p "$PYTHON"
       - name: Check metadata
         run: uvx twine check --strict dist/*
-      - name: Check contents against the 1.9.1 wheel
+      - name: Check contents against the 1.10.0 wheel
         run: |
-          uvx pip download --no-deps --only-binary :all: py-apple-books==1.9.1 -d base/
-          uv run --no-project -p "$PYTHON" python scripts/check_dist.py --baseline-wheel base/py_apple_books-1.9.1-py3-none-any.whl
+          uvx pip download --no-deps --only-binary :all: py-apple-books==1.10.0 -d base/
+          uv run --no-project -p "$PYTHON" python scripts/check_dist.py --baseline-wheel base/py_apple_books-1.10.0-py3-none-any.whl
       - name: Run tests against the installed wheel
         run: |
           venv="$RUNNER_TEMP/venv"
@@ -127,6 +133,44 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  linux:
+    # The wheel the dist job built, installed and tested on Linux: no
+    # st_flags in os.stat and no iCloud I/O policy through ctypes, so the
+    # library's macOS-only gating has to step aside cleanly there, and no
+    # test may assume APFS. The workflow env keeps uv's own CPython builds
+    # (UV_PYTHON_PREFERENCE only-managed).
+    name: linux (${{ matrix.python }})
+    needs: dist
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.14"]
+    env:
+      PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+      - name: Run tests against the installed wheel
+        run: |
+          venv="$RUNNER_TEMP/venv"
+          uv venv -p "$PYTHON" "$venv"
+          uv pip install -p "$venv" dist/*.whl --group dev
+          # Only tests/ and the pytest config: nothing importable from the
+          # source tree, so py_apple_books comes from the wheel.
+          mkdir "$RUNNER_TEMP/wheel-tests"
+          cp -R tests pyproject.toml "$RUNNER_TEMP/wheel-tests/"
+          cd "$RUNNER_TEMP/wheel-tests"
+          "$venv/bin/python" -c 'import importlib.metadata as md, py_apple_books as p; assert "site-packages" in p.__file__, p.__file__; assert md.version("py-apple-books") == p.__version__, (md.version("py-apple-books"), p.__version__)'
+          "$venv/bin/python" -c 'import os, py_apple_books._icloud as ic; assert not hasattr(os.lstat("."), "st_flags"); assert ic._policy_functions() is None'
+          "$venv/bin/python" -m pytest -q
+
   workflow-lint:
     runs-on: ubuntu-latest
     steps:
@@ -138,15 +182,16 @@ jobs:
 
   mcp-compat:
     # Drives apple-books-mcp over stdio against the built wheel and a
-    # seeded fixture library: 0.8.2 must match its goldens, and the latest
-    # release must not crash.
+    # seeded fixture library: 0.8.2 and 0.9.0 must match their goldens
+    # (recorded on the released 1.10.0), and the latest release must not
+    # crash.
     name: mcp-compat (${{ matrix.mcp }}, uvx ${{ matrix.uvx_python }})
     needs: dist
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        mcp: ["0.8.2", "latest"]
+        mcp: ["0.8.2", "0.9.0", "latest"]
         uvx_python: ["3.12", "3.14"]
     env:
       TZ: UTC
@@ -163,3 +208,38 @@ jobs:
           path: dist/
       - name: Check apple-books-mcp against the wheel
         run: python3 tests/mcp_compat/run.py --mcp-version "$MCP_VERSION" --uvx-python "$UVX_PYTHON" --lib dist/*.whl --check
+
+  mcp-suite:
+    # apple-books-mcp's own test suite, from its released sdist, against
+    # the built wheel: the server's expectations of the library (types,
+    # errors, fixtures), beyond what the goldens show.
+    name: mcp-suite (${{ matrix.mcp }}, ${{ matrix.python }})
+    needs: dist
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mcp: ["0.8.2", "0.9.0"]
+        python: ["3.13", "3.14"]
+    env:
+      MCP_VERSION: ${{ matrix.mcp }}
+      PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+      - name: Install apple-books-mcp from its sdist, with the wheel
+        run: |
+          uvx pip download --no-deps --no-binary :all: "apple-books-mcp==$MCP_VERSION" -d mcp-sdist/
+          tar -xzf "mcp-sdist/apple_books_mcp-$MCP_VERSION.tar.gz"
+          uv venv -p "$PYTHON"
+          uv pip install dist/*.whl "./apple_books_mcp-$MCP_VERSION" "pytest>=8.3.5"
+          .venv/bin/python -c 'import importlib.metadata as md, py_apple_books as p; assert "site-packages" in p.__file__, p.__file__; assert md.version("py-apple-books") == p.__version__, (md.version("py-apple-books"), p.__version__); print("py-apple-books", p.__version__, "apple-books-mcp", md.version("apple-books-mcp"))'
+      - name: Run its tests
+        # An empty HOME: the suite builds its own fixture libraries.
+        run: |
+          mkdir "$RUNNER_TEMP/home"
+          cd "apple_books_mcp-$MCP_VERSION"
+          HOME="$RUNNER_TEMP/home" ../.venv/bin/python -m pytest -q

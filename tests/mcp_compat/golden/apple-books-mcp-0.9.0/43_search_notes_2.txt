@@ -1,0 +1,4 @@
+# search_notes {"limit": 1, "note": "synthetic"} isError=False
+Synthetic Book (Test Author):
+  [2] Opening words. — Chapter 2 (ch=chap2)
+    ↳ note: my synthetic note

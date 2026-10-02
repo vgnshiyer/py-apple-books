@@ -1,0 +1,11 @@
+# describe_annotation {"annotation_id": "1"} isError=False
+Annotation 1
+  Book:     Synthetic Book (Test Author)
+  Open in Books: ibooks://assetid/8BE83570810E5357845372A57CDA8FCB
+  Chapter:  Chapter 1 (ch=chap1)
+  Created:  2026-09-21 12:00
+  Color:    YELLOW
+
+  Highlighted: "a synthetic highlight"
+
+  CFI: epubcfi(/6/4[chap1]!/4/4,/1:0,/1:21)

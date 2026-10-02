@@ -1,0 +1,5 @@
+# recent_annotations {"limit": 2, "offset": 2} isError=False
+2026-09-21 12:00 [1] a synthetic highlight — Chapter 1 (ch=chap1) · Synthetic Book
+2026-09-19 12:00 [7] orphan synthetic highlight · removed book ORPHANAS…
+
+Showing 3–4 of 7 annotations. Next page: offset=4.

@@ -1,0 +1,5 @@
+# Modules added by stream 2.4 (metadata) whose import must do no I/O
+# (R19): the OPF reader and its caches are set up on first use.
+py_apple_books._opf
+py_apple_books.models.book_metadata
+py_apple_books.models.series

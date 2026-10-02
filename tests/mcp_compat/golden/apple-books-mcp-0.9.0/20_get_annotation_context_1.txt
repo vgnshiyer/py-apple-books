@@ -1,0 +1,4 @@
+# get_annotation_context {"annotation_id": 1} isError=False
+<book_text book_id="1" annotation_id="1">
+Chapter 1 Opening words. «a synthetic highlight» sits here in chapter 1. Closing words. A removed synthetic highlight was here once.
+</book_text>

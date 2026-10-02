@@ -10,10 +10,11 @@ collection of pure functions; anything with real domain weight
 from __future__ import annotations
 
 import configparser
+import math
 import pathlib
 import re
 from datetime import datetime
-from typing import Optional, Set
+from typing import Callable, Dict, Optional, Set, Tuple
 
 from bs4 import BeautifulSoup, CData, NavigableString, Tag
 
@@ -41,6 +42,34 @@ def apple_timestamp_to_datetime(raw):
     return datetime.fromtimestamp(float(raw) + APPLE_EPOCH_OFFSET)
 
 
+def _apple_datetime_or_none(raw) -> Optional[datetime]:
+    """:func:`apple_timestamp_to_datetime` for model fields, which never
+    raises: a corrupt date reads as None instead of failing every list
+    the row is in.
+
+    A datetime is returned as is, so the conversion is idempotent (a
+    model built from another one's fields keeps its dates). None for
+    None, for anything ``float()`` can't convert, for NaN and the
+    infinities, and for values outside the range a datetime can hold
+    on this platform (``OverflowError``, ``OSError``, ``ValueError``;
+    Core Data's distantPast, 0000-12-30, is one). Every other value
+    gives exactly what :func:`apple_timestamp_to_datetime` gives (naive
+    local time).
+    """
+    if raw is None or isinstance(raw, datetime):
+        return raw
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(seconds):
+        return None
+    try:
+        return datetime.fromtimestamp(seconds + APPLE_EPOCH_OFFSET)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # HTML → plain text extraction
 # ---------------------------------------------------------------------------
@@ -48,10 +77,24 @@ def apple_timestamp_to_datetime(raw):
 # EPUBs ship XHTML. ebooklib gives us raw bytes via ``item.get_content()``
 # but no text extraction; bs4's ``get_text()`` concatenates everything
 # without block-level awareness (``<p>A</p><p>B</p>`` → ``"AB"``). The
-# helpers below preprocess the DOM so bs4's own ``get_text()`` produces
-# readable paragraph-separated output, and add anchor-window support
-# so Project Gutenberg-style multi-section files can be split cleanly
-# by their NCX fragments.
+# extraction core has three parts, each one pass over the document:
+#
+# * :func:`_parse` parses the bytes (stdlib ``html.parser`` backend) and
+#   drops script, style and head elements with their contents;
+# * :func:`_walk` collects the text of a subtree in document order and
+#   emits a newline on entering and on leaving each block-level tag, so
+#   paragraph breaks survive. It can start at an element and stop at the
+#   first tag a predicate picks, which splits Project Gutenberg-style
+#   multi-section files cleanly by their NCX fragment anchors;
+# * :func:`_anchor_index` maps every fragment id (and ``<a name>``) of a
+#   document to its element.
+#
+# :func:`extract_chapter_text` is composed from them. Its output is
+# byte-identical to 1.10's, which inserted newline nodes into the tree
+# around every block-level tag before calling bs4's ``get_text()``: that
+# mutated the tree and took quadratic time in the number of sibling tags.
+# ``tests/test_extract_equivalence.py`` pins the equivalence against a
+# frozen copy of the 1.10 code.
 
 
 # Contents of these elements is dropped entirely before extraction.
@@ -63,8 +106,8 @@ _SKIP_TAGS = {"script", "style", "head"}
 # ``<template>`` contents) are left out on both extraction paths.
 _TEXT_STRING_TYPES = (NavigableString, CData)
 
-# Tags that should introduce a newline before/after their contents so
-# paragraph breaks survive ``get_text()``.
+# Tags that introduce a newline before and after their contents so
+# paragraph breaks survive extraction.
 _BLOCK_LEVEL_TAGS = {
     "address", "article", "aside", "blockquote", "br", "details", "div",
     "dl", "dd", "dt", "figure", "footer", "header", "hgroup", "hr",
@@ -72,6 +115,107 @@ _BLOCK_LEVEL_TAGS = {
     "li", "main", "nav", "ol", "p", "pre", "section", "table", "tr",
     "td", "th", "ul",
 }
+
+# Sentinel for an exhausted child iterator in :func:`_walk`.
+_END = object()
+
+
+def _parse(html_bytes: bytes) -> BeautifulSoup:
+    """Parse XHTML bytes with bs4's ``html.parser`` backend and remove
+    every script, style and head element, contents included.
+
+    The tree is otherwise as parsed: nothing is inserted (1.10 inserted
+    newline strings at this point; :func:`_walk` emits them instead).
+    """
+    soup = BeautifulSoup(html_bytes, "html.parser")
+    for tag_name in _SKIP_TAGS:
+        for tag in soup.find_all(tag_name):
+            tag.decompose()
+    return soup
+
+
+def _walk(
+    top: Tag,
+    start_el: Optional[Tag] = None,
+    is_stop: Optional[Callable[[Tag], bool]] = None,
+) -> Tuple[str, bool]:
+    """Collect the text under ``top`` in one document-order walk.
+
+    Only strings of the types bs4's ``get_text()`` keeps count (see
+    ``_TEXT_STRING_TYPES``). A block-level tag adds ``"\\n"`` when the
+    walk enters it and again when it leaves it, after its contents;
+    ``top`` itself adds none. The text is returned raw: callers apply
+    :func:`normalize_whitespace`.
+
+    :param top: The tag (or soup) whose descendants are walked.
+    :param start_el: If given, collect from this element on: its own
+        contents and everything after it in document order. The newline
+        for entering it is not included; the one for leaving it is, as
+        are those for leaving its block-level ancestors below ``top``.
+        Nothing is collected if it is not under ``top``.
+    :param is_stop: Called with each tag reached while collecting
+        (never with ``start_el``). The walk ends at the first tag it
+        returns true for, with the text before that tag (including the
+        newline for entering it, if it is block-level).
+    :return: ``(text, stopped)``; ``stopped`` is True when ``is_stop``
+        ended the walk.
+    """
+    parts: list = []
+    append = parts.append
+    collecting = start_el is None
+    block = _BLOCK_LEVEL_TAGS
+    text_types = _TEXT_STRING_TYPES
+    # One child iterator per open tag; ``open_tags[i]`` owns
+    # ``stack[i + 1]`` (``stack[0]`` iterates ``top``'s children).
+    stack = [iter(top.contents)]
+    open_tags: list = []
+    while stack:
+        node = next(stack[-1], _END)
+        if node is _END:
+            stack.pop()
+            if open_tags:
+                tag = open_tags.pop()
+                if collecting and tag.name in block:
+                    append("\n")
+            continue
+        if isinstance(node, Tag):
+            if collecting:
+                if node.name in block:
+                    append("\n")
+                if is_stop is not None and is_stop(node):
+                    return "".join(parts), True
+            elif node is start_el:
+                collecting = True
+            stack.append(iter(node.contents))
+            open_tags.append(node)
+        elif collecting and type(node) in text_types:
+            append(node)
+    return "".join(parts), False
+
+
+def _anchor_index(soup: Tag) -> Tuple[Dict[str, Tag], Dict[str, Tag]]:
+    """Every fragment target of a parsed document, in one pass.
+
+    :return: ``(ids, names)``: each ``id`` value mapped to the first
+        element (in document order) that carries it, which is the
+        element ``soup.find(id=value)`` returns; and each ``name`` of an
+        ``<a>`` element mapped to the first such ``<a>``. Resolve a
+        fragment in ``ids`` first, then in ``names``.
+    """
+    ids: Dict[str, Tag] = {}
+    names: Dict[str, Tag] = {}
+    for el in soup.descendants:
+        if not isinstance(el, Tag):
+            continue
+        attrs = el.attrs
+        value = attrs.get("id")
+        if isinstance(value, str) and value not in ids:
+            ids[value] = el
+        if el.name == "a":
+            value = attrs.get("name")
+            if isinstance(value, str) and value not in names:
+                names[value] = el
+    return ids, names
 
 
 def extract_chapter_text(
@@ -91,17 +235,7 @@ def extract_chapter_text(
     ``<body>`` (or whole document if there's no body) is returned.
     """
     stop_anchors = stop_anchors or set()
-    soup = BeautifulSoup(html_bytes, "html.parser")
-
-    for tag_name in _SKIP_TAGS:
-        for tag in soup.find_all(tag_name):
-            tag.decompose()
-
-    # Insert explicit newlines around block-level tags so bs4's own
-    # ``get_text()`` produces paragraph-separated output.
-    for tag in list(soup.find_all(_BLOCK_LEVEL_TAGS)):
-        tag.insert_before("\n")
-        tag.insert_after("\n")
+    soup = _parse(html_bytes)
 
     if start_anchor:
         anchor_el = soup.find(id=start_anchor)
@@ -109,7 +243,7 @@ def extract_chapter_text(
             return _text_in_window(soup, anchor_el, stop_anchors)
 
     root = soup.body if soup.body is not None else soup
-    return normalize_whitespace(root.get_text())
+    return normalize_whitespace(_walk(root)[0])
 
 
 def _text_in_window(
@@ -118,19 +252,12 @@ def _text_in_window(
     """Collect text in document order from ``anchor_el`` forward,
     stopping at the first element whose ``id`` is in ``stop_anchors``.
     Used by :func:`extract_chapter_text` for fragment scoping.
+
+    ``soup`` is a tree from :func:`_parse` (since 1.11 no newline nodes
+    are inserted into it; :func:`_walk` emits them).
     """
-    collecting = False
-    parts: list = []
-    for node in soup.descendants:
-        if isinstance(node, Tag):
-            if node is anchor_el:
-                collecting = True
-                continue
-            if collecting and node.get("id") in stop_anchors:
-                break
-        elif collecting and type(node) in _TEXT_STRING_TYPES:
-            parts.append(str(node))
-    return normalize_whitespace("".join(parts))
+    text, _ = _walk(soup, anchor_el, lambda tag: tag.get("id") in stop_anchors)
+    return normalize_whitespace(text)
 
 
 def normalize_whitespace(text: str) -> str:

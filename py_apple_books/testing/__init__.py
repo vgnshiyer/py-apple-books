@@ -10,6 +10,11 @@ bookkeeping, no library rows) and fills them with synthetic rows::
     book = lib.add_book("Synthetic Book", progress=0.4)
     lib.add_annotation(book, "a synthetic highlight")
 
+:func:`write_epub_bundle` writes EPUB bundles in the shapes real books
+come in (sub-folders, nav or NCX only, fragments, non-linear and odd
+spine entries, guide and landmarks); ``FixtureLibrary`` also writes
+Books' preferences plist and per-book info caches beside the stores.
+
 ``python -m py_apple_books.testing.dump_schema`` produces a new schema
 fixture from a real library (see its ``--help``).
 
@@ -21,6 +26,7 @@ import). Importing it opens no database.
 """
 
 from .demo import seed_demo, write_epub
+from .epub import write_epub_bundle
 from .fixture import (
     ANNOTATION_KINDS,
     COLORS,
@@ -28,10 +34,12 @@ from .fixture import (
     STORE_SERIES,
     SYSTEM_COLLECTIONS,
     UBIQUITY,
+    YEAR_ZERO,
     FixtureLibrary,
     available_schemas,
     build_store,
     core_data_time,
+    page_location_blob,
 )
 
 __all__ = [
@@ -41,10 +49,13 @@ __all__ = [
     "STORE_SERIES",
     "SYSTEM_COLLECTIONS",
     "UBIQUITY",
+    "YEAR_ZERO",
     "FixtureLibrary",
     "available_schemas",
     "build_store",
     "core_data_time",
+    "page_location_blob",
     "seed_demo",
     "write_epub",
+    "write_epub_bundle",
 ]

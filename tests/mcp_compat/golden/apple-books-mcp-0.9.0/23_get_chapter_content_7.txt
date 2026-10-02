@@ -1,0 +1,2 @@
+# get_chapter_content {"book_id": 7, "chapter_id": "chap1"} isError=True
+Error executing tool get_chapter_content: Book is DRM-protected: 'Locked Store Book' is a DRM-protected Apple Books Store purchase (FairPlay). Its text content cannot be read directly; only imported EPUBs and PDFs are readable.

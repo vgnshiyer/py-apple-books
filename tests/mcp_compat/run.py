@@ -6,6 +6,7 @@ usage:
   python tests/mcp_compat/run.py --mcp-version 0.8.2 --uvx-python 3.14 --lib dist/py_apple_books-*.whl --check
   python tests/mcp_compat/run.py --mcp-version 0.8.2 --python .venv/bin/python --lib . --update
   python tests/mcp_compat/run.py --mcp-version latest
+  python tests/mcp_compat/run.py --mcp-version 0.9.0 --lib dist/py_apple_books-*.whl --lib-extra pdf --check
 
 Seeds the demo library (``py_apple_books.testing.seed_demo``) into a
 temporary HOME, starts the MCP server over stdio and calls every
@@ -19,12 +20,26 @@ Two ways to start the server:
   --python PY    PY -m apple_books_mcp, with PYTHONPATH=<lib> (PY must have that MCP version)
 
 ``--lib`` is the py_apple_books under test: this checkout by default, or
-a built wheel. ``--check`` exits 1 on any difference from the goldens;
+a built wheel; ``--lib-extra NAME`` installs it with that optional extra
+(uvx only; an extra the wheel's METADATA or the tree's pyproject.toml
+doesn't declare is an error, since uv would only warn). ``--check``
+exits 1 on any difference from the goldens;
 ``--update`` rewrites them (review the diff: every change to MCP output
 must be an intended one). ``--mcp-version latest`` has no goldens and
 fails only on an isError from a probe not marked as an expected error,
-a 'Traceback', 'no such column', or a tool missing from the argument
-table.
+a 'Traceback', 'no such column', a tool missing from the argument
+table, or an argument no probe passes (below).
+
+Every argument of every offered read tool (its ``inputSchema``
+properties in ``tools/list``) must be passed by some probe that applies
+to the version, apart from that version's ``KNOWN_UNPROBED``: otherwise
+``--check`` and ``--mcp-version latest`` exit 1 (a "coverage:" line
+names it), so a new argument of a later apple-books-mcp gets a probe.
+
+A probe with ``since`` is made for that apple-books-mcp version and
+later (a new tool or argument); older pinned versions skip it, so their
+goldens don't change. New probes go at the end of the table, since
+golden files are numbered by table position.
 
 The server never gets APPLE_BOOKS_MCP_ENABLE_WRITES, and write tools
 aren't called. Only the standard library is needed to run this script;
@@ -42,6 +57,7 @@ import json
 import os
 import pathlib
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -71,22 +87,48 @@ class Probe(NamedTuple):
     expected_error: bool = False
     # Seconds to wait for the response; None means --call-timeout.
     timeout: Optional[float] = None
+    # The oldest apple-books-mcp version the probe is made for (None: every
+    # version). A pinned older version skips it, so its goldens don't move.
+    since: Optional[str] = None
+
+
+def version_key(version: str) -> Tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", version))
+
+
+def applies(probe: Probe, mcp_version: str) -> bool:
+    return (probe.since is None or mcp_version == "latest"
+            or version_key(mcp_version) >= version_key(probe.since))
 
 
 def probe_table(demo: dict) -> List[Tuple[str, List[Probe]]]:
-    """``[(tool, [Probe, ...]), ...]`` for every read tool, in golden order."""
+    """``[(tool, [Probe, ...]), ...]`` for every read tool, in golden order.
+
+    Golden files are numbered by table position, so new entries go at
+    the end: inserting one would rename every later file of every
+    version's goldens.
+    """
     books, annos, colls = demo["books"], demo["annotations"], demo["collections"]
     book = {k: v["id"] for k, v in books.items()}
     reading, shelf, deleted = book["synthetic"], colls["shelf"]["id"], colls["deleted"]["id"]
     content_books = [reading, MISSING, HUGE, book["drm"], book["finished"], book["series_stack"], book["owned_series"]]
+
+    def failing(args: dict, **kwargs) -> Probe:
+        # A not-found or not-readable answer: plain text up to 0.8.x, an
+        # error result from 0.9.0 on. Either is expected.
+        return Probe(args, expected_error=True, **kwargs)
+
+    def v090(args: dict, **kwargs) -> Probe:
+        return Probe(args, since="0.9.0", **kwargs)
+
     return [
         ("list_all_collections", [Probe({}), Probe({"limit": 2})]),
         ("get_collection_books", [
-            Probe({"collection_id": str(shelf)}), Probe({"collection_id": str(MISSING)}),
-            Probe({"collection_id": str(deleted)})]),
+            Probe({"collection_id": str(shelf)}), failing({"collection_id": str(MISSING)}),
+            failing({"collection_id": str(deleted)})]),
         ("describe_collection", [
-            Probe({"collection_id": str(shelf)}), Probe({"collection_id": str(MISSING)}),
-            Probe({"collection_id": str(deleted)})]),
+            Probe({"collection_id": str(shelf)}), failing({"collection_id": str(MISSING)}),
+            failing({"collection_id": str(deleted)})]),
         ("search_collections_by_title", [Probe({"title": "Shelf"}), Probe({"title": "nothing like it"})]),
         ("list_all_books", [
             Probe({}), Probe({"limit": 2}),
@@ -94,8 +136,8 @@ def probe_table(demo: dict) -> List[Tuple[str, List[Probe]]]:
             Probe({"limit": HUGE}, expected_error=True)]),
         ("describe_book", [
             Probe({"book_id": str(reading)}), Probe({"book_id": str(book["finished_zero"])}),
-            Probe({"book_id": str(book["series_stack"])}), Probe({"book_id": str(MISSING)}),
-            Probe({"book_id": str(HUGE)})]),
+            Probe({"book_id": str(book["series_stack"])}), failing({"book_id": str(MISSING)}),
+            failing({"book_id": str(HUGE)})]),
         ("search_books_by_title", [
             Probe({"title": "Synthetic"}),
             Probe({"title": "Don't"}, expected_error=True),  # F08: a syntax error before 1.10
@@ -106,7 +148,8 @@ def probe_table(demo: dict) -> List[Tuple[str, List[Probe]]]:
         ("get_unstarted_books", [Probe({})]),
         ("get_recently_read_books", [Probe({}), Probe({"limit": 2})]),
         ("list_all_annotations", [Probe({}), Probe({"limit": 3})]),
-        ("list_annotations", [Probe({"book_id": b}) for b in (reading, book["finished"], MISSING, HUGE)]),
+        ("list_annotations", [Probe({"book_id": reading}), Probe({"book_id": book["finished"]}),
+                              failing({"book_id": MISSING}), failing({"book_id": HUGE})]),
         ("get_highlights_by_color", [
             Probe({"color": "yellow"}), Probe({"color": "purple"}), Probe({"color": "blue", "limit": 1}),
             Probe({"color": "orange"}, expected_error=True)]),  # not a highlight colour
@@ -119,23 +162,96 @@ def probe_table(demo: dict) -> List[Tuple[str, List[Probe]]]:
             # before the tool runs; whatever happens is recorded.
             Probe({"text": "x" + chr(0xD800)}, expected_error=True, timeout=10.0)]),
         ("recent_annotations", [Probe({}), Probe({"limit": 2})]),
-        ("describe_annotation", [Probe({"annotation_id": str(a)}) for a in (
-            annos["highlight"], annos["note"], annos["deleted"], annos["tombstone"], annos["orphan"], MISSING)]),
-        ("get_annotation_context", [Probe({"annotation_id": a}) for a in (
-            annos["highlight"], annos["apostrophe"], annos["curly"], annos["deleted"], annos["orphan"],
-            annos["no_file"], MISSING, HUGE)]),
+        ("describe_annotation", [
+            *[Probe({"annotation_id": str(a)}) for a in (
+                annos["highlight"], annos["note"], annos["deleted"], annos["tombstone"], annos["orphan"])],
+            failing({"annotation_id": str(MISSING)})]),
+        ("get_annotation_context", [
+            *[Probe({"annotation_id": a}) for a in (
+                annos["highlight"], annos["apostrophe"], annos["curly"], annos["deleted"])],
+            *[failing({"annotation_id": a}) for a in (annos["orphan"], annos["no_file"], MISSING, HUGE)]]),
         ("get_annotations_by_date_range", [
             Probe({"after": "2026-09-01", "before": "2026-09-30"}), Probe({"after": "2026-09-20"}),
             Probe({"before": "2026-09-18", "limit": 2})]),
-        ("list_book_chapters", [Probe({"book_id": b}) for b in content_books]),
+        ("list_book_chapters", [Probe({"book_id": reading}),
+                                *[failing({"book_id": b}) for b in content_books[1:]]]),
         ("get_chapter_content", [
             Probe({"book_id": reading, "chapter_id": "chap1"}), Probe({"book_id": reading, "chapter_id": "2"}),
             Probe({"book_id": reading, "chapter_id": "chap2", "offset": 10, "max_chars": 20}),
-            Probe({"book_id": reading, "chapter_id": "Chapter 5"}),
-            *[Probe({"book_id": b, "chapter_id": "chap1"}) for b in content_books[1:]]]),
-        ("get_current_reading_position", [Probe({"book_id": b}) for b in content_books]),
+            failing({"book_id": reading, "chapter_id": "Chapter 5"}),
+            *[failing({"book_id": b, "chapter_id": "chap1"}) for b in content_books[1:]]]),
+        ("get_current_reading_position", [
+            Probe({"book_id": reading}), failing({"book_id": MISSING}), failing({"book_id": HUGE}),
+            *[Probe({"book_id": b}) for b in content_books[3:]]]),
         ("get_library_stats", [Probe({})]),
+        # -- apple-books-mcp 0.9.0 on: a new tool and new arguments --
+        ("search_books", [
+            v090({"query": "synthetic"}), v090({"query": "second author"}),
+            v090({"query": "don't"}), v090({"query": "DON\u2019T PANIC"}),
+            v090({"query": "store"}), v090({"query": "series"}),
+            v090({"query": "test author book"}), v090({"query": "nothing like it"}),
+            v090({"query": "%"}), v090({"query": " "}),
+            v090({"query": "book", "limit": 1, "offset": 1})]),
+        # chapter_id defaults to "current": the chapter being read.
+        ("get_chapter_content", [
+            v090({"book_id": reading}),
+            v090({"book_id": reading, "chapter_id": "current", "offset": 10, "max_chars": 20}),
+            *[v090({"book_id": b, "chapter_id": "current"}, expected_error=True) for b in content_books[1:]]]),
+        ("list_all_books", [v090({"limit": 2, "offset": 2}), v090({"offset": 99})]),
+        ("list_all_annotations", [v090({"limit": 2, "offset": 2})]),
+        ("list_annotations", [v090({"book_id": reading, "limit": 2, "offset": 2})]),
+        ("search_annotations", [
+            v090({"text": "synthetic", "limit": 1, "offset": 1}),
+            v090({"text": "synthetic", "order_by": "oldest"})]),
+        ("get_annotations_by_date_range", [v090({"after": "2026-09-01", "order_by": "oldest"})]),
+        ("get_annotation_context", [
+            v090({"annotation_id": annos["highlight"], "chars_before": 5, "chars_after": 5})]),
+        # -- apple-books-mcp 0.9.0: offset on every paged tool, order_by on
+        # every tool that has it (each maps to a library query path) --
+        ("list_all_collections", [v090({"limit": 2, "offset": 2})]),
+        ("search_books_by_title", [v090({"title": "Book", "limit": 1, "offset": 1})]),
+        ("get_books_by_genre", [v090({"genre": "Fiction", "limit": 1, "offset": 1})]),
+        ("get_books_in_progress", [v090({"limit": 1, "offset": 1})]),
+        ("get_finished_books", [v090({"limit": 1}), v090({"limit": 1, "offset": 1})]),
+        ("get_unstarted_books", [v090({"limit": 1}), v090({"limit": 1, "offset": 1})]),
+        ("get_recently_read_books", [v090({"limit": 2, "offset": 2})]),
+        ("recent_annotations", [v090({"limit": 2, "offset": 2})]),
+        ("get_highlights_by_color", [
+            v090({"color": "yellow", "order_by": "oldest"}),
+            v090({"color": "yellow", "limit": 1, "offset": 1}),
+            v090({"color": "yellow", "limit": 1, "offset": 1, "order_by": "oldest"})]),
+        ("search_notes", [
+            v090({"note": "synthetic", "order_by": "oldest"}),
+            v090({"note": "synthetic", "limit": 1}),
+            v090({"note": "synthetic", "limit": 1, "offset": 1, "order_by": "oldest"})]),
+        ("get_annotations_by_date_range", [
+            v090({"after": "2026-09-01", "limit": 2, "offset": 2}),
+            v090({"after": "2026-09-01", "limit": 2, "offset": 2, "order_by": "oldest"})]),
     ]
+
+
+# Parameters a pinned version's probes never pass, accepted because its
+# goldens are frozen (R15): adding a probe would change them. The 0.9.0
+# probes pass each of these, on the same library paths.
+KNOWN_UNPROBED = {
+    "0.8.2": {("get_finished_books", "limit"), ("get_unstarted_books", "limit"),
+              ("list_annotations", "limit"), ("search_notes", "limit"),
+              ("get_annotation_context", "chars_before"), ("get_annotation_context", "chars_after")},
+}
+
+
+def unprobed(params: Dict[str, set], table, mcp_version: str) -> List[Tuple[str, str]]:
+    """``(tool, parameter)`` pairs of the offered read tools (``params``:
+    tool name -> its inputSchema properties) that no probe applying to
+    ``mcp_version`` passes, less that version's KNOWN_UNPROBED."""
+    passed: Dict[str, set] = {}
+    for tool, probes in table:
+        for probe in probes:
+            if applies(probe, mcp_version):
+                passed.setdefault(tool, set()).update(probe.args)
+    known = KNOWN_UNPROBED.get(mcp_version, set())
+    return sorted((tool, name) for tool, names in params.items() if tool not in WRITE_TOOLS
+                  for name in names - passed.get(tool, set()) if (tool, name) not in known)
 
 
 # -- seeding ------------------------------------------------------------------
@@ -284,7 +400,11 @@ def uvx_server(args, env: Dict[str, str]) -> List[str]:
         if path:
             env[var] = path
     source = "apple-books-mcp@latest" if args.mcp_version == "latest" else f"apple-books-mcp=={args.mcp_version}"
-    cmd = ["uvx", "--python", args.uvx_python, "--from", source, "--with", str(args.lib),
+    lib = str(args.lib)
+    if args.lib_extra:
+        # A direct reference, so the extra's dependencies are installed too.
+        lib = f"py-apple-books[{','.join(args.lib_extra)}] @ {args.lib.as_uri()}"
+    cmd = ["uvx", "--python", args.uvx_python, "--from", source, "--with", lib,
            "--refresh-package", "py-apple-books", "apple-books-mcp"]
     print("server: " + " ".join(cmd), file=sys.stderr)
     return cmd
@@ -326,8 +446,10 @@ def render(tool: str, args: dict, outcome: Outcome, roots: List[str]) -> str:
     return f"# {tool} {json.dumps(args, sort_keys=True)} {status}\n{normalize(outcome.text, roots)}\n"
 
 
-def run_calls(args) -> Tuple[Dict[str, str], List[str]]:
-    """Seed, start the server, make every call; ``({file: text}, problems)``."""
+def run_calls(args) -> Tuple[Dict[str, str], List[str], List[str]]:
+    """Seed, start the server, make every call; ``({file: text}, problems,
+    gaps)``, ``gaps`` naming the arguments of offered read tools that no
+    probe passes."""
     testing = load_testing()
     workdir = pathlib.Path(tempfile.mkdtemp(prefix="mcp-compat-"))
     try:
@@ -351,7 +473,7 @@ def run_calls(args) -> Tuple[Dict[str, str], List[str]]:
             shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _drive(server: Server, table, roots: List[str], args) -> Tuple[Dict[str, str], List[str]]:
+def _drive(server: Server, table, roots: List[str], args) -> Tuple[Dict[str, str], List[str], List[str]]:
     init = server.request("initialize", {
         "protocolVersion": PROTOCOL_VERSION, "capabilities": {},
         "clientInfo": {"name": "py-apple-books-mcp-compat", "version": "1"},
@@ -360,14 +482,21 @@ def _drive(server: Server, table, roots: List[str], args) -> Tuple[Dict[str, str
         raise SystemExit(f"error: initialize failed: {init}. Server stderr:\n{server.stderr_tail()}")
     server.notify("notifications/initialized")
     listed = server.request("tools/list", {}, timeout=args.call_timeout)
-    tools = {t["name"] for t in ((listed or {}).get("result") or {}).get("tools", [])}
+    offered = ((listed or {}).get("result") or {}).get("tools", [])
+    tools = {t["name"] for t in offered}
     if not tools:
         raise SystemExit(f"error: tools/list failed: {listed}")
 
     files = {"00_tools.txt": "# tools/list (names)\n" + "\n".join(sorted(tools)) + "\n"}
     problems = [f"tool {name!r} is not in the argument table"
                 for name in sorted(tools - WRITE_TOOLS - {tool for tool, _ in table})]
+    params = {t["name"]: set(((t.get("inputSchema") or {}).get("properties") or {})) for t in offered}
+    gaps = [f"argument {name!r} of {tool} is passed by no probe"
+            for tool, name in unprobed(params, table, args.mcp_version)]
     for n, (tool, probes) in enumerate(table, start=1):
+        probes = [probe for probe in probes if applies(probe, args.mcp_version)]
+        if not probes:
+            continue  # made for newer versions only
         if tool not in tools:
             print(f"note: {tool} is not offered by this server version; skipped", file=sys.stderr)
             continue
@@ -386,7 +515,7 @@ def _drive(server: Server, table, roots: List[str], args) -> Tuple[Dict[str, str
     files["99_resource_currently_reading.txt"] = render("resources/read", {"uri": RESOURCE}, outcome, roots)
     if outcome.status != "ok":
         problems.append(f"resources/read {RESOURCE}: {outcome.status}")
-    return files, problems
+    return files, problems, gaps
 
 
 def compare(files: Dict[str, str], golden: pathlib.Path) -> List[str]:
@@ -404,6 +533,42 @@ def compare(files: Dict[str, str], golden: pathlib.Path) -> List[str]:
     return diffs
 
 
+def extra_name(value: str) -> str:
+    """An extra name as PEP 508 allows it (argparse type)."""
+    if not re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?", value):
+        raise argparse.ArgumentTypeError(f"not an extra name: {value!r}")
+    return value
+
+
+def _canonical_extra(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def declared_extras(lib: pathlib.Path) -> Optional[set]:
+    """The optional extras ``lib`` declares (canonical names): a wheel's
+    ``Provides-Extra``, or a source tree's ``[project.optional-dependencies]``.
+    None when that can't be read here (no tomllib before Python 3.11)."""
+    if lib.is_file() and lib.suffix == ".whl":
+        with zipfile.ZipFile(lib) as wheel:
+            names = [n for n in wheel.namelist()
+                     if n.count("/") == 1 and n.endswith(".dist-info/METADATA")]
+            if len(names) != 1:
+                return None
+            metadata = wheel.read(names[0]).decode("utf-8")
+        return {_canonical_extra(line.split(":", 1)[1].strip())
+                for line in metadata.split("\n\n", 1)[0].splitlines()
+                if line.lower().startswith("provides-extra:")}
+    pyproject = lib / "pyproject.toml"
+    if not pyproject.is_file():
+        return None
+    try:
+        import tomllib
+    except ImportError:
+        return None
+    project = tomllib.loads(pyproject.read_text(encoding="utf-8")).get("project", {})
+    return {_canonical_extra(name) for name in project.get("optional-dependencies", {})}
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--mcp-version", required=True, help="apple-books-mcp version, e.g. 0.8.2, or 'latest'")
@@ -412,6 +577,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     how.add_argument("--uvx-python", default="3.12", help="Python version for uvx (default 3.12)")
     parser.add_argument("--lib", type=pathlib.Path, default=REPO,
                         help="py_apple_books under test: a source tree or a wheel (default: this checkout)")
+    parser.add_argument("--lib-extra", action="append", metavar="NAME", type=extra_name,
+                        help="install --lib with this optional extra (uvx only; repeatable)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="exit 1 if the output differs from the goldens")
     mode.add_argument("--update", action="store_true", help="rewrite the goldens")
@@ -421,11 +588,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--call-timeout", type=float, default=60.0)
     args = parser.parse_args(argv)
     args.lib = args.lib.resolve()
+    if args.lib_extra and args.python:
+        parser.error("--lib-extra needs uvx; with --python, install the extra's dependencies into PY")
+    if args.lib_extra:
+        declared = declared_extras(args.lib)
+        missing = sorted({_canonical_extra(e) for e in args.lib_extra} - (declared or set()))
+        if declared is not None and missing:
+            parser.error(f"--lib-extra {', '.join(missing)}: {args.lib} declares "
+                         f"{sorted(declared) or 'no extras'}")
     pinned = args.mcp_version != "latest"
     if args.update and not pinned:
         parser.error("--update needs a pinned --mcp-version")
 
-    files, problems = run_calls(args)
+    files, problems, gaps = run_calls(args)
     for name, text in sorted(files.items()):
         header = text.split("\n", 1)[0]
         digest = hashlib.sha1(text.encode()).hexdigest()[:8]
@@ -443,16 +618,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         for name, text in files.items():
             (golden / name).write_text(text, encoding="utf-8")
         print(f"updated {len(files)} goldens in {golden.relative_to(REPO)}")
+    differs = False
     if pinned and args.check:
         diffs = compare(files, golden)
         for diff in diffs:
             print(diff)
         print(f"{len(diffs)} of {len(files)} outputs differ from {golden.relative_to(REPO)}")
-        if diffs:
-            return 1
+        differs = bool(diffs)
     for problem in problems:
         print(f"problem: {problem}")
-    if not pinned and problems:
+    for gap in gaps:
+        print(f"coverage: {gap}")
+    if differs or (gaps and (args.check or not pinned)) or (problems and not pinned):
         return 1
     return 0
 

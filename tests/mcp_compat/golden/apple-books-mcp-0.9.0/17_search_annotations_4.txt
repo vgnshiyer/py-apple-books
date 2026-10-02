@@ -1,0 +1,3 @@
+# search_annotations {"text": "100%"} isError=False
+Synthetic Book (Test Author):
+  [9] Don't panic, it's 100% fine. — Chapter 2 (ch=chap2)

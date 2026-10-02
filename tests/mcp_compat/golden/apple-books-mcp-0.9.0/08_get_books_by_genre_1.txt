@@ -1,0 +1,3 @@
+# get_books_by_genre {"genre": "Fiction"} isError=False
+[1] Synthetic Book by Test Author (Fiction)
+[2] Don't Panic by Second Author (Science Fiction)

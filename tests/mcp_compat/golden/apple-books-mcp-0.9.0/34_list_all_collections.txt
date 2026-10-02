@@ -1,0 +1,5 @@
+# list_all_collections {"limit": 2, "offset": 2} isError=False
+[3] Books
+[4] Downloaded
+
+Showing 3–4 of 9 collections. Next page: offset=4.

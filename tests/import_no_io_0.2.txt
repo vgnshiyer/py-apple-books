@@ -1,0 +1,11 @@
+# Modules added by stream 0.2 (facade split) whose import must do no
+# I/O (R19); see tests/test_import_no_io.py.
+py_apple_books._api
+py_apple_books._api._common
+py_apple_books._api.book_info
+py_apple_books._api.engagement
+py_apple_books._api.metadata
+py_apple_books._api.pdf
+py_apple_books._api.positions
+py_apple_books._api.reading
+py_apple_books._api.search
