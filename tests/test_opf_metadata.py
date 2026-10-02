@@ -380,8 +380,70 @@ class TestSeries:
 # -- refusals and limits ----------------------------------------------------------
 
 
+@pytest.fixture
+def doctype_refusals(monkeypatch):
+    """The ``has_internal_subset`` value of every DOCTYPE ``_opf``'s own
+    handler saw (so a test can show the refusal is ``_opf``'s, not the
+    bundled expat's own amplification limit)."""
+    seen = []
+    real = _opf._refuse_doctype
+
+    def spy(name, system_id, public_id, has_internal_subset):
+        seen.append(has_internal_subset)
+        return real(name, system_id, public_id, has_internal_subset)
+
+    monkeypatch.setattr(_opf, "_refuse_doctype", spy)
+    return seen
+
+
+def both_unreadable(path) -> None:
+    """Neither the metadata nor the subjects read accepts ``path`` (each
+    parsed afresh)."""
+    clear_content_cache()
+    assert read(path) == _opf.OpfResult(_opf.UNREADABLE)
+    clear_content_cache()
+    assert _opf.read_subjects(path) is None
+
+
+class TestDoctype:
+    """``_opf`` refuses any internal subset itself; no test here passes
+    on expat's own entity-amplification limit (a small, non-amplifying
+    entity, or no entity at all)."""
+
+    BENIGN = '<!DOCTYPE package [<!ENTITY t "Benign">]>'
+
+    def test_benign_entity_in_a_subject(self, tmp_path, doctype_refusals):
+        both_unreadable(bundle(tmp_path, opf("<dc:subject>&t;</dc:subject>", head=self.BENIGN)))
+        assert doctype_refusals and all(doctype_refusals)
+
+    def test_empty_internal_subset(self, tmp_path, doctype_refusals):
+        both_unreadable(bundle(tmp_path, opf("<dc:subject>A</dc:subject>", head="<!DOCTYPE package [ ]>")))
+        assert doctype_refusals and all(doctype_refusals)
+
+    def test_entity_declarations_refused_on_their_own(self, tmp_path, monkeypatch):
+        """Defence in depth: with the DOCTYPE check switched off, the
+        entity declaration handler still refuses."""
+        monkeypatch.setattr(_opf, "_refuse_doctype", lambda *args: None)
+        both_unreadable(bundle(tmp_path, opf("<dc:subject>&t;</dc:subject>", head=self.BENIGN)))
+
+    @pytest.mark.parametrize("subset", ['[<!ENTITY p "OEBPS/content.opf">]', "[ ]"])
+    def test_container_internal_subset(self, tmp_path, doctype_refusals, subset):
+        container = (f'<?xml version="1.0"?>\n<!DOCTYPE container {subset}><container version="1.0" '
+                     'xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles>'
+                     '<rootfile full-path="{path}" media-type="application/oebps-package+xml"/>'
+                     '</rootfiles></container>')
+        full_path = "&p;" if "ENTITY" in subset else "OEBPS/content.opf"
+        path = bundle(tmp_path, opf("<dc:subject>A</dc:subject>"), container=container.replace("{path}", full_path))
+        both_unreadable(path)
+        assert doctype_refusals and all(doctype_refusals)
+
+    def test_doctype_without_a_subset_reads(self, tmp_path, doctype_refusals):
+        got = meta(tmp_path, "<dc:subject>A</dc:subject>", head="<!DOCTYPE package>")
+        assert got.subjects == ("A",) and doctype_refusals and not any(doctype_refusals)
+
+
 class TestLimits:
-    def test_internal_subset_entity_bomb_utf16(self, tmp_path):
+    def test_internal_subset_entity_bomb_utf16(self, tmp_path, doctype_refusals):
         bomb = ('<?xml version="1.0" encoding="UTF-16"?>\n<!DOCTYPE package [<!ENTITY a "aaaaaaaaaa">'
                 + "".join(f'<!ENTITY a{i} "&a{i - 1 if i else ""};&a{i - 1 if i else ""};">' for i in range(30))
                 + ']><package><metadata><dc:subject xmlns:dc="x">&a29;</dc:subject></metadata></package>')
@@ -389,6 +451,9 @@ class TestLimits:
         started = time.process_time()  # CPU time: no expansion work (wall time varies with load)
         assert read(path).state == _opf.UNREADABLE
         assert time.process_time() - started < 0.5
+        # Refused by _opf at the DOCTYPE, before any declaration (on any
+        # expat, including one without an amplification limit).
+        assert len(doctype_refusals) == 1 and doctype_refusals[0]
 
     def test_tiny_elements(self, tmp_path):
         body = "<x/>" * (2 * 1024 * 1024)  # 8 MiB
