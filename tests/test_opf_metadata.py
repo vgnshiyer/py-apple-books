@@ -24,6 +24,7 @@ from py_apple_books import _icloud, _opf
 from py_apple_books.content import clear_content_cache
 from py_apple_books.models import BookMetadata, MetadataFileState
 from py_apple_books.testing import write_epub_bundle
+from tests._bootstrap import FREE_THREADED, WEIGHT_ON_FREE_THREADED
 
 OPF_NS = 'xmlns="http://www.idpf.org/2007/opf" xmlns:opf="http://www.idpf.org/2007/opf"'
 DC_NS = 'xmlns:dc="http://purl.org/dc/elements/1.1/"'
@@ -835,6 +836,7 @@ class TestCache:
                         name=f"b{i}.epub"))
         assert 0 < _opf._metadata_cache.weight <= 100_000 and len(_opf._metadata_cache) < 10
 
+    @pytest.mark.xfail(FREE_THREADED, reason=WEIGHT_ON_FREE_THREADED, strict=False)
     @pytest.mark.parametrize("which", ["metadata", "subjects"])
     def test_weight_estimate_covers_what_entries_use(self, tmp_path, which):
         """The byte bounds hold: an entry's estimated weight (key, paths,

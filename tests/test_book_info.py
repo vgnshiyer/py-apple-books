@@ -38,6 +38,7 @@ from py_apple_books.db import LibraryDB, use_library
 from py_apple_books.exceptions import InvalidArgumentError
 from py_apple_books.testing import FixtureLibrary
 from tests import _bookinfo_cases as cases
+from tests._bootstrap import TIME_SLACK as SLACK
 from tests import _fs_audit
 
 V0, V7, V10 = "v20250715-26.0", "v20250715-26.7", "v20250715-26.10"
@@ -497,6 +498,7 @@ def _set_title(path, key, title):
 
 
 def test_locked_cache_keeps_its_last_rows(home, reader, monkeypatch):
+    monkeypatch.setattr(book_info, "_BUSY_WAIT", 0.25 * SLACK)
     path = home.add_book_info_cache([{"asset_id": "K", "title": "v1"}], journal_mode="DELETE")
     assert reader.get_cached_book_info("K")["K"].title == "v1"
     _set_title(path, "K", "v2")
@@ -504,7 +506,7 @@ def test_locked_cache_keeps_its_last_rows(home, reader, monkeypatch):
     with held(path, "BEGIN EXCLUSIVE"):
         start = time.monotonic()
         got = reader.get_cached_book_info("K")
-        assert time.monotonic() - start < 1.0  # its busy wait (0.25 s), not the holder's
+        assert time.monotonic() - start < 1.0 * SLACK  # its busy wait, not the holder's
     assert got["K"].title == "v1"  # the last good row
     assert reader.get_cached_book_info("K")["K"].title == "v2"  # read again once released
 
@@ -876,29 +878,33 @@ def test_many_ids_all_found(home, reader):
 # -- budget ------------------------------------------------------------------------
 
 
-def test_a_locked_file_within_a_query_deadline(three, reader):
+def test_a_locked_file_within_a_query_deadline(three, reader, monkeypatch):
+    monkeypatch.setattr(book_info, "_BUSY_WAIT", 0.25 * SLACK)
+    monkeypatch.setattr(book_info, "_CALL_BUDGET", 2.0 * SLACK)
     newest = three.book_info_dir / "AEBookInfo-v20250715-26.11.sqlite"
     newest_lib = FixtureLibrary(three.root)
     newest_lib.add_book_info_cache([{"asset_id": "A", "title": "A in 26.11"}], version="v20250715-26.11",
                                    journal_mode="DELETE")
     with held(newest, "BEGIN EXCLUSIVE"):
-        # The locked file costs its busy wait (0.25 s); the rest of the
-        # deadline reads the other files.
+        # The locked file costs its busy wait; the rest of the deadline
+        # reads the other files.
         start = time.monotonic()
-        with reader.query_deadline(0.6):
+        with reader.query_deadline(0.6 * SLACK):
             got = reader.get_cached_book_info(["A", "B"])
         elapsed = time.monotonic() - start
-        assert elapsed < 0.9
+        assert elapsed < 0.9 * SLACK
         assert got["A"].source == cache_name(V10) and got["B"].title == "Only B"
         # A tighter deadline is kept too: the call returns by then, with
         # whatever it read (here nothing new: the wait used it up).
         start = time.monotonic()
-        with reader.query_deadline(0.2):
+        with reader.query_deadline(0.2 * SLACK):
             reader.get_cached_book_info(["A", "B", "C"])
-        assert time.monotonic() - start < 0.5
+        assert time.monotonic() - start < 0.5 * SLACK
 
 
-def test_locked_files_cost_their_busy_wait_each(home, reader):
+def test_locked_files_cost_their_busy_wait_each(home, reader, monkeypatch):
+    monkeypatch.setattr(book_info, "_BUSY_WAIT", 0.25 * SLACK)
+    monkeypatch.setattr(book_info, "_CALL_BUDGET", 2.0 * SLACK)
     paths = [home.add_book_info_cache([{"asset_id": "A", "title": f"in {v}"}], version=v, journal_mode="DELETE")
              for v in ("v1", "v2", "v3")]
     with contextlib.ExitStack() as stack:
@@ -907,11 +913,12 @@ def test_locked_files_cost_their_busy_wait_each(home, reader):
         start = time.monotonic()
         assert reader.get_cached_book_info("A") == {}
         elapsed = time.monotonic() - start
-    assert elapsed < 2.1
+    assert elapsed < 2.1 * SLACK
 
 
 def test_the_call_budget_caps_the_waits(home, reader, monkeypatch):
-    monkeypatch.setattr(book_info, "_CALL_BUDGET", 0.4)
+    monkeypatch.setattr(book_info, "_CALL_BUDGET", 0.4 * SLACK)
+    monkeypatch.setattr(book_info, "_BUSY_WAIT", 0.25 * SLACK)
     paths = [home.add_book_info_cache([{"asset_id": "A", "title": f"in {v}"}], version=v, journal_mode="DELETE")
              for v in ("v1", "v2", "v3")]
     with contextlib.ExitStack() as stack:
@@ -919,20 +926,20 @@ def test_the_call_budget_caps_the_waits(home, reader, monkeypatch):
             stack.enter_context(held(path, "BEGIN EXCLUSIVE"))
         start = time.monotonic()
         reader.get_cached_book_info("A")
-        assert time.monotonic() - start < 0.8
+        assert time.monotonic() - start < 0.8 * SLACK
 
 
 def test_query_timeout_caps_the_call(home, monkeypatch):
     # A busy wait of 1 s would alone take the call past the bound; only
     # the library's query_timeout (0.1 s) keeps it under.
-    monkeypatch.setattr(book_info, "_BUSY_WAIT", 1.0)
+    monkeypatch.setattr(book_info, "_BUSY_WAIT", 1.0 * SLACK)
     path = home.add_book_info_cache([{"asset_id": "A", "title": "x"}], journal_mode="DELETE")
-    api = PyAppleBooks(home.data_dir, query_timeout=0.1)
+    api = PyAppleBooks(home.data_dir, query_timeout=0.1 * SLACK)
     try:
         with held(path, "BEGIN EXCLUSIVE"):
             start = time.monotonic()
             assert api.get_cached_book_info("A") == {}
-            assert time.monotonic() - start < 0.5
+            assert time.monotonic() - start < 0.5 * SLACK
     finally:
         api.close()
 

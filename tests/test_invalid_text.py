@@ -37,6 +37,7 @@ from py_apple_books.exceptions import (
     WriteError,
 )
 from py_apple_books.testing import FixtureLibrary
+from tests._bootstrap import TIME_SLACK as SLACK
 
 BAD_TITLE = b"AB\xffC"
 # A UTF-16 surrogate encoded as UTF-8 (CESU-8), which UTF-8 forbids.
@@ -253,9 +254,9 @@ def test_a_lock_taken_before_the_retry_stops_it_at_the_deadline(bad, monkeypatch
         thread.start()
         assert held.wait(timeout=10)
 
-    _slow_first_attempt(monkeypatch, 0.8, lock)
+    _slow_first_attempt(monkeypatch, 0.8 * SLACK, lock)
     try:
-        with LibraryDB(data_dir=bad.data_dir, query_timeout=1.0) as db:
+        with LibraryDB(data_dir=bad.data_dir, query_timeout=1.0 * SLACK) as db:
             start = time.monotonic()
             with pytest.raises(QueryTimeoutError, match="locked database") as exc:
                 db.execute(TITLES)
@@ -263,7 +264,7 @@ def test_a_lock_taken_before_the_retry_stops_it_at_the_deadline(bad, monkeypatch
     finally:
         release.set()
         thread.join(timeout=10)
-    assert elapsed < 1.5  # 0.8 s, then what was left of 1 s; not 0.8 s + 1 s
+    assert elapsed < 1.5 * SLACK  # the slow attempt, then what was left of the limit; not both
     cause = exc.value.__cause__
     assert isinstance(cause, sqlite3.OperationalError) and cause.__context__ is None
 

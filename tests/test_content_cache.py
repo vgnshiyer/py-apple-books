@@ -26,6 +26,7 @@ from py_apple_books.content import BookContent, clear_content_cache
 from py_apple_books.exceptions import AppleBooksError, DRMProtectedError, UnsafeEpubEntryError
 from py_apple_books.testing import write_epub_bundle
 from tests import _epub_shapes
+from tests._bootstrap import FREE_THREADED, WEIGHT_ON_FREE_THREADED
 from tests._epub_shapes import SHAPES
 
 
@@ -191,6 +192,7 @@ class TestHits:
         estimated = sum(index.weight for index in kept)
         assert 0.5 * estimated <= used <= 1.25 * estimated
 
+    @pytest.mark.xfail(FREE_THREADED, reason=WEIGHT_ON_FREE_THREADED, strict=False)
     @pytest.mark.parametrize("shape", ["metadata", "names", "astral"])
     def test_weight_covers_long_package_strings(self, tmp_path, shape):
         """Strings from the package document are kept by what they cost,

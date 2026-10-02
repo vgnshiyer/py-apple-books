@@ -81,7 +81,10 @@ def test_other_threads_only_with_all_threads(tmp_path):
 
     with record() as rec:
         read_in_thread()
-    assert os.path.realpath(f) not in rec.paths("open")
+    # Where new threads inherit the caller's context (the default on
+    # free-threaded 3.14), the recording comes along.
+    inherits = bool(getattr(sys.flags, "thread_inherit_context", False))
+    assert (os.path.realpath(f) in rec.paths("open")) is inherits
     with record(all_threads=True) as rec:
         read_in_thread()
     assert os.path.realpath(f) in rec.paths("open")
