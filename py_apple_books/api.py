@@ -24,7 +24,6 @@ from py_apple_books._api.pdf import _PdfAPI
 from py_apple_books._api.positions import _PositionsAPI
 from py_apple_books._api.reading import _ReadingAPI
 from py_apple_books._api.search import _SearchAPI
-from py_apple_books._messages import quote_title
 from py_apple_books.content import BookContent, Chapter
 from py_apple_books.db.clause import Q
 from py_apple_books.db.client import (
@@ -693,14 +692,14 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
         # plain object. A row with a local file is always tried.
         if getattr(book, "is_store_series_item", False) and not getattr(book, "path", None):
             raise NotInLibraryError(
-                f"{quote_title(book.title)} is an Apple Books Store series item that "
+                f"{_quoted_title(book)} is an Apple Books Store series item that "
                 f"isn't in your library (an unowned volume or a series "
                 f"container), so there is no book file to read."
             )
 
         if not book.path:
             raise BookNotDownloadedError(
-                f"{quote_title(book.title)} has not been downloaded to this Mac. "
+                f"{_quoted_title(book)} has not been downloaded to this Mac. "
                 f"Open it in Apple Books to download a local copy, then "
                 f"try again."
             )
@@ -717,12 +716,12 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
             # else is an imported EPUB carrying its own DRM.
             if content._drm_evidence() == "sinf.xml":
                 raise DRMProtectedError(
-                    f"{quote_title(book.title)} is a DRM-protected Apple Books Store "
+                    f"{_quoted_title(book)} is a DRM-protected Apple Books Store "
                     f"purchase (FairPlay). Its text content cannot be read "
                     f"directly; only imported EPUBs and PDFs are readable."
                 )
             raise DRMProtectedError(
-                f"{quote_title(book.title)} is an encrypted EPUB (DRM). Its text "
+                f"{_quoted_title(book)} is an encrypted EPUB (DRM). Its text "
                 f"content cannot be read directly; only DRM-free EPUBs "
                 f"are readable."
             )
@@ -866,9 +865,23 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
         )
 
 
+def _quoted_title(book) -> str:
+    """A book's title in a :meth:`PyAppleBooks.get_book_content` message,
+    exactly as 1.10 wrote it (``'<title>'``), at any length.
+
+    Titles are not shortened here (entry and file names in content
+    errors are, see :mod:`py_apple_books._messages`): apple-books-mcp
+    0.8.2 shows these messages verbatim, so shortening a long title would
+    change its output for books that are fully downloaded (DRM-protected
+    or Store series books), and 0.9.0 already shortens quoted names
+    itself.
+    """
+    return f"'{book.title}'"
+
+
 def _stored_in_icloud_message(book) -> str:
     return (
-        f"{quote_title(book.title)} is stored in iCloud and has not been "
+        f"{_quoted_title(book)} is stored in iCloud and has not been "
         f"downloaded to this Mac. Open it in Apple Books to trigger "
         f"a download, then try again."
     )

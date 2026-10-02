@@ -329,23 +329,28 @@ class TestTitles:
         assert _raises(lambda: api.get_book_content(row["id"])) == STORED_IN_ICLOUD.format(
             title=f"'{title}'")
 
-    def test_long_titles_are_shortened(self, api, library, bundle, tmp_path):
-        title = "A" * 60 + "m" * 5000 + "Z" * 20
-        short = "'" + "A" * 60 + "…" + "Z" * 20 + "'"
+    def test_long_titles_are_kept_as_in_1_10(self, api, library, bundle, tmp_path):
+        # Not shortened: apple-books-mcp 0.8.2 shows these messages
+        # verbatim (0.9.0 shortens quoted names itself), and fully
+        # downloaded books (DRM, Store series) reach them too.
+        title = "A" * 60 + "m" * 500 + "Z" * 20
+        quoted = f"'{title}'"
         rows = [
-            (library.add_book(title, path=None), BookNotDownloadedError),
-            (library.add_book(title, path=tmp_path / "gone.epub"), BookNotDownloadedError),
-            (library.add_book(title, path=bundle, state=_icloud_state()), BookNotDownloadedError),
-            (library.add_book(title, data_source=STORE_SERIES, can_redownload=0), NotInLibraryError),
+            (library.add_book(title, path=None), BookNotDownloadedError, NOT_DOWNLOADED),
+            (library.add_book(title, path=tmp_path / "gone.epub"), BookNotDownloadedError, STORED_IN_ICLOUD),
+            (library.add_book(title, path=bundle, state=_icloud_state()), BookNotDownloadedError,
+             STORED_IN_ICLOUD),
         ]
-        for row, cls in rows:
-            message = _raises(lambda: api.get_book_content(row["id"]), cls)
-            assert message.startswith(short) and len(message) < 300
+        for row, cls, template in rows:
+            assert _raises(lambda: api.get_book_content(row["id"]), cls) == template.format(title=quoted)
+        row = library.add_book(title, data_source=STORE_SERIES, can_redownload=0)
+        assert _raises(lambda: api.get_book_content(row["id"]), NotInLibraryError).startswith(quoted + " is")
         drm = write_epub(tmp_path / "Locked.epub", "Locked")
         (drm / "META-INF" / "sinf.xml").write_text("<x/>")
         row = library.add_book(title, path=drm)
-        message = _raises(lambda: api.get_book_content(row["id"]), DRMProtectedError)
-        assert message.startswith(short) and len(message) < 300
+        assert _raises(lambda: api.get_book_content(row["id"]), DRMProtectedError).startswith(quoted + " is")
+        row = library.add_book(None, path=None)
+        assert _raises(lambda: api.get_book_content(row["id"])) == NOT_DOWNLOADED.format(title="'None'")
 
 
 # ---------------------------------------------------------------------------
