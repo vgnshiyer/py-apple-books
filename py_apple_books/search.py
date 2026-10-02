@@ -198,9 +198,11 @@ class _Plan:
     #: Match ``items`` as substrings, not with FTS5: the query holds a
     #: script written without spaces, or no word at all (punctuation).
     substring: bool
-    #: The whole folded query, stripped, when it has 3 or more
-    #: characters: the substring tier that makes results a superset of
-    #: ``search_annotation_by_text``.
+    #: The whole folded query as a substring, the tier that makes results
+    #: a superset of ``search_annotation_by_text`` for every folded query
+    #: of 3 or more characters: stripped when that leaves 3 or more
+    #: characters (it then finds more), else as folded (' ab' keeps its
+    #: space, exactly the substring search's needle); None when shorter.
     needle: Optional[str]
 
 
@@ -270,7 +272,10 @@ def _plan(query) -> Optional[_Plan]:
     stripped = folded.strip()
     if not stripped:
         return None
-    needle = stripped if len(stripped) >= 3 else None
+    # Folding leaves at most one space at each end. A stripped needle is
+    # broader, so it is used when it is still selective; a shorter one
+    # keeps its spaces (as the substring search matches it).
+    needle = stripped if len(stripped) >= 3 else folded if len(folded) >= 3 else None
     phrases: List[str] = []
     words: List[str] = []
     # Enough raw words to find _MAX_TERMS distinct non-stopwords in any

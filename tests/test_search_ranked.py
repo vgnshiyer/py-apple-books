@@ -156,6 +156,14 @@ def test_special_queries_run_every_tier_without_error(query):
     ("...", ("...",), True, "..."),
     ("?", ("?",), True, None),
     ("ab", ("ab",), False, None),
+    # 3 characters only with a space: the needle keeps it, as the
+    # substring search's does.
+    (" ab", ("ab",), False, " ab"),
+    ("ab ", ("ab",), False, "ab "),
+    (" a ", ("a",), False, " a "),
+    ("\u00a0ab", ("ab",), False, " ab"),
+    (" \u0301ab", ("ab",), False, " ab"),
+    (" a", ("a",), False, None),
 ])
 def test_plan(query, items, substring, needle):
     plan = search._plan(query)
@@ -439,26 +447,47 @@ def corpus(lib, ranked):
     return texts
 
 
+# Queries of 3 folded characters only with a space at an end.
+EDGE_QUERIES = [" a ", " x ", " of", "of ", " ha", "it ", "ng ", "fe ", " e-", " co", "\u2028x ", " ...",
+                " \u2014 ", "fe\u0301 ", "\u00a0of"]
+
+
 def test_superset_of_the_substring_search(ranked, corpus):
-    """For random fragments (cut mid-word) and frequent words, ranked
-    results include every annotation search_annotation_by_text finds."""
+    """For random fragments (cut mid-word, often at a space), frequent
+    words and queries with a space at an end, ranked results include
+    every annotation search_annotation_by_text finds: every query of 3
+    or more folded characters, spaces included."""
     rng = random.Random(5)
-    queries = [w for w in WORDS if len(search.fold_for_match(w).strip()) >= 3]
+    queries = [w for w in WORDS if len(search.fold_for_match(w)) >= 3]
     for _ in range(80):
         text = rng.choice(corpus)
         start = rng.randrange(len(text))
         queries.append(text[start:start + rng.randint(3, 20)])
-    queries += ["decision making", "habit decision", "the habit", "of the"]
+    queries += ["decision making", "habit decision", "the habit", "of the"] + EDGE_QUERIES
     checked = violations = 0
+    found_with_spaces = 0
     for query in queries:
-        if len(search.fold_for_match(query).strip()) < 3:
+        if len(search.fold_for_match(query)) < 3:
             continue
         for deleted in (False, True):
             want = {a.id for a in ranked.search_annotation_by_text(query, include_deleted=deleted)}
             got = set(ids(ranked.search_annotations(query, limit=None, include_deleted=deleted)))
             checked += 1
             violations += not want <= got
+            found_with_spaces += bool(want) and len(search.fold_for_match(query).strip()) < 3
     assert checked > 100 and violations == 0
+    assert found_with_spaces >= 10  # the edge queries do find rows
+
+
+def test_superset_with_a_space_at_an_end(lib, ranked, filler):
+    """' qz' has 3 folded characters but only 2 without its space: the
+    substring search finds ' qz' inside 'xx qzwerty' (no word 'qz')."""
+    row = lib.add_annotation(filler, "xx qzwerty yy")
+    tail = lib.add_annotation(filler, "zzqz cd")
+    for query, expected in ((" qz", [row]), ("qz ", [tail]), (" qzw", [row]), ("\u00a0qz", [row])):
+        assert [a.id for a in ranked.search_annotation_by_text(query)] == expected
+        hits = ranked.search_annotations(query, limit=None)
+        assert ids(hits) == expected and hits[0].method is SUBSTRING and hits[0].matched_all
 
 
 # -- freshness ---------------------------------------------------------------------

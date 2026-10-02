@@ -52,7 +52,7 @@ class _SearchAPI:
         spaces between words (Chinese, Japanese, Korean, Thai, Lao,
         Khmer, Myanmar) or of punctuation only is matched as text
         contained in the annotation. For a query of 3 or more
-        characters (folded, without leading and trailing spaces), the
+        characters once folded (a space at either end counts), the
         results with ``limit=None`` include every annotation
         :meth:`search_annotation_by_text` returns.
 
