@@ -387,7 +387,10 @@ def _new_database() -> Tuple[sqlite3.Connection, Optional[str]]:
     conn = None
     try:
         conn = sqlite3.connect(":memory:", check_same_thread=False)
-        # Sorts and temporary results stay in memory too.
+        # Sorts and temporary results stay in memory too. (A SQLite built
+        # with SQLITE_TEMP_STORE=0 ignores this pragma and would spill
+        # them to unlinked temporary files; Python's builds use 1, which
+        # honours it.)
         conn.execute("PRAGMA temp_store=MEMORY")
         if fts5_available():
             for tokenizer in _TOKENIZERS:

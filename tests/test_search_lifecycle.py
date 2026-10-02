@@ -519,6 +519,9 @@ def test_the_index_stays_in_memory(db):
     ranked(db)
     conn = index_of(db)._ready.conn
     assert conn.execute("PRAGMA temp_store").fetchone()[0] == 2
+    # The pragma reads back 2 even where SQLite was built to ignore it
+    # (SQLITE_TEMP_STORE=0: temporary data always in files).
+    assert "TEMP_STORE=0" not in [row[0] for row in conn.execute("PRAGMA compile_options")]
     assert [row[2] for row in conn.execute("PRAGMA database_list")] == [""]
 
 
