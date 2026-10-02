@@ -841,7 +841,13 @@ def _still_valid(bundle, entry: _Read) -> bool:
 class _BoundedCache:
     """An LRU bounded by entry count and by an estimated weight in
     bytes. One lock, held only around dict operations; stored values
-    are immutable."""
+    are immutable.
+
+    :meth:`clear` starts a new :attr:`generation`: a value read from the
+    files before it is stored only if :meth:`put` is given the
+    generation taken before the read, and it is unchanged (as
+    ``_epub_index._IndexCache.insert``), so a read in flight during a
+    clear leaves no entry."""
 
     def __init__(self, max_entries: int, max_weight: int):
         self.max_entries = max_entries
@@ -849,6 +855,13 @@ class _BoundedCache:
         self._lock = threading.Lock()
         self._entries: "OrderedDict[Any, Tuple[Any, int]]" = OrderedDict()
         self._weight = 0
+        self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        """Taken before reading the files a value comes from."""
+        with self._lock:
+            return self._generation
 
     def get(self, key):
         with self._lock:
@@ -858,18 +871,25 @@ class _BoundedCache:
             self._entries.move_to_end(key)
             return hit[0]
 
-    def put(self, key, value, weight: int) -> None:
+    def put(self, key, value, weight: int, generation: Optional[int] = None) -> bool:
+        """Store ``value`` (replacing any entry for ``key``) unless the
+        cache was cleared since ``generation`` (None: unchecked) or it
+        weighs more than :attr:`max_weight`; then evict least recently
+        used entries down to the bounds. True if it is stored."""
         with self._lock:
+            if generation is not None and generation != self._generation:
+                return False
             old = self._entries.pop(key, None)
             if old is not None:
                 self._weight -= old[1]
             if weight > self.max_weight:
-                return
+                return False
             self._entries[key] = (value, weight)
             self._weight += weight
             while self._entries and (len(self._entries) > self.max_entries or self._weight > self.max_weight):
                 _, (_, dropped) = self._entries.popitem(last=False)
                 self._weight -= dropped
+            return key in self._entries
 
     def discard(self, key) -> None:
         with self._lock:
@@ -881,6 +901,7 @@ class _BoundedCache:
         with self._lock:
             self._entries.clear()
             self._weight = 0
+            self._generation += 1
 
     def __len__(self) -> int:
         with self._lock:
@@ -958,12 +979,14 @@ def read_metadata(bundle) -> OpfResult:
     key = _key(bundle)
     if key is None:
         return _IO_FAILED  # nothing to look up a relative path from
+    generation = _metadata_cache.generation
     entry = _metadata_cache.get(key)
     if entry is not None and _still_valid(bundle, entry):
         return entry.result
     entry = _read(bundle, "full")
     if entry.result.cacheable:
-        _metadata_cache.put(key, entry, _metadata_weight(key, entry))
+        # Not if clear_content_cache() ran during the read.
+        _metadata_cache.put(key, entry, _metadata_weight(key, entry), generation)
     else:
         _metadata_cache.discard(key)
     return entry.result
@@ -991,6 +1014,7 @@ def read_subjects(bundle) -> Optional[Tuple[str, ...]]:
     key = _key(bundle)
     if key is None:
         return None  # nothing to look up a relative path from
+    generation = _subject_index.generation
     indexed = _subject_index.get(key)
     if indexed is not None and _still_valid(bundle, indexed):
         return indexed.folded
@@ -1003,7 +1027,8 @@ def read_subjects(bundle) -> Optional[Tuple[str, ...]]:
     folded = _fold_all(result.fields.subjects) if result.state == READ and result.fields else None
     if result.cacheable:
         item = _Subjects(folded, entry.container_id, entry.opf_rel, entry.opf_id)
-        _subject_index.put(key, item, _subject_weight(key, item))
+        # Not if clear_content_cache() ran during the read.
+        _subject_index.put(key, item, _subject_weight(key, item), generation)
     else:
         _subject_index.discard(key)
     return folded

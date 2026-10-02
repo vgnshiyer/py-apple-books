@@ -876,6 +876,58 @@ class TestCache:
         clear_content_cache()
         assert len(_opf._metadata_cache) == 0 and len(_opf._subject_index) == 0
 
+    @pytest.mark.parametrize("which", ["metadata", "subjects"])
+    def test_a_clear_during_a_read_leaves_no_entry(self, tmp_path, monkeypatch, which):
+        """clear_content_cache() while a read is in flight: the read
+        returns its result but stores nothing (as the EPUB index's
+        generation guard), so a package document edited in place with
+        its size and mtime kept is read again by the next call."""
+        path = bundle(tmp_path, opf("<dc:subject>Alpha</dc:subject>"))
+        package = path / "OEBPS" / "content.opf"
+        call = read if which == "metadata" else _opf.read_subjects
+        entered, gate = threading.Event(), threading.Event()
+        real = _opf._read
+
+        def paused(bundle_path, mode):
+            entry = real(bundle_path, mode)
+            if not gate.is_set():
+                entered.set()
+                assert gate.wait(10)
+            return entry
+
+        monkeypatch.setattr(_opf, "_read", paused)
+        result = []
+        worker = threading.Thread(target=lambda: result.append(call(path)))
+        worker.start()
+        try:
+            assert entered.wait(10)
+            st = package.stat()
+            package.write_text(package.read_text(encoding="utf-8").replace("Alpha", "Omega"),
+                               encoding="utf-8")
+            os.utime(package, ns=(st.st_atime_ns, st.st_mtime_ns))
+            assert _opf._identity(package.stat()) == _opf._identity(st)  # unseen by the identity check
+            clear_content_cache()
+        finally:
+            gate.set()
+            worker.join(10)
+        before = result[0] if which == "subjects" else result[0].fields.subjects
+        assert before in (("alpha",), ("Alpha",))  # the read in flight returns what it read
+        assert len(_opf._metadata_cache) == 0 and len(_opf._subject_index) == 0
+        after = call(path) if which == "subjects" else call(path).fields.subjects
+        assert after in (("omega",), ("Omega",))
+        assert len(_opf._metadata_cache if which == "metadata" else _opf._subject_index) == 1
+
+    def test_put_after_a_clear_is_dropped(self):
+        cache = _opf._BoundedCache(4, 10_000)
+        generation = cache.generation
+        assert cache.put("a", "value", 10, generation) and len(cache) == 1
+        cache.clear()
+        assert cache.generation == generation + 1
+        assert cache.put("b", "value", 10, generation) is False
+        assert len(cache) == 0 and cache.weight == 0
+        assert cache.put("b", "value", 10, cache.generation) and cache.put("c", "value", 10)
+        assert cache.put("d", "value", 10_001) is False and len(cache) == 2
+
     def test_subjects_from_the_metadata_cache(self, tmp_path, reads):
         path = bundle(tmp_path, opf("<dc:subject>Gödel</dc:subject>"))
         read(path)
