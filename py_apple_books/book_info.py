@@ -22,6 +22,7 @@ this module does no I/O.
 from __future__ import annotations
 
 import collections
+import itertools
 import logging
 import math
 import os
@@ -666,11 +667,14 @@ class _BookInfoIndex:
             return None
         finally:
             lock.release()
+        # At most what the memo keeps, so that a call with many ids holds
+        # the state lock (which memo-only answers wait for) briefly.
+        keep = list(itertools.islice(got.items(), max(0, len(got) - _MEMO_IDS), None))
         with self._lock:
             memo = self._memos.get(name)
             if memo is None or memo.sig != sig or memo.unusable:
                 memo = self._memos[name] = _FileMemo(sig)
-            for i, row in got.items():
+            for i, row in keep:
                 memo.rows[i] = row
                 memo.rows.move_to_end(i)
             while len(memo.rows) > _MEMO_IDS:

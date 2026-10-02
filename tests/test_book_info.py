@@ -649,6 +649,15 @@ def test_memo_is_bounded_per_file(three, reader):
     assert memos and all(len(memo.rows) <= book_info._MEMO_IDS for memo in memos.values())
 
 
+def test_a_read_remembers_the_last_ids_it_was_asked(home, reader, monkeypatch):
+    monkeypatch.setattr(book_info, "_MEMO_IDS", 4)
+    home.add_book_info_cache([{"asset_id": f"k{i}", "title": f"t{i}"} for i in range(10)])
+    ids = [f"k{i}" for i in range(10)] + ["absent"]
+    assert len(reader.get_cached_book_info(ids)) == 10
+    (memo,) = index_of(reader)._memos.values()
+    assert list(memo.rows) == ids[-4:] and memo.rows["absent"] is None
+
+
 def test_many_ids_all_found(home, reader):
     rows = [{"asset_id": f"k{i:04d}", "title": f"t{i}"} for i in range(1500)]
     home.add_book_info_cache(rows)
