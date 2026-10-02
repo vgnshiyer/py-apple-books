@@ -202,8 +202,14 @@ class TestStates:
         assert lib.api.get_book_metadata(add(lib, epub(tmp_path))).file_state is S.NOT_DOWNLOADED
 
     def test_stub_next_to_a_missing_bundle(self, lib, tmp_path):
-        (tmp_path / ".book.epub.icloud").write_bytes(b"stub")
-        assert lib.api.get_book_metadata(add(lib, tmp_path / "book.epub")).file_state is S.NOT_DOWNLOADED
+        stub = tmp_path / ".book.epub.icloud"
+        stub.write_bytes(b"stub")
+        book = add(lib, tmp_path / "book.epub")
+        with _fs_audit.record() as rec:
+            assert lib.api.get_book_metadata(book).file_state is S.NOT_DOWNLOADED
+        # Decided by lstat alone: nothing opened or listed, the stub included.
+        assert not rec.under(tmp_path / "book.epub", "open", "os.scandir", "os.listdir")
+        assert not rec.under(stub, "open") and not rec.of(*_fs_audit.PROCESS_EVENTS)
 
     def test_missing_bundle(self, lib, tmp_path):
         assert lib.api.get_book_metadata(add(lib, tmp_path / "gone.epub")).file_state is S.UNREADABLE
@@ -225,6 +231,9 @@ class TestStates:
         with _fs_audit.record() as rec:
             assert lib.api.get_book_metadata(book).file_state is S.NOT_DOWNLOADED
         assert looked_up == [str(path)] and not rec.of(*_fs_audit.PROCESS_EVENTS)
+        # Refused before the walk, at the audit-hook level too (not only
+        # through the patched lstat): nothing under the bundle opened or listed.
+        assert not rec.under(path, "open", "os.scandir", "os.listdir")
 
     def test_dataless_meta_inf(self, lib, tmp_path, monkeypatch):
         book = add(lib, epub(tmp_path))
