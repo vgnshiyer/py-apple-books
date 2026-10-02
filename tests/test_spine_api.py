@@ -159,6 +159,15 @@ class TestListSpineItems:
         assert item.toc_orders == (1, 2, 3)
         assert [c.order for c in content.list_chapters()] == [1, 2, 3]
 
+    @pytest.mark.parametrize("media_type, readable", [
+        ("IMAGE/PNG", False), ("Image/Jpeg", False), ("text/CSS", False),
+        (" text/css ; charset=utf-8", False), ("image/svg+xml; charset=utf-8", True),
+        ("IMAGE/SVG+XML", True), ("Application/XHTML+XML", True), ("text/html;q=1", True),
+        (None, True), ("", True),
+    ])
+    def test_media_types_ignore_case_and_parameters(self, media_type, readable):
+        assert content_module._is_text_media_type(media_type) is readable
+
     def test_media_types_and_readable(self, tmp_path):
         items = BookContent(_epub_shapes.mixed_types(tmp_path)).list_spine_items()
         assert [(i.item_id, i.media_type, i.readable) for i in items] == [
@@ -305,6 +314,14 @@ class TestGetSpineItemText:
         assert raw == "Café co­op ​word﻿ end"
         assert content.get_spine_item_text("c1", normalize_unicode=True) == "Café coop word end"
         assert content.get_spine_item_text(0) == raw  # the memo keeps the default form
+        normalized = content.get_spine_item_text(0, normalize_unicode=True)
+        assert normalized != raw
+        # Normalized first, on a new instance: the memo still keeps the
+        # default form, so later default calls keep TextPosition offsets.
+        fresh = BookContent(bundle)
+        assert fresh.get_spine_item_text("c1", normalize_unicode=True) == normalized
+        assert fresh.get_spine_item_text("c1") == raw
+        assert fresh.get_spine_item_text(0) == raw
 
     def test_missing_file(self, tmp_path):
         bundle = _epub_shapes.plain(tmp_path)
