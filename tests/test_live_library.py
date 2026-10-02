@@ -113,14 +113,18 @@ raise SystemExit(1 if failures else 0)
 
 def _run_script(home, *, settings=None, prelude="", timeout=600):
     """Run ``_SCRIPT`` (after ``prelude``) in a subprocess whose HOME is
-    ``home``, with no APPLE_BOOKS_* settings but ``settings``."""
+    ``home``, with no APPLE_BOOKS_* settings but ``settings``. It imports
+    ``tests`` from this test tree and py_apple_books from where this
+    process does (the checkout, or an installed wheel)."""
     import py_apple_books
 
-    tree = os.path.dirname(os.path.dirname(os.path.abspath(py_apple_books.__file__)))
+    tests_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    package_root = os.path.dirname(os.path.dirname(os.path.abspath(py_apple_books.__file__)))
     env = {k: v for k, v in os.environ.items() if not k.startswith("APPLE_BOOKS_")}
     env.update(settings or {})
-    env.update(HOME=str(home), PYTHONPATH=os.pathsep.join(filter(None, [tree, env.get("PYTHONPATH")])))
-    return subprocess.run([sys.executable, "-c", prelude + _SCRIPT], env=env, cwd=tree,
+    path = list(dict.fromkeys([tests_root, package_root, env.get("PYTHONPATH")]))
+    env.update(HOME=str(home), PYTHONPATH=os.pathsep.join(filter(None, path)))
+    return subprocess.run([sys.executable, "-c", prelude + _SCRIPT], env=env, cwd=tests_root,
                           capture_output=True, text=True, timeout=timeout)
 
 
