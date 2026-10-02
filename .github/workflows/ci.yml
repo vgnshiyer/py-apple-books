@@ -133,6 +133,44 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  linux:
+    # The wheel the dist job built, installed and tested on Linux: no
+    # st_flags in os.stat and no iCloud I/O policy through ctypes, so the
+    # library's macOS-only gating has to step aside cleanly there, and no
+    # test may assume APFS. The workflow env keeps uv's own CPython builds
+    # (UV_PYTHON_PREFERENCE only-managed).
+    name: linux (${{ matrix.python }})
+    needs: dist
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.14"]
+    env:
+      PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+      - name: Run tests against the installed wheel
+        run: |
+          venv="$RUNNER_TEMP/venv"
+          uv venv -p "$PYTHON" "$venv"
+          uv pip install -p "$venv" dist/*.whl --group dev
+          # Only tests/ and the pytest config: nothing importable from the
+          # source tree, so py_apple_books comes from the wheel.
+          mkdir "$RUNNER_TEMP/wheel-tests"
+          cp -R tests pyproject.toml "$RUNNER_TEMP/wheel-tests/"
+          cd "$RUNNER_TEMP/wheel-tests"
+          "$venv/bin/python" -c 'import importlib.metadata as md, py_apple_books as p; assert "site-packages" in p.__file__, p.__file__; assert md.version("py-apple-books") == p.__version__, (md.version("py-apple-books"), p.__version__)'
+          "$venv/bin/python" -c 'import os, py_apple_books._icloud as ic; assert not hasattr(os.lstat("."), "st_flags"); assert ic._policy_functions() is None'
+          "$venv/bin/python" -m pytest -q
+
   workflow-lint:
     runs-on: ubuntu-latest
     steps:
