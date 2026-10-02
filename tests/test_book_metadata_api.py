@@ -313,6 +313,14 @@ class TestInputs:
         sql_trace.clear()
         assert lib.api.get_book_metadata(book).file_state is S.READ and len(sql_trace) == 1
 
+    def test_not_requested_needs_no_path(self, lib, sql_trace):
+        """read_files=False reads no file, so a Book without a path (or
+        a state) is not read again."""
+        book = lib.api.get_book_by_id(add(lib, None, genre="Poetry"))
+        sql_trace.clear()
+        got = lib.api.get_book_metadata(book, read_files=False)
+        assert got.file_state is S.NOT_REQUESTED and got.subjects == ("Poetry",) and sql_trace == []
+
     def test_a_book_from_another_library_is_resolved_here(self, lib, make_library, tmp_path):
         other = make_library()
         other_book_id = other.add_book("Other", genre="Elsewhere")["id"]

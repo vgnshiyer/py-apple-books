@@ -69,14 +69,20 @@ class _MetadataAPI:
         read from the files are cached while they are unchanged.
 
         :param book_id: the book's id, or a :class:`Book` (used as is
-            when read from this library with its ``path`` and ``state``).
+            when read from this library, with its ``path`` and ``state``
+            when ``read_files``). A ``Book`` read with ``only=`` that
+            left out the language, ``release_date``, ``year``,
+            ``description`` or ``genre`` is taken as the library having
+            none: the file's values fill them and are named in
+            ``book_file_fields``. Pass the id (or a fully read ``Book``)
+            for the library's own values.
         :param read_files: False to use the library's values only
             (``file_state`` ``not_requested``; no file access).
         :raises BookNotFoundError: no book has that id (an
             :class:`IndexError`).
         :raises DBError: the library couldn't be read.
         """
-        book = _book_arg(book_id, needs=("path", "state"), get_book=self.get_book_by_id)
+        book = _book_arg(book_id, needs=("path", "state") if read_files else (), get_book=self.get_book_by_id)
         if read_files:
             state, fields = _book_file_metadata(book)
         else:
@@ -89,10 +95,12 @@ class _MetadataAPI:
 
         ``book_id`` may be a volume, a copy of a volume in your library
         that only shares its Store id, or the series container; an id or
-        a :class:`Book` (used as is when read from this library). None
-        when Books records no series for the book. Reads the library
-        database only (at most 4 statements, 3 given a ``Book``), never a
-        book file. ``Series.volumes`` lists the *known* volumes, not the
+        a :class:`Book` (used as is when read from this library, unless
+        it has none of the series and Store id fields, as a ``Book``
+        read with ``only=`` may: then it is read again once). None when
+        Books records no series for the book. Reads the library database
+        only (at most 4 statements, 3 given a ``Book``), never a book
+        file. ``Series.volumes`` lists the *known* volumes, not the
         length of the series.
 
         :raises BookNotFoundError: no book has that id (an
@@ -103,6 +111,12 @@ class _MetadataAPI:
         columns = _SeriesColumns()
         if not columns.any_series:
             return None
+        if book is book_id and book.series_id is None and book.series_container_id is None \
+                and book.store_id is None:
+            # A Book used as is (R7) may come from an only= read that left
+            # every series column out; _book_arg's needs= rereads when any
+            # field is None, which most volumes are, so check "all" here.
+            book = self.get_book_by_id(book.id)
         anchor = book
         if book.series_id is None and book.series_container_id is None and not columns.is_container(book):
             if not columns.store_id or not book.store_id:

@@ -12,7 +12,7 @@ import pytest
 from py_apple_books import PyAppleBooks
 from py_apple_books.db import LibraryDB, use_library
 from py_apple_books.exceptions import BookNotFoundError, InvalidArgumentError
-from py_apple_books.models import ReadingStatus, Series, SeriesVolume
+from py_apple_books.models import Book, ReadingStatus, Series, SeriesVolume
 from py_apple_books.testing import STORE_SERIES, UBIQUITY
 
 UTC = dt.timezone.utc
@@ -252,6 +252,24 @@ class TestStatements:
             sql_trace.clear()
             lib.api.get_series(book)
             assert len(sql_trace) <= 3
+
+    def test_partially_read_book_is_read_again_once(self, lib, sql_trace):
+        """A Book whose only= read left out every series and Store id
+        field is read again (R7), not taken as in no series."""
+        _, (v1, _, _), _ = series_s(lib)
+        with use_library(lib.api._PyAppleBooks__library):
+            partial = list(Book.manager.filter(id=v1, only=["id", "title"]))[0]
+        assert partial.series_id is partial.series_container_id is partial.store_id is None
+        sql_trace.clear()
+        got = lib.api.get_series(partial)
+        assert len(sql_trace) <= 3
+        assert got is not None and ids(got) == ids(lib.api.get_series(v1))
+
+    def test_book_in_no_series(self, lib, sql_trace):
+        series_s(lib)
+        book = lib.api.get_book_by_id(lib.fx.add_book("No series")["id"])
+        sql_trace.clear()
+        assert lib.api.get_series(book) is None and len(sql_trace) <= 3
 
     def test_list_series(self, lib, sql_trace):
         series_s(lib)
