@@ -543,6 +543,117 @@ class TestLimits:
         assert got.subjects == ("A",) and got.cover_href == "OEBPS/c.png"
 
 
+def names_seen_by_the_parser() -> list:
+    """The ``(name, attribute names)`` ``_opf``'s parser reports for one
+    prefixed element."""
+    parser = _opf._new_parser()
+    seen = []
+    parser.StartElementHandler = lambda name, attrs: seen.append((name, sorted(attrs)))
+    parser.Parse(b'<x:a xmlns:x="urn:example:u" x:b=""/>', True)
+    return seen
+
+
+def measured(call):
+    """``(result, CPU seconds, tracemalloc peak bytes)`` of ``call()``."""
+    clear_content_cache()
+    tracemalloc.start()
+    started = time.process_time()  # CPU time (wall time varies with load)
+    try:
+        result = call()
+        elapsed = time.process_time() - started
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    return result, elapsed, peak
+
+
+def full_subjects(path):
+    """The subjects a full read finds, or the state when it isn't READ."""
+    result = read(path)
+    return result.fields.subjects if result.state == _opf.READ else result.state
+
+
+def with_namespace(text: str, tag: str, *, uri_room: int, extra: str = "") -> str:
+    """``text`` with ``xmlns:x="urn:uuu..."`` (and ``extra``) added to its
+    first ``<tag ``, the URI as long as leaves ``uri_room`` bytes for the
+    whole document (ASCII, so characters are bytes)."""
+    uri_length = uri_room - len(text) - len(extra) - len(' xmlns:x="urn:"')
+    assert uri_length > 0
+    return text.replace(f"<{tag} ", f'<{tag} xmlns:x="urn:{"u" * uri_length}"{extra} ', 1)
+
+
+class TestNamespaceUris:
+    """Namespace processing is off. With it on, expat copies a prefix's
+    URI into every prefixed element and attribute name before any
+    handler runs, so one long ``xmlns:x`` URI and many ``x:`` names
+    multiply the input past every byte and element cap (minutes of CPU
+    per read, and on an expat older than 2.7.2 memory without bound).
+    Every case here holds on any expat version."""
+
+    @pytest.fixture(autouse=True)
+    def namespace_processing_is_off(self):
+        # Checked first, on a tiny document: with processing back on, the
+        # inputs below would take minutes or exhaust memory rather than
+        # fail.
+        assert names_seen_by_the_parser() == [("x:a", ["x:b", "xmlns:x"])]
+
+    def test_names_keep_their_prefix(self):
+        assert names_seen_by_the_parser() == [("x:a", ["x:b", "xmlns:x"])]
+
+    def test_many_prefixed_elements_under_a_long_uri(self, tmp_path):
+        body = "<dc:subject>A</dc:subject>" + "<x:a/>" * 40_000
+        package = with_namespace(opf(body), "package", uri_room=_opf.OPF_MAX_BYTES - 64)
+        assert len(package) > 3_500_000
+        path = bundle(tmp_path, package)
+        assert path.joinpath("OEBPS/content.opf").stat().st_size < _opf.OPF_MAX_BYTES
+        for call, expected in ((lambda: full_subjects(path), ("A",)),
+                               (lambda: _opf.read_subjects(path), ("a",))):
+            got, elapsed, peak = measured(call)
+            assert got == expected and elapsed < 1 and peak < 64 * 1024 * 1024
+
+    @pytest.mark.parametrize("tag", ["package", "dc:subject"])
+    def test_many_prefixed_attributes_under_a_long_uri(self, tmp_path, tag):
+        attributes = "".join(f' x:a{i}=""' for i in range(100_000))
+        package = opf("<dc:subject >A</dc:subject>")
+        package = with_namespace(package, tag, uri_room=len(package) + len(attributes) + 2 * 1024 * 1024,
+                                 extra=attributes)
+        path = bundle(tmp_path, package)
+        assert path.joinpath("OEBPS/content.opf").stat().st_size < _opf.OPF_MAX_BYTES
+        for call, expected in ((lambda: full_subjects(path), ("A",)),
+                               (lambda: _opf.read_subjects(path), ("a",))):
+            got, elapsed, peak = measured(call)
+            assert got == expected and peak < 64 * 1024 * 1024
+
+    def test_container_at_its_cap(self, tmp_path):
+        elements = CONTAINER.replace("<rootfiles>", "<rootfiles>" + "<x:a/>" * 4_000)
+        attributes = "".join(f' x:a{i}=""' for i in range(2_500))
+        cap = _opf.CONTAINER_MAX_BYTES - 64
+        for container in (with_namespace(elements, "container", uri_room=cap),
+                          with_namespace(CONTAINER, "container", uri_room=cap, extra=attributes)):
+            container = container.format(path="OEBPS/content.opf")
+            assert _opf.CONTAINER_MAX_BYTES - 128 < len(container) < _opf.CONTAINER_MAX_BYTES
+            path = bundle(tmp_path, opf("<dc:subject>A</dc:subject>"), container=container)
+            for call, expected in ((lambda: full_subjects(path), ("A",)),
+                                   (lambda: _opf.read_subjects(path), ("a",))):
+                got, elapsed, peak = measured(call)
+                assert got == expected and elapsed < 0.5 and peak < 8 * 1024 * 1024
+
+    def test_namespace_declarations_are_not_attributes(self, tmp_path):
+        """An ``xmlns:properties`` (local name ``properties``) can't stand
+        in for the real ``properties`` attribute."""
+        got = meta(tmp_path, "", '<item properties="cover-image" xmlns:properties="urn:example:p" id="c" '
+                                 'href="c.png" media-type="image/png"/>')
+        assert got.cover_href == "OEBPS/c.png"
+
+    def test_an_undeclared_prefix_reads(self, tmp_path):
+        """Names are matched by local name; an unbound prefix doesn't
+        make the package document unreadable."""
+        package = ('<?xml version="1.0"?><opf:package><opf:metadata><dc:subject>A</dc:subject>'
+                   '<dc:language>fr</dc:language></opf:metadata></opf:package>')
+        got = fields(bundle(tmp_path, package))
+        assert (got.subjects, got.language) == (("A",), "fr")
+
+
 class TestFailSoft:
     @pytest.mark.parametrize("make", [
         lambda root: bundle(root, opf("<dc:subject>A</dc:subject><broken")),

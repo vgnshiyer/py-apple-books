@@ -14,8 +14,13 @@ The package document is untrusted input. It is streamed through
 - a DOCTYPE with an internal subset refused, and so every entity
   declaration (no entity expansion at all); parameter entities never
   parsed; external entities and DTDs never fetched;
-- element names matched by local name, so OPF 1.x, 2 and 3 and odd
-  namespaces all work;
+- namespace processing off: element and attribute names are matched
+  by their local name (the part after the last ``:``), so OPF 1.x, 2
+  and 3 and odd namespaces all work, and no name is ever expanded with
+  its namespace URI (with processing on, expat copies the URI into
+  every prefixed name before any handler runs, so one long
+  ``xmlns:x`` URI and many ``x:`` names would multiply the input past
+  every cap below); ``xmlns`` declarations are not attributes;
 - caps: 64 KiB for ``container.xml``, 4 MiB for the package document,
   50,000 elements, depth 64, 64 KiB of raw description text, and small
   per-field caps;
@@ -440,11 +445,14 @@ class _Refused(Exception):
 
 
 def _local(name: str) -> str:
-    return name.rpartition(" ")[2].lower()
+    """A name without its prefix (``dc:subject`` -> ``subject``), lower-case."""
+    return name.rpartition(":")[2].lower()
 
 
 def _attrs(attrs: Dict[str, str]) -> Dict[str, str]:
-    return {_local(k): v for k, v in attrs.items()}
+    """Attributes by local name; namespace declarations dropped (so an
+    ``xmlns:id`` can't stand in for ``id``)."""
+    return {_local(k): v for k, v in attrs.items() if k != "xmlns" and not k.startswith("xmlns:")}
 
 
 def _refined(refines: dict, element_id: Optional[str], prop: str) -> Optional[str]:
@@ -465,7 +473,9 @@ def _refuse(*args):
 
 
 def _new_parser() -> "expat.XMLParserType":
-    parser = expat.ParserCreate(namespace_separator=" ")
+    # No namespace_separator: namespace processing stays off (see the
+    # module docstring). Names are matched by local name anyway.
+    parser = expat.ParserCreate()
     parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
     parser.StartDoctypeDeclHandler = _refuse_doctype
     parser.EntityDeclHandler = _refuse
