@@ -334,6 +334,12 @@ class TestDeadline:
 
 class TestScale:
     def test_two_thousand_bundles(self, lib, monkeypatch, tmp_path):
+        # The cold scans read 2000 package documents. Their wall time is
+        # mostly I/O wait, which a loaded machine stretches past the 30 s
+        # default deadline; what this test bounds is the warm scan's CPU
+        # time, so the cold ones get a deadline load can't reach.
+        lib.api.close()
+        lib.api = PyAppleBooks(data_dir=lib.fx.data_dir, query_timeout=600)
         paths = []
         for i in range(2000):
             path = minimal_bundle(tmp_path / f"s{i}.epub", [f"Subject {i % 7}", "Common"])
