@@ -600,6 +600,62 @@ def test_only_changed_files_are_read_after_the_recheck(three, reader, spy, monke
     assert spy.files() == [cache_name(V7)]
 
 
+_BOOKS = """
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1], isolation_level=None)
+con.execute("PRAGMA wal_autocheckpoint=0")
+con.execute("SELECT count(*) FROM ZAEBOOKINFO").fetchall()
+print("open", flush=True)
+for statement in sys.stdin:
+    con.execute(statement)
+    print("done", flush=True)
+con.close()
+"""
+
+
+@contextlib.contextmanager
+def books_has_open(path):
+    """Another process has the WAL-mode cache ``path`` open, as Books
+    would, and never checkpoints it; ``write(sql)`` runs a statement
+    there (its change lands in the ``-wal`` only)."""
+    holder = subprocess.Popen([sys.executable, "-I", "-c", _BOOKS, str(path)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
+    def write(sql):
+        holder.stdin.write(sql + "\n")
+        holder.stdin.flush()
+        assert holder.stdout.readline().strip() == "done"
+
+    try:
+        assert holder.stdout.readline().strip() == "open"
+        yield write
+    finally:
+        holder.stdin.close()
+        holder.wait(timeout=30)
+        holder.stdout.close()
+
+
+def test_a_write_to_an_open_wal_cache_is_seen_after_the_recheck(home, reader, spy, monkeypatch):
+    # Books keeps its newest cache open in WAL mode: a new row lands in
+    # the -wal, and the main file's size and mtime stay as they were
+    # until a checkpoint. The -wal's change is what makes the file read
+    # again.
+    path = home.book_info_dir / cases.CACHE_NAME
+    cases.create(path, "WAL").close()
+    with books_has_open(path) as write:
+        assert book_info._open_mode(str(path)) == cases.WAL
+        assert reader.get_cached_book_info("NEW") == {}
+        main = path.stat()
+        write("INSERT INTO ZAEBOOKINFO (ZDATABASEKEY, ZBOOKTITLE) VALUES ('NEW', 'new title')")
+        assert (path.stat().st_size, path.stat().st_mtime_ns) == (main.st_size, main.st_mtime_ns)
+        spy.reset()
+        assert reader.get_cached_book_info("NEW") == {}  # within BOOK_INFO_RECHECK: not looked at
+        assert spy.uris == []
+        monkeypatch.setattr(book_info, "BOOK_INFO_RECHECK", 0.0)
+        assert reader.get_cached_book_info("NEW")["NEW"].title == "new title"
+        assert spy.files() == [cases.CACHE_NAME] and spy.uris[0].endswith("?mode=ro")
+
+
 def test_recheck_interval_is_read_at_call_time(three, reader, spy, monkeypatch):
     reader.get_cached_book_info(["A"])
     index = index_of(reader)
