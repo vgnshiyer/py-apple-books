@@ -3,10 +3,14 @@
 A fresh interpreter (``-I -B``: no cwd, no PYTHON* settings, no
 bytecode writes) installs the suite's audit hook and imports every
 module named in the ``tests/import_no_io_*.txt`` lists, one at a time,
-recording each import. Reading Python source and package data from the import path is
-expected; anything else is not: no file outside it, no write, no
-SQLite connection, no process, no ``ctypes.dlopen``. ctypes, plistlib,
-FTS5 probes and the like belong in first use, not at import.
+recording each import. Expected: reading any file in the package's own
+folder (its modules and package data), and, elsewhere on the import
+path, only module files (source, bytecode, extension modules: the
+interpreter's ``importlib.machinery.all_suffixes()``) and directory
+listings. Anything else is not: no other file (another distribution's
+data files included), no write, no SQLite connection, no process, no
+``ctypes.dlopen``. ctypes, plistlib, FTS5 probes and the like belong in
+first use, not at import.
 
 Each stream that adds a module lists it in its own
 ``tests/import_no_io_<stream>.txt``; ``test_every_module_is_listed``
@@ -24,7 +28,7 @@ TESTS = pathlib.Path(__file__).resolve().parent
 PACKAGE = "py_apple_books"
 
 _SCRIPT = r'''
-import importlib, importlib.util, json, os, sys
+import importlib, importlib.machinery, importlib.util, json, os, sys
 
 spec = importlib.util.spec_from_file_location("_fs_audit", sys.argv[1])
 audit = sys.modules["_fs_audit"] = importlib.util.module_from_spec(spec)
@@ -33,10 +37,11 @@ audit.install()
 if sys.argv[2]:
     sys.path.insert(0, sys.argv[2])
 pkg = importlib.util.find_spec("py_apple_books")
-roots = sorted({os.path.realpath(p) for p in [*sys.path, *pkg.submodule_search_locations]
-                if p and os.path.isdir(p)})
+package = sorted({os.path.realpath(p) for p in pkg.submodule_search_locations})
+roots = sorted({os.path.realpath(p) for p in [*sys.path, *package] if p and os.path.isdir(p)})
 WRITE = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
-out = {"roots": roots, "file": pkg.origin, "modules": {}}
+out = {"roots": roots, "package": package, "suffixes": importlib.machinery.all_suffixes(),
+       "file": pkg.origin, "modules": {}}
 for name in sys.argv[3:]:
     with audit.record() as rec:
         importlib.import_module(name)
@@ -111,14 +116,28 @@ def import_events(modules, extra_path=""):
 
 
 def problems_in(report):
-    roots = report["roots"]
+    roots, package = report["roots"], report["package"]
+    module_suffixes = tuple(report["suffixes"])
     problems = []
     for name, events in report["modules"].items():
         for event, path, write in events:
-            if event in ("open", "os.listdir", "os.scandir", "shutil.copyfile"):
-                if path is None or (_under(path, roots) and not write):
-                    continue
-                why = "a write" if write else "outside the import path"
+            if event == "open" and path is not None:
+                if write:
+                    why = "a write"
+                elif _under(path, package):
+                    continue  # the package's own modules and data
+                elif not _under(path, roots):
+                    why = "outside the import path"
+                elif path.endswith(module_suffixes):
+                    continue  # another module being imported
+                else:
+                    why = "not a module file"
+            elif event in ("os.listdir", "os.scandir") and path is not None:
+                if _under(path, roots):
+                    continue  # the import system looking for modules
+                why = "outside the import path"
+            elif event == "open":
+                continue  # an already-open fd: its open was checked
             else:
                 why = "not allowed at import"
             problems.append(f"{name}: {event} {path} ({why})")
@@ -135,20 +154,33 @@ def test_importing_the_package_does_no_io():
 
 def test_import_time_io_is_caught(tmp_path):
     """The check itself: a module that reads a file outside the import
-    path, writes, connects to SQLite and starts a process at import."""
+    path, reads a data file of another distribution on it, lists a
+    folder outside it, writes, connects to SQLite and starts a process
+    at import."""
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "data.txt").write_text("x")
     code = tmp_path / "code"
-    code.mkdir()
+    (code / "other_dist").mkdir(parents=True)
+    (code / "other_dist" / "data.json").write_text("{}")
+    (code / "quiet_helper.py").write_text("VALUE = 1\n")
     (code / "noisy_module.py").write_text(
-        "import sqlite3, subprocess, sys\n"
+        "import os, sqlite3, subprocess, sys\n"
+        "import quiet_helper\n"
         f"open({str(outside / 'data.txt')!r}).read()\n"
+        f"open({str(code / 'other_dist' / 'data.json')!r}).read()\n"
+        f"os.listdir({str(outside)!r})\n"
         f"open({str(outside / 'new.txt')!r}, 'w').close()\n"
         "sqlite3.connect(':memory:').close()\n"
         "subprocess.run([sys.executable, '-c', 'pass'])\n")
-    problems = problems_in(import_events(["noisy_module"], extra_path=code))
+    report = import_events(["noisy_module"], extra_path=code)
+    problems = problems_in(report)
     kinds = sorted({p.split(" ", 2)[1] for p in problems})
-    assert kinds == ["open", "sqlite3.connect", "subprocess.Popen"], problems
+    assert kinds == ["open", "os.listdir", "sqlite3.connect", "subprocess.Popen"], problems
     assert any("(a write)" in p for p in problems)
-    assert any("(outside the import path)" in p for p in problems)
+    assert any("data.txt (outside the import path)" in p for p in problems)
+    assert any("data.json (not a module file)" in p for p in problems)
+    # Importing another module from the import path is not a problem.
+    helper = os.path.realpath(code / "quiet_helper.py")
+    assert any(path == helper for _, path, _ in report["modules"]["noisy_module"])
+    assert not any("quiet_helper" in p for p in problems)
