@@ -10,17 +10,28 @@ mode their rule picks with :attr:`Case.mode`, which pins the two copies
 to one rule:
 
 - rollback journal (DELETE, PERSIST, TRUNCATE; locked by another
-  process or with a hot journal too): ``journal``, opened ``mode=ro``;
+  process, with another process's uncommitted write, with a hot journal,
+  or with an empty ``-wal`` left by persistent WAL): ``journal``, opened
+  ``mode=ro``;
 - rollback journal whose ``-journal`` is not a local regular file (a
-  symlink): refused (:data:`REFUSED`), never opened, because SQLite
-  would read it;
+  symlink), or with a ``-wal`` that is not empty or not a regular file:
+  refused (:data:`REFUSED`), never opened, because SQLite would read the
+  ``-journal``, and opens such a ``-wal`` whatever the header says (and
+  creates ``-shm``);
 - WAL with a local regular ``-wal`` and ``-shm``, whether a connection
-  has the cache open or not: ``wal``, ``mode=ro``. The read writes
-  ``-shm`` in place (SQLite's read marks; a rebuild of the index when no
-  connection has the cache open, after a crash or in a copy); every other
-  file stays as it was;
+  has the cache open or not, and with or without a local regular
+  ``-journal``: ``wal``, ``mode=ro``. The read writes ``-shm`` in place
+  (SQLite's read marks; a rebuild of the index when no connection has
+  the cache open, after a crash or in a copy); every other file stays as
+  it was;
+- the same with a ``-journal`` that is not a local regular file (a
+  symlink, a FIFO): refused, because SQLite's hot-journal check opens it
+  and reads a byte;
 - WAL without both (closed cleanly, one missing, one a symlink):
   ``wal_immutable``, ``mode=ro&immutable=1``.
+
+A FIFO sidecar is held open for writing while its case runs, so a reader
+whose rule wrongly lets SQLite open it fails instead of hanging.
 
 The caches are built from the committed ``AEBookInfo.sql`` and hold
 synthetic rows only: every text column reads ``SECRET-<column>-<n>``, so
@@ -108,11 +119,12 @@ def _persist(folder: pathlib.Path) -> Iterator[pathlib.Path]:
     yield path
 
 
-_HOLD_LOCK = """
+_HOLD = """
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1], isolation_level=None)
-con.execute("BEGIN EXCLUSIVE")
-print("locked", flush=True)
+for statement in sys.argv[2:]:
+    con.execute(statement)
+print("holding", flush=True)
 sys.stdin.read()
 con.execute("ROLLBACK")
 con.close()
@@ -120,22 +132,118 @@ con.close()
 
 
 @contextlib.contextmanager
-def _locked(folder: pathlib.Path) -> Iterator[pathlib.Path]:
-    # The lock is held by another process, as Books holds it. A lock held
-    # by a connection in this process would not model Books: POSIX locks
-    # belong to the process, and the open rule's own os.open/os.close of
-    # the file would drop it.
+def _held(folder: pathlib.Path, *statements: str) -> Iterator[pathlib.Path]:
+    # Another process runs ``statements`` on the cache and keeps its
+    # transaction open, as Books would. A connection in this process would
+    # not model Books: POSIX locks belong to the process, and the open
+    # rule's own os.open/os.close of the file would drop them.
     path = folder / CACHE_NAME
     create(path).close()
-    holder = subprocess.Popen([sys.executable, "-I", "-c", _HOLD_LOCK, str(path)],
+    holder = subprocess.Popen([sys.executable, "-I", "-c", _HOLD, str(path), *statements],
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
-        assert holder.stdout.readline().strip() == "locked"
+        assert holder.stdout.readline().strip() == "holding"
         yield path
     finally:
         holder.stdin.close()
         holder.wait(timeout=30)
         holder.stdout.close()
+
+
+def _locked(folder: pathlib.Path) -> ContextManager[pathlib.Path]:
+    return _held(folder, "BEGIN EXCLUSIVE")
+
+
+@contextlib.contextmanager
+def _dirty_writer(folder: pathlib.Path) -> Iterator[pathlib.Path]:
+    # An uncommitted write small enough to stay in the writer's page cache:
+    # the -journal is there, but the writer's RESERVED lock says it is not
+    # hot, and the cache file itself is unchanged.
+    with _held(folder, "BEGIN IMMEDIATE", f"UPDATE {TABLE} SET Z_OPT = Z_OPT + 1") as path:
+        assert sidecars(path) == [f"{CACHE_NAME}-journal"]
+        yield path
+
+
+@contextlib.contextmanager
+def _journal_stray_wal(folder: pathlib.Path) -> Iterator[pathlib.Path]:
+    # A rollback-journal cache with a -wal beside it holding a committed
+    # frame (a crash around a journal-mode switch, or a crafted folder).
+    # SQLite would open the -wal whatever the header says, read the frame
+    # and create -shm.
+    path = folder / CACHE_NAME
+    create(path).close()
+    work = folder / "work"
+    work.mkdir()
+    source = work / CACHE_NAME
+    shutil.copyfile(path, source)
+    con = sqlite3.connect(source, isolation_level=None)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA wal_autocheckpoint=0")
+    fill(con, 1)
+    shutil.copyfile(f"{source}-wal", f"{path}-wal")
+    con.close()
+    shutil.rmtree(work)
+    assert sidecars(path) == [f"{CACHE_NAME}-wal"]
+    yield path
+
+
+@contextlib.contextmanager
+def _journal_empty_wal(folder: pathlib.Path) -> Iterator[pathlib.Path]:
+    # The empty -wal (and -shm) that persistent WAL leaves when a cache
+    # goes back to a rollback journal: SQLite treats an empty regular -wal
+    # as absent.
+    path = folder / CACHE_NAME
+    create(path).close()
+    pathlib.Path(f"{path}-wal").write_bytes(b"")
+    pathlib.Path(f"{path}-shm").write_bytes(b"\x00" * 32768)
+    yield path
+
+
+@contextlib.contextmanager
+def _wal_with_journal(folder: pathlib.Path, journal: str) -> Iterator[pathlib.Path]:
+    # A live WAL cache with a -journal beside it: a zeroed one as PERSIST
+    # mode leaves after a switch to WAL, or one that is not a local file.
+    # SQLite's hot-journal check opens it and reads its first byte.
+    path = folder / CACHE_NAME
+    con = create(path, "WAL")
+    con.execute("PRAGMA wal_autocheckpoint=0")
+    fill(con, 1)
+    zeroed = b"\x00" * 512
+    try:
+        if journal == "zeroed":
+            pathlib.Path(f"{path}-journal").write_bytes(zeroed)
+        else:  # a symlink to a zeroed file elsewhere
+            elsewhere = folder / "elsewhere"
+            elsewhere.mkdir()
+            (elsewhere / "journal").write_bytes(zeroed)
+            os.symlink(elsewhere / "journal", f"{path}-journal")
+        assert sidecars(path) == [f"{CACHE_NAME}-{s}" for s in ("journal", "shm", "wal")]
+        yield path
+    finally:
+        con.close()
+
+
+@contextlib.contextmanager
+def _fifo_sidecar(folder: pathlib.Path, journal_mode: str, side: str) -> Iterator[pathlib.Path]:
+    # A FIFO named like a sidecar. Opening a FIFO to read blocks until a
+    # writer comes, so this holds one open read-write for the whole case:
+    # a reader whose rule wrongly lets SQLite open it gets an error, not a
+    # hang (SQLite reads with pread, which a FIFO refuses).
+    path = folder / CACHE_NAME
+    con = create(path, journal_mode)
+    if journal_mode == "WAL":
+        con.execute("PRAGMA wal_autocheckpoint=0")
+        fill(con, 1)
+    else:
+        con.close()
+    fifo = f"{path}{side}"
+    os.mkfifo(fifo)
+    fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        yield path
+    finally:
+        os.close(fd)
+        con.close()
 
 
 @contextlib.contextmanager
@@ -257,10 +365,17 @@ CASES = [
     Case("truncate", JOURNAL, lambda d: _closed(d, "TRUNCATE")),
     Case("persist_journal", JOURNAL, _persist),
     Case("delete_locked", JOURNAL, _locked, readable=False),
+    Case("dirty_writer", JOURNAL, _dirty_writer),
     Case("hot_journal", JOURNAL, _hot_journal, readable=None),
     Case("journal_symlinked", REFUSED, _journal_symlinked, readable=False),
+    Case("journal_empty_wal", JOURNAL, _journal_empty_wal),
+    Case("journal_stray_wal", REFUSED, _journal_stray_wal, readable=False),
+    Case("journal_fifo_wal", REFUSED, lambda d: _fifo_sidecar(d, "DELETE", "-wal"), readable=False),
     Case("wal_live", WAL, _wal_live),
     Case("wal_dormant_sidecars", WAL, _wal_dormant),
+    Case("wal_persist_journal", WAL, lambda d: _wal_with_journal(d, "zeroed")),
+    Case("wal_journal_symlinked", REFUSED, lambda d: _wal_with_journal(d, "symlink"), readable=False),
+    Case("wal_fifo_journal", REFUSED, lambda d: _fifo_sidecar(d, "WAL", "-journal"), readable=False),
     Case("wal_closed", WAL_IMMUTABLE, lambda d: _closed(d, "WAL")),
     Case("wal_without_shm", WAL_IMMUTABLE, lambda d: _wal_one_sidecar(d, "-wal")),
     Case("wal_without_wal", WAL_IMMUTABLE, lambda d: _wal_one_sidecar(d, "-shm")),

@@ -26,9 +26,12 @@ else, with no literal or comment in them, and ``meta.json`` gains
 and never written: rollback journal or WAL with both sidecars
 read-only (SQLite's own read locks; for WAL, SQLite may rebuild the
 shared-memory index, ``-shm``), WAL without them read-only and
-immutable. No file is created beside it unless Books closes the cache
-during the read, which is reported. A missing or unreadable cache is
-reported on stderr and skipped; the stores are dumped regardless.
+immutable. Every sidecar such a read may open (``-journal``, ``-wal``,
+``-shm``) is checked first, and a rollback-journal cache with a
+non-empty ``-wal`` beside it is refused. No file is created beside the
+cache unless Books changes its sidecars during the read, which is
+reported. A missing, refused or unreadable cache is reported on stderr
+and skipped; the stores are dumped regardless.
 
 ``--compare`` prints column and entity-hash differences against the
 nearest committed fixture. ``--census`` prints (and never saves) a
@@ -442,29 +445,38 @@ def book_info_open_mode(path) -> str:
     Chosen from the file's 100-byte header (read with ``O_NOFOLLOW``) and
     its sidecars, so that reading never writes the database or its
     journal or WAL, never waits on Books beyond SQLite's own read locks,
-    and creates no file unless Books closes the cache during the read:
+    and creates no file unless Books changes the cache's sidecars during
+    the read (:func:`dump_book_info` reports that):
 
     - rollback journal: ``mode=ro`` (``OPEN_JOURNAL``), which takes the
-      shared lock and honours a hot journal; a ``-journal`` that is there
-      must be a local regular file, because SQLite reads it;
+      shared lock and honours a hot journal. A ``-journal`` that is there
+      must be a local regular file, because SQLite reads it. A ``-wal``
+      must be absent or an empty local regular file: SQLite opens any
+      other ``-wal`` whatever the header says, reads it and creates
+      ``-shm`` beside it, so the file is refused;
     - WAL whose ``-wal`` and ``-shm`` are both local regular files:
       ``mode=ro`` (``OPEN_WAL``), which sees the committed WAL content.
       SQLite opens ``-shm`` read-write and may rebuild it (when no
-      connection has the cache open, e.g. after a crash);
-    - WAL without them (closed cleanly, or one is missing):
-      ``mode=ro&immutable=1`` (``OPEN_WAL_IMMUTABLE``), because a read-only
-      open would fail or create the sidecars. The file is re-checked after
-      the read.
+      connection has the cache open, e.g. after a crash). Before it looks
+      at the WAL it checks for a hot rollback journal and reads the first
+      byte of a ``-journal`` that is there, so that must be a local
+      regular file too;
+    - WAL without them (closed cleanly, or one is missing or not a local
+      regular file): ``mode=ro&immutable=1`` (``OPEN_WAL_IMMUTABLE``),
+      because a read-only open would fail or create the sidecars. SQLite
+      opens no sidecar in this mode. The file is re-checked after the read.
 
-    Every file read is gated: regular, not a symlink, not evicted to
-    iCloud. The header is read with a raw ``os.open``/``os.close``, which
-    drops every POSIX lock this process holds on the file, so a reader
-    must call this before opening its own connection to the file, never
-    while one is open.
+    So every file SQLite may open is checked first: the cache and, for
+    the two ``mode=ro`` modes, its ``-journal``, ``-wal`` and ``-shm``
+    must each be absent or a regular file (not a symlink, FIFO or
+    folder) that is not evicted to iCloud. The header is read with a raw
+    ``os.open``/``os.close``, which drops every POSIX lock this process
+    holds on the file, so a reader must call this before opening its own
+    connection to the file, never while one is open.
 
     The same rule as py_apple_books' own cache reader; the probe cases in
     ``tests/_bookinfo_cases.py`` pin both. Raises :class:`DumpError` unless
-    ``path`` is a local regular SQLite file.
+    ``path`` is a local regular SQLite file whose sidecars allow a read.
     """
     path = pathlib.Path(path)
     st = _lstat(path)
@@ -492,12 +504,26 @@ def book_info_open_mode(path) -> str:
         raise DumpError(f"{path.name} is not a SQLite file")
     # Bytes 18 and 19: file format write and read versions, 2 for WAL.
     if head[18] != 2 and head[19] != 2:
-        journal = _lstat(f"{path}-journal")
-        if journal is not None and not _local_regular(journal):
-            raise DumpError(f"{path.name}-journal is not a local file")
+        # SQLite ignores only an empty regular -wal (its "exists" test is
+        # "not a regular file, or not empty"); it opens any other.
+        wal = _lstat(f"{path}-wal")
+        if wal is not None and not (_local_regular(wal) and wal.st_size == 0):
+            raise DumpError(f"{path.name} is in rollback-journal mode but has a -wal file beside it")
+        _check_journal(path)
         return OPEN_JOURNAL
     sidecars = (_lstat(f"{path}-wal"), _lstat(f"{path}-shm"))
-    return OPEN_WAL if all(_local_regular(s) for s in sidecars) else OPEN_WAL_IMMUTABLE
+    if not all(_local_regular(s) for s in sidecars):
+        return OPEN_WAL_IMMUTABLE
+    _check_journal(path)
+    return OPEN_WAL
+
+
+def _check_journal(path: pathlib.Path) -> None:
+    # A mode=ro open checks for a hot rollback journal in every journal
+    # mode: it opens a -journal that is there and reads its first byte.
+    journal = _lstat(f"{path}-journal")
+    if journal is not None and not _local_regular(journal):
+        raise DumpError(f"{path.name}-journal is not a local file")
 
 
 def _signature(path: pathlib.Path) -> tuple:
@@ -519,21 +545,22 @@ def dump_book_info(path) -> Tuple[str, dict]:
     ``book_info`` entry (bare file name, column count). Reads no row.
 
     Raises :class:`DumpError` when an entry is not a plain ``CREATE
-    TABLE``/``CREATE INDEX`` statement (one statement, no literal, quoted
-    name or comment), and, for a WAL cache read with its sidecars, when
-    they were removed, replaced or created during the read: Books closed
-    the cache meanwhile, and SQLite may have created them anew.
+    TABLE``/``CREATE INDEX`` statement (one statement, no string or blob
+    literal, quoted name or comment), and, for a cache read without
+    ``immutable``, when its ``-wal`` or ``-shm`` was removed, replaced or
+    created during the read, whether the read succeeded or not: Books
+    closed, reopened or converted the cache meanwhile, and SQLite may
+    have created them anew.
     """
     path = pathlib.Path(path)
     mode = book_info_open_mode(path)
     before = _signature(path)
     extra = "&immutable=1" if mode == OPEN_WAL_IMMUTABLE else ""
+    failure = None
+    con = None
     try:
         con = sqlite3.connect(f"file:{quote(str(path))}?mode=ro{extra}", uri=True,
                               isolation_level=None, timeout=_BUSY_TIMEOUT)
-    except sqlite3.Error as e:
-        raise DumpError(f"{path.name} can't be read: {e}") from None
-    try:
         con.execute("BEGIN")  # one consistent snapshot, released right after
         objects = con.execute(
             "SELECT type, name, sql FROM sqlite_master WHERE type IN ('table', 'index') "
@@ -542,15 +569,19 @@ def dump_book_info(path) -> Tuple[str, dict]:
         columns = len(con.execute(f"PRAGMA table_info({_ident(BOOK_INFO_TABLE)})").fetchall())
         con.execute("COMMIT")
     except sqlite3.Error as e:
-        raise DumpError(f"{path.name} can't be read: {e}") from None
+        failure = f"{path.name} can't be read: {e}"
     finally:
-        con.close()
+        if con is not None:
+            con.close()
+    # A file created beside the cache is reported before a failed read.
     after = _signature(path)
     if mode == OPEN_WAL_IMMUTABLE and after != before:
         raise DumpError(f"{path.name} changed while being read; try again")
-    if mode == OPEN_WAL and _sidecar_ids(after) != _sidecar_ids(before):
+    if mode != OPEN_WAL_IMMUTABLE and _sidecar_ids(after) != _sidecar_ids(before):
         raise DumpError(f"{path.name}: its -wal or -shm file was removed, replaced or created during the "
-                        f"read (Books closed or reopened the cache); try again")
+                        f"read (Books closed, reopened or converted the cache); try again")
+    if failure is not None:
+        raise DumpError(failure)
     if not any(kind == "table" for kind, _, _ in objects):
         raise DumpError(f"{path.name} has no {BOOK_INFO_TABLE} table")
     if not all(_is_plain_ddl(sql) for _, _, sql in objects):

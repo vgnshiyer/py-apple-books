@@ -9,6 +9,8 @@ import pathlib
 import re
 import sqlite3
 import stat
+import subprocess
+import sys
 from urllib.parse import quote
 
 import pytest
@@ -514,6 +516,67 @@ def test_open_rule(case, tmp_path):
                 del files[shm]
         assert after == before
         assert after_bytes == before_bytes
+
+
+def test_stray_wal_case_is_a_real_hazard(tmp_path):
+    """What the journal_stray_wal case guards against: a plain read-only
+    open of a rollback-journal cache reads a -wal beside it and creates
+    -shm. So the rule must refuse it, not open it."""
+    stray = next(c for c in CASES if c.name == "journal_stray_wal")
+    with stray.make(tmp_path) as path:
+        con = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True)
+        try:
+            assert con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+            assert con.execute(f"SELECT count(*) FROM {TABLE}").fetchone()[0] == 3  # 2 + the WAL's row
+        finally:
+            con.close()
+        assert f"{CACHE_NAME}-shm" in cases.sidecars(path)
+
+
+_DUMP_ONE = """
+import sys
+from py_apple_books.testing import dump_schema
+try:
+    dump_schema.dump_book_info(sys.argv[1])
+except dump_schema.DumpError as e:
+    print("refused:", e)
+"""
+
+
+@pytest.mark.parametrize("journal_mode, side", [("WAL", "-journal"), ("DELETE", "-wal")])
+def test_fifo_sidecar_never_blocks(tmp_path, journal_mode, side):
+    """A FIFO sidecar no process writes to: SQLite's open of a FIFO
+    ``-journal`` blocks forever, so the rule refuses the file before
+    SQLite runs. In a subprocess, so a regression fails instead of
+    hanging the suite."""
+    path = tmp_path / CACHE_NAME
+    con = cases.create(path, journal_mode)
+    try:
+        if journal_mode == "WAL":
+            con.execute("PRAGMA wal_autocheckpoint=0")
+            cases.fill(con, 1)  # keeps -wal and -shm: the rule would pick mode=ro
+        else:
+            con.close()
+        os.mkfifo(f"{path}{side}")
+        run = subprocess.run([sys.executable, "-c", _DUMP_ONE, str(path)],
+                             capture_output=True, text=True, timeout=60)
+    finally:
+        con.close()
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.startswith("refused:") and str(tmp_path) not in run.stdout
+
+
+def test_sidecar_created_by_a_journal_read_is_reported(tmp_path, monkeypatch):
+    """Should a -wal appear after the rule picked ``mode=ro`` for a
+    rollback-journal cache, SQLite creates -shm beside it: the read
+    succeeds, and the new file is reported."""
+    stray = next(c for c in CASES if c.name == "journal_stray_wal")
+    with stray.make(tmp_path) as path:
+        monkeypatch.setattr(dump_schema, "book_info_open_mode", lambda p: dump_schema.OPEN_JOURNAL)
+        with pytest.raises(dump_schema.DumpError, match="removed, replaced or created during the read") as info:
+            dump_schema.dump_book_info(path)
+        assert f"{CACHE_NAME}-shm" in cases.sidecars(path)
+    assert str(tmp_path) not in str(info.value)
 
 
 def test_open_rule_constants_match_the_cases():
