@@ -199,9 +199,11 @@ class _BookIndex:
     :attr key: Its cache key (see :func:`_current_key`).
     :attr chapters: 1.10's chapter list, with :attr:`Chapter.spine_index`.
     :attr spine: The spine, one :class:`SpineItem` per ``<spine>`` element.
-    :attr book: ebooklib's book as the index-only load left it: the
-        manifest, ebooklib's own spine view and the ToC are complete;
-        items not read have :class:`_Deferred` content.
+    :attr book: ebooklib's book from the index-only load, keeping what
+        text extraction needs: its text documents (those not read have
+        :class:`_Deferred` content), ebooklib's own spine view, language
+        and templates. Binary items, the parsed ToC and page lists are
+        dropped (see :attr:`manifest` and :attr:`chapters`).
     :attr opf_dir: The package document's folder in the bundle (as
         ``BookContent`` derives it).
     :attr manifest: manifest id -> ``(href, media type, entry name)``:
@@ -405,11 +407,31 @@ def _build_index(root: pathlib.Path, root_st: os.stat_result) -> _BookIndex:
         + [item.item_id for item in spine if item.is_toc_page and item.item_id])
     keyed_files = tuple(sorted(reader.keyed))
     key = _key(root_st, ((name, *reader.keyed[name]) for name in keyed_files))
-    # Calibrated with tracemalloc on synthetic books of 2 to 500 files
-    # (about 2 KB per manifest item, ToC entry and spine entry together,
-    # plus the navigation files kept as read): within ~25 % above.
-    weight = (8192 + 2 * reader.bytes_read + 1024 * len(book.items)
-              + 512 * (len(chapters) + len(spine))
+    # Keep only what text extraction needs: the text documents (those not
+    # read stay deferred), ebooklib's spine view, the book's language and
+    # templates. Binary items (their text is refused anyway), the NCX and
+    # ebooklib's parsed ToC and page lists (the chapter list is computed)
+    # are dropped.
+    # An id is looked up as ebooklib does (its first item), so an id whose
+    # first item is binary keeps no item at all (refused, as it was).
+    first_is_text: Dict[Any, bool] = {}
+    for item in book.items:
+        first_is_text.setdefault(item.id, _content._is_text_media_type(getattr(item, "media_type", None)))
+    book.items = [item for item in book.items
+                  if first_is_text[item.id]
+                  and _content._is_text_media_type(getattr(item, "media_type", None))]
+    book.toc = []
+    book.pages = []
+    for item in book.items:
+        if getattr(item, "pages", None):
+            item.pages = []
+    kept_bytes = sum(len(item.content) for item in book.items
+                     if isinstance(item.content, bytes) and not isinstance(item.content, _Deferred))
+    # Calibrated with tracemalloc on synthetic books: about 1 KB
+    # per kept item and 0.5 KB per ToC entry, spine entry and manifest map
+    # entry, plus the navigation documents kept as read.
+    weight = (8192 + 2 * kept_bytes + 1024 * len(book.items)
+              + 512 * (len(chapters) + len(spine) + len(manifest))
               + sum(len(c.id) + len(c.title) + len(c.href) + len(c.fragment) for c in chapters))
     return _BookIndex(
         key=key,

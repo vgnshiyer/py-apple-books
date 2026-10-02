@@ -7,6 +7,7 @@ Every bundle is synthetic (tests/_epub_shapes.py, write_epub_bundle).
 
 from __future__ import annotations
 
+import gc
 import os
 import shutil
 import sqlite3
@@ -103,6 +104,32 @@ class TestHits:
                                      "OEBPS/nav.xhtml", "OEBPS/toc.ncx")
         total = sum(p.stat().st_size for p in bundle.rglob("*") if p.is_file())
         assert index.bytes_read < 10_000 < total
+
+    def test_index_keeps_only_what_text_needs(self, tmp_path):
+        bundle = _epub_shapes.mixed_types(tmp_path)
+        index = _epub_index._build_index(bundle, os.stat(bundle))
+        assert sorted(item.get_id() for item in index.book.items) == ["art", "c1", "nav", "page"]
+        assert index.book.toc == [] and index.book.pages == []
+        # The manifest map still names every item.
+        assert set(index.manifest) == {"art", "c1", "cover", "css", "font", "nav", "ncx", "page", "pic"}
+        assert index.manifest["pic"] == ("OEBPS/pic.png", "image/png", "OEBPS/pic.png")
+
+    def test_weight_tracks_measured_memory(self, tmp_path):
+        bundles = [write_epub_bundle(tmp_path / f"m{i}.epub",
+                                     [(f"c{j}", f"<p>text {j}</p>") for j in range(60)],
+                                     toc=[(f"Chapter {j}", f"c{j}.xhtml") for j in range(60)])
+                   for i in range(5)]
+        _epub_index._build_index(bundles[0], os.stat(bundles[0]))
+        gc.collect()
+        tracemalloc.start()
+        try:
+            kept = [_epub_index._build_index(b, os.stat(b)) for b in bundles]
+            gc.collect()
+            used = tracemalloc.get_traced_memory()[0]
+        finally:
+            tracemalloc.stop()
+        estimated = sum(index.weight for index in kept)
+        assert 0.5 * estimated <= used <= 1.25 * estimated
 
     def test_get_chapter_flattens_the_toc_once(self, tmp_path, monkeypatch):
         content = BookContent(_epub_shapes.plain(tmp_path))

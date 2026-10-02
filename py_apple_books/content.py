@@ -30,6 +30,15 @@ it is looked up, every entry before it is read, and every read runs
 with downloads of evicted files turned off for the reading thread (see
 :mod:`py_apple_books._icloud`), so a missed placeholder fails with
 :class:`BookNotDownloadedError` instead of being downloaded.
+
+Also since 1.11, a process-wide index of each book (its chapter list and
+spine, read from ``container.xml``, the package document and the
+navigation files only; see :mod:`py_apple_books._epub_index`) serves
+repeat :meth:`BookContent.list_chapters` calls and the spine API
+(:meth:`BookContent.list_spine_items`,
+:meth:`BookContent.get_spine_item_text`,
+:meth:`BookContent.iter_spine_text`), which then read only the files
+whose text is asked for. :func:`clear_content_cache` empties it.
 """
 
 import copy

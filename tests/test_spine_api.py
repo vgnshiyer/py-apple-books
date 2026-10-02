@@ -506,3 +506,26 @@ class TestMixins:
         clone = pickle.loads(pickle.dumps(content))
         assert clone._spine_text_memo == {} and clone._chapters_memo is None
         assert clone.get_spine_item_text(1) == content.get_spine_item_text(1)
+
+
+class TestDuplicateIds:
+    """A manifest that repeats an id: the text is that of the first item
+    with the id, as 1.10's lookup finds it, loaded book or index."""
+
+    @pytest.mark.parametrize("binary_first", [True, False])
+    def test_first_item_decides(self, tmp_path, binary_first):
+        doc = ("dup", "doc.xhtml", "application/xhtml+xml", "<html><body><p>Doc text.</p></body></html>")
+        img = ("dup", "img.png", "image/png", b"\x89PNG")
+        bundle = write_epub_bundle(tmp_path / "Dup.epub", [("c1", "<p>one</p>")], toc=[("One", "c1.xhtml")])
+        opf = bundle / "OEBPS" / "content.opf"
+        first, second = (img, doc) if binary_first else (doc, img)
+        items = "".join(f'<item id="{i}" href="{h}" media-type="{m}"/>' for i, h, m, _ in (first, second))
+        opf.write_text(opf.read_text().replace("</manifest>", items + "</manifest>"))
+        for _, href, _, data in (first, second):
+            (bundle / "OEBPS" / href).write_bytes(data if isinstance(data, bytes) else data.encode())
+        for content in (BookContent(bundle), _full(bundle)):
+            if binary_first:
+                with pytest.raises(ChapterNotFoundError):
+                    content.get_spine_item_text("dup")
+            else:
+                assert content.get_spine_item_text("dup") == "Doc text."
