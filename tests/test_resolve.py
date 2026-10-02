@@ -390,3 +390,86 @@ def test_two_megabytes_six_thousand_ids_cold_under_a_second(tmp_path):
     elapsed = time.perf_counter() - start
     assert (title(resolved), resolved.match) == ("Section 4320", ANCHOR)
     assert elapsed < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Bounded work on crafted files (many deeply nested ToC anchors)
+# ---------------------------------------------------------------------------
+
+
+def _nested_anchors_book(tmp_path, depth, anchors):
+    """One file: a heading, then ``anchors`` spans inside ``depth``
+    nested divs, every one of them a ToC entry (start paths of about
+    ``depth * anchors`` steps together)."""
+    body = ('<h1 id="top">Top</h1>' + "<div>" * depth
+            + "".join(f'<span id="a{i}">x</span>' for i in range(anchors)) + "</div>" * depth)
+    toc = [("Top", "c1.xhtml#top")] + [(f"S{i}", f"c1.xhtml#a{i}") for i in range(anchors)]
+    return write_epub_bundle(tmp_path / "Nested.epub", [("c1", body)], toc=toc)
+
+
+class TestBoundedStarts:
+    def test_over_the_budget_is_section_unknown_fast_and_small(self, tmp_path):
+        import tracemalloc
+
+        bundle = _nested_anchors_book(tmp_path, 8000, 8000)
+        location = cfi(0, "c1", "/4/4/2/1:0")
+        start = time.perf_counter()
+        resolved = BookContent(bundle).resolve(location)
+        elapsed = time.perf_counter() - start
+        assert (resolved.chapter, resolved.match, resolved.spine_index) == (None, UNKNOWN, 0)
+        assert elapsed < 1.0
+        tracemalloc.start()
+        try:
+            BookContent(bundle).resolve(location)  # the anchor table is cached: the starts alone
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        assert peak < 64 * 1024 * 1024
+
+    def test_the_budget_is_the_sum_of_the_start_paths(self, gutenberg, monkeypatch):
+        # Start paths: #ch1 (4, 4), #ch2 (4, 8, 2), #ch3 (4, 12): 7 steps.
+        location = cfi(1, "body", "/4/10/1:2")
+        monkeypatch.setattr(_content_resolve, "_MAX_START_STEPS", 7)
+        assert placed(gutenberg, location) == ("II", ANCHOR)
+        monkeypatch.setattr(_content_resolve, "_MAX_START_STEPS", 6)
+        assert placed(gutenberg, location) == (None, UNKNOWN)
+        # Never "file start", and the file after it can't take its last entry.
+        assert placed(gutenberg, cfi(2, "license")) == (None, UNKNOWN)
+
+    def test_a_batch_builds_each_files_starts_once(self, library, api, tmp_path, monkeypatch):
+        sections = "".join(f'<h2 id="s{i}">S{i}</h2><p>{"word " * 5}</p>' for i in range(6000))
+        bundle = write_epub_bundle(tmp_path / "Big.epub", [("c1", sections)],
+                                   toc=[(f"S{i}", f"c1.xhtml#s{i}") for i in range(6000)])
+        book = library.add_book("Big", path=str(bundle))
+        for i in range(1000):
+            n = i * 7 % 6000
+            library.add_annotation(book, f"w{i}", location=cfi(0, "c1", f"/4/{2 * (2 * n + 2)}/1:0"))
+        builds = []
+        real = _content_resolve._Boundaries._build_sections
+
+        def counted(self, file):
+            builds.append(file)
+            return real(self, file)
+
+        monkeypatch.setattr(_content_resolve._Boundaries, "_build_sections", counted)
+        annotations = list(api.list_annotations(order_by="id"))
+        api.get_annotation_locations(annotations)  # cold: parses the file once
+        builds.clear()
+        start = time.perf_counter()
+        found = api.get_annotation_locations(annotations)
+        elapsed = time.perf_counter() - start
+        assert builds == ["OEBPS/c1.xhtml"]
+        assert elapsed < 1.0
+        placed_at = [found[a.id].chapter.title for a in annotations]
+        assert placed_at == [f"S{i * 7 % 6000}" for i in range(1000)]
+
+    def test_a_batch_in_a_crafted_file_is_bounded(self, library, api, tmp_path):
+        book = library.add_book("Nested", path=str(_nested_anchors_book(tmp_path, 8000, 8000)))
+        for i in range(1000):
+            library.add_annotation(book, f"w{i}", location=cfi(0, "c1", "/4/4/2/1:0"))
+        annotations = list(api.list_annotations(order_by="id"))
+        start = time.perf_counter()
+        found = api.get_annotation_locations(annotations)
+        elapsed = time.perf_counter() - start
+        assert {(r.chapter, r.match) for r in found.values()} == {(None, UNKNOWN)}
+        assert elapsed < 1.5  # cold: includes parsing the file

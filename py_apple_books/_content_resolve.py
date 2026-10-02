@@ -26,6 +26,12 @@ documents):
   Its own path is the CFI's content path, re-based on the deepest step
   whose id assertion names an anchor of the file (that anchor's path,
   then the steps after it).
+- A file whose entries' start paths would hold more than
+  :data:`_MAX_START_STEPS` steps together (a crafted file of many deeply
+  nested ToC anchors) is treated like one whose anchors can't be read:
+  ``SECTION_UNKNOWN``. Each file's starts are built once per
+  :class:`_Boundaries` and sorted, so placing a location costs a binary
+  search.
 
 Reads: nothing but the index and, for a file holding several ToC
 entries with fragments (the location's, or the file before it), that
@@ -65,6 +71,14 @@ _ANCHOR_MATCHING = True
 
 # A content path: CFI steps (ints) from the root element of the file.
 _Path = Tuple[int, ...]
+
+#: The most element steps the start paths of one file's ToC entries may
+#: hold together (the sum of their anchors' depths). Over it, locations in
+#: that file are ``SECTION_UNKNOWN``, never "file start": this bounds the
+#: time and memory of placing a location in a crafted file whose many ToC
+#: anchors are all deeply nested (each path is built in steps proportional
+#: to its depth). A real book's file stays far below it.
+_MAX_START_STEPS = 1_000_000
 
 
 class _Target(NamedTuple):
@@ -135,13 +149,24 @@ class _Start(NamedTuple):
     chapter: "Chapter"
 
 
+class _Sections(NamedTuple):
+    """Where the ToC entries of one file start, sorted by ``(path,
+    order)``, with their paths alone (for bisecting) and the file's anchor
+    table (None when no entry has a fragment, so none was read)."""
+
+    starts: List[_Start]
+    paths: List[_Path]
+    table: Optional[Mapping[str, _Path]]
+
+
 class _Boundaries:
     """The section boundaries of one book index, built once per call
     (or per book, for a batch): ToC entries grouped by their file, and
     the files holding entries by spine index. Holds anchor tables read
     during the call, so a batch reads each one once."""
 
-    __slots__ = ("index", "root", "by_file", "starts_at", "files_at", "_tables", "_spine_ids")
+    __slots__ = ("index", "root", "by_file", "starts_at", "files_at", "_tables", "_sections",
+                 "_anchor_paths", "_spine_ids")
 
     def __init__(self, index: Any, root: Any) -> None:
         self.index = index
@@ -158,6 +183,8 @@ class _Boundaries:
         self.starts_at: List[int] = sorted(files_at)
         self.files_at = files_at
         self._tables: Dict[str, Optional[Mapping[str, _Path]]] = {}
+        self._sections: Dict[str, Optional[_Sections]] = {}
+        self._anchor_paths: Dict[Tuple[str, str], _Path] = {}
         self._spine_ids: Optional[Dict[str, int]] = None
 
     # -- the file ---------------------------------------------------------------
@@ -199,23 +226,46 @@ class _Boundaries:
         self._tables[file] = found
         return found
 
-    def starts(self, file: str) -> Optional[Tuple[List[_Start], Optional[Mapping[str, _Path]]]]:
-        """Where each ToC entry of ``file`` starts, and the file's anchor
-        table (None when no entry has a fragment, so none was read); None
-        when an entry has a fragment and the table can't be had."""
+    def sections(self, file: str) -> Optional[_Sections]:
+        """Where each ToC entry of ``file`` starts (see :class:`_Sections`);
+        None when an entry has a fragment and the file's anchor table
+        can't be had, or when the entries' start paths would hold more
+        than :data:`_MAX_START_STEPS` steps. Built once per instance, so
+        a batch builds each file's once."""
+        if file in self._sections:
+            return self._sections[file]
+        found = self._build_sections(file)
+        self._sections[file] = found
+        return found
+
+    def _build_sections(self, file: str) -> Optional[_Sections]:
         entries = self.by_file.get(file, ())
-        if not any(c.fragment for c in entries):
-            return [_Start((), c.order, c) for c in entries], None
-        table = self.table(file)
-        if table is None:
-            return None
-        found = []
+        table = None
+        if any(c.fragment for c in entries):
+            table = self.table(file)
+            if table is None:
+                return None
+        starts = []
+        budget = _MAX_START_STEPS
         for c in entries:
             path: _Path = ()
-            if c.fragment and c.fragment in table:
+            if table is not None and c.fragment and c.fragment in table:
                 path = table[c.fragment]
-            found.append(_Start(path, c.order, c))
-        return found, table
+                budget -= len(path)
+                if budget < 0:
+                    return None
+            starts.append(_Start(path, c.order, c))
+        starts.sort(key=lambda s: (s.path, s.order))
+        return _Sections(starts, [s.path for s in starts], table)
+
+    def anchor_path(self, file: str, table: Mapping[str, _Path], anchor: str) -> _Path:
+        """``table[anchor]`` for ``file``'s table, kept for the instance
+        (a batch re-bases many locations on the same anchors)."""
+        key = (file, anchor)
+        path = self._anchor_paths.get(key)
+        if path is None:
+            path = self._anchor_paths[key] = tuple(table[anchor])
+        return path
 
     # -- placing ----------------------------------------------------------------
 
@@ -233,24 +283,40 @@ class _Boundaries:
             return entries[0], ChapterMatch.FILE
         if not _ANCHOR_MATCHING:
             return None, ChapterMatch.SECTION_UNKNOWN
-        found = self.starts(file)
-        if found is None:
+        sections = self.sections(file)
+        if sections is None:
             return None, ChapterMatch.SECTION_UNKNOWN
-        starts, table = found
         if steps is None:
             # Where the location is in its file is unknown: only a file
-            # whose entries all start at its top can be placed.
-            if all(s.path == () for s in starts):
-                return max(starts, key=lambda s: s.order).chapter, ChapterMatch.ANCHOR
+            # whose entries all start at its top can be placed (the last
+            # of them in ToC order).
+            if sections.paths[-1] == ():
+                return sections.starts[-1].chapter, ChapterMatch.ANCHOR
             return None, ChapterMatch.SECTION_UNKNOWN
-        path = _rebased(steps, table)
-        before = [s for s in starts if s.path <= path]
-        if before:
-            return max(before, key=lambda s: (s.path, s.order)).chapter, ChapterMatch.ANCHOR
+        path = self.rebased(file, steps, sections.table)
+        # The last entry starting at or before the location: of those
+        # starting at the same place, the last in ToC order.
+        at = bisect.bisect_right(sections.paths, path)
+        if at:
+            return sections.starts[at - 1].chapter, ChapterMatch.ANCHOR
         # Before every entry of its file: the section before the file (its
         # first place in the spine, where its sections start, for a file
         # the spine lists more than once).
         return self.preceding(self.index.first_spine_index.get(file, position))
+
+    def rebased(self, file: str, steps: Tuple[Tuple[int, Optional[str]], ...],
+                table: Optional[Mapping[str, _Path]]) -> _Path:
+        """The integer path of ``steps``, re-based on the deepest even
+        step whose id assertion names an anchor in ``file``'s ``table``:
+        that anchor's path, then the steps after it (so a CFI whose
+        element counting differs from the parser's still lands on its
+        element)."""
+        if table:
+            for k in range(len(steps) - 1, -1, -1):
+                step, ident = steps[k]
+                if ident is not None and step % 2 == 0 and ident in table:
+                    return self.anchor_path(file, table, ident) + tuple(s for s, _ in steps[k + 1:])
+        return tuple(s for s, _ in steps)
 
     def preceding(self, file_index: int) -> Tuple[Optional["Chapter"], ChapterMatch]:
         """The last section starting in a file before spine index
@@ -264,11 +330,10 @@ class _Boundaries:
         entries = self.by_file[file]
         if len(entries) == 1:
             return entries[0], ChapterMatch.PRECEDING
-        found = self.starts(file)
-        if found is None:
+        sections = self.sections(file)
+        if sections is None:
             return None, ChapterMatch.SECTION_UNKNOWN
-        last = max(found[0], key=lambda s: (s.path, s.order))
-        return last.chapter, ChapterMatch.PRECEDING
+        return sections.starts[-1].chapter, ChapterMatch.PRECEDING
 
     def resolve(self, target: _Target) -> Optional[ResolvedLocation]:
         """The :class:`ResolvedLocation` of ``target``, or None when it
@@ -278,20 +343,6 @@ class _Boundaries:
             return None
         chapter, match = self.place(position, target.steps)
         return ResolvedLocation(chapter, match, position, self.index.spine[position].item_id)
-
-
-def _rebased(steps: Tuple[Tuple[int, Optional[str]], ...],
-             table: Optional[Mapping[str, _Path]]) -> _Path:
-    """The integer path of ``steps``, re-based on the deepest even step
-    whose id assertion names an anchor in ``table``: that anchor's path,
-    then the steps after it (so a CFI whose element counting differs
-    from the parser's still lands on its element)."""
-    if table:
-        for k in range(len(steps) - 1, -1, -1):
-            step, ident = steps[k]
-            if ident is not None and step % 2 == 0 and ident in table:
-                return tuple(table[ident]) + tuple(s for s, _ in steps[k + 1:])
-    return tuple(s for s, _ in steps)
 
 
 def _resolve(index: Any, root: Any, target: _Target) -> Optional[ResolvedLocation]:
