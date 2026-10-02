@@ -115,6 +115,34 @@ class TestQueriesAndReads:
         assert api.get_annotation_locations(anns) == expected
         assert len(_book_queries(sql_trace)) == 1
 
+    def test_one_books_boundaries_at_a_time(self, api, seeded, monkeypatch):
+        """Annotations are placed book by book, interleaved or not: when
+        a book's boundaries (and the anchor tables they hold) are built,
+        no other book's are still alive."""
+        import gc
+        import weakref
+
+        from py_apple_books import _content_resolve
+
+        alive, built = [], []
+
+        class Tracked(_Boundaries):
+            def __init__(self, index, root):
+                gc.collect()
+                assert [r for r in alive if r() is not None] == []
+                super().__init__(index, root)
+                alive.append(weakref.ref(self))
+                built.append(root)
+
+        monkeypatch.setattr(_content_resolve, "_Boundaries", Tracked)
+        anns = list(api.list_annotations(order_by="id"))
+        interleaved = [a for pair in zip(anns, reversed(anns)) for a in pair]
+        expected = api.get_annotation_locations(anns)
+        assert len(built) == 2
+        assert api.get_annotation_locations(interleaved) == {a.id: expected[a.id] for a in interleaved}
+        assert list(api.get_annotation_locations(interleaved)) == list(dict.fromkeys(a.id for a in interleaved))
+        assert len(built) == 6
+
     def test_no_book_query_without_located_annotations(self, api, seeded, sql_trace):
         anns = _by_id(api, seeded["noloc"])
         del sql_trace[:]

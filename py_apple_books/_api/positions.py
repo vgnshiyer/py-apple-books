@@ -20,7 +20,7 @@ gate, never with ``du`` or a walk of the bundle. See
 
 import math
 import re
-from typing import Any, Dict, Iterable, Iterator, NamedTuple, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Tuple, Union
 
 from py_apple_books._api._common import (
     _book_arg,
@@ -514,7 +514,7 @@ class _PositionsAPI:
         :raises DBError: the library store can't be read (book-level
             failures never raise).
         """
-        from py_apple_books._content_resolve import _Boundaries, _usable
+        from py_apple_books._content_resolve import _usable
         from py_apple_books.positions import _spine_index
 
         if isinstance(annotations, Annotation):
@@ -528,31 +528,24 @@ class _PositionsAPI:
 
         located = {key: a for key, a in distinct.items() if _usable(a.location)}
         books = _books_for(a.asset_id for a in located.values())
-        per_book: Dict[Any, Any] = {}
         results: Dict[Any, ResolvedLocation] = {}
+        # The annotations of each book, so that one book's boundaries
+        # (its index and the anchor tables read for it) are let go
+        # before the next book's are built: a batch over the whole
+        # library holds one book's tables at a time, not all of them.
+        per_book: Dict[str, List[Tuple[Any, Annotation]]] = {}
         for key, annotation in distinct.items():
-            location = annotation.location
             if key not in located:
                 results[key] = ResolvedLocation(None, None, None, None, UnavailableReason.NO_LOCATION)
-                continue
-            spine_index, hint = _spine_index(location), location.chapter_id
-            book = books.get(annotation.asset_id)
-            if book is None:
-                results[key] = ResolvedLocation(None, None, spine_index, hint, UnavailableReason.ORPHANED)
-                continue
-            state = per_book.get(book.id)
-            if state is None:
-                gated = _gate(book)
-                state = per_book[book.id] = (
-                    gated.reason if gated.reason is not None else _Boundaries(gated.index, book.path))
-            if isinstance(state, UnavailableReason):
-                results[key] = ResolvedLocation(None, None, spine_index, hint, state)
-                continue
-            resolved, reason = _resolve_in(state, location)
-            if resolved is None:
-                resolved = ResolvedLocation(None, None, spine_index, hint, reason)
-            results[key] = resolved
-        return results
+            elif annotation.asset_id not in books:
+                location = annotation.location
+                results[key] = ResolvedLocation(None, None, _spine_index(location), location.chapter_id,
+                                                UnavailableReason.ORPHANED)
+            else:
+                per_book.setdefault(annotation.asset_id, []).append((key, annotation))
+        for asset_id, members in per_book.items():
+            _place_in_book(books[asset_id], members, results)
+        return {key: results[key] for key in distinct}
 
     def get_annotation_context(self, annotation_id: Union[int, str, Annotation], chars_before: int = 300,
                                chars_after: int = 300) -> AnnotationContext:
@@ -697,6 +690,26 @@ class _PositionsAPI:
 # is 999).
 _IN_LIST_MAX = 500
 _GATE_FIELDS = ("id", "asset_id", "title", "path", "state", "content_type", "data_source", "can_redownload")
+
+
+def _place_in_book(book: Book, members: List[Tuple[Any, Annotation]],
+                   results: Dict[Any, ResolvedLocation]) -> None:
+    """Gate ``book`` once and place each ``(key, annotation)`` of it in
+    ``results``. The book's boundaries live only for this call."""
+    from py_apple_books._content_resolve import _Boundaries
+    from py_apple_books.positions import _spine_index
+
+    gated = _gate(book)
+    boundaries = None if gated.reason is not None else _Boundaries(gated.index, book.path)
+    for key, annotation in members:
+        location = annotation.location
+        if boundaries is None:
+            resolved, reason = None, gated.reason
+        else:
+            resolved, reason = _resolve_in(boundaries, location)
+        if resolved is None:
+            resolved = ResolvedLocation(None, None, _spine_index(location), location.chapter_id, reason)
+        results[key] = resolved
 
 
 def _books_for(asset_ids: Iterable[Optional[str]]) -> Dict[str, Book]:
