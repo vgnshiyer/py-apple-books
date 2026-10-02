@@ -6,15 +6,23 @@ reads synthetic libraries. Column values are written with raw SQL, so
 nothing here depends on the 1.11 fixture helpers.
 """
 
+import copy
+import dataclasses
 import datetime as dt
 import math
+import pathlib
+import pickle
+import plistlib
 import random
 
 import pytest
 
 from py_apple_books import PyAppleBooks
+from py_apple_books import text as text_module
 from py_apple_books.db import LibraryDB, use_library
-from py_apple_books.models import Annotation, Book
+from py_apple_books.models import Annotation, Book, PageLocation
+from py_apple_books.models.book import CONTENT_TYPE_SERIES_CONTAINER
+from py_apple_books.testing import STORE_SERIES
 from py_apple_books.utils import _apple_datetime_or_none, apple_timestamp_to_datetime
 
 # NSDate.distantPast in Core Data seconds: 0000-12-30 in the proleptic
@@ -182,3 +190,250 @@ class TestTolerantModelDates:
                 assert book.title == "Book" and book.finished_date is None
         finally:
             db.close()
+
+
+# ---------------------------------------------------------------------------
+# Book: metadata, series and high-water fields (F55, F49, F22-high-water)
+# ---------------------------------------------------------------------------
+
+BOOK_FIELDS_111 = {
+    "language": "ZLANGUAGE",
+    "year": "ZYEAR",
+    "release_date": "ZRELEASEDATE",
+    "series_id": "ZSERIESID",
+    "series_container_id": "ZSERIESCONTAINER",
+    "series_sequence": "ZSEQUENCENUMBER",
+    "series_label": "ZSEQUENCEDISPLAYNAME",
+    "series_is_ordered": "ZSERIESISORDERED",
+    "high_water_progress": "ZBOOKHIGHWATERMARKPROGRESS",
+}
+
+
+class TestBookFieldConversions:
+    def test_mapping(self):
+        mapping = Book._get_mappings("Book")
+        assert list(mapping)[-len(BOOK_FIELDS_111):] == list(BOOK_FIELDS_111)
+        assert {f: mapping[f] for f in BOOK_FIELDS_111} == BOOK_FIELDS_111
+        assert "ZACCOUNTID" not in mapping.values()
+
+    def test_all_null(self):
+        book = Book.from_db(book_row())
+        assert {f: getattr(book, f) for f in BOOK_FIELDS_111} == dict.fromkeys(BOOK_FIELDS_111)
+
+    @pytest.mark.parametrize("raw, expected", [
+        ("en", "en"), ("fr_CA", "fr_CA"), ("", None), ("   ", None), (5, None), (b"en", None),
+    ], ids=repr)
+    def test_language(self, raw, expected):
+        assert Book.from_db(book_row(language=raw)).language == expected
+
+    @pytest.mark.parametrize("raw, expected", [
+        ("2019", 2019), (" 2019 ", 2019), ("0042", 42), (2019, 2019), (1, 1), (9999, 9999),
+        ("n/a", None), ("", None), ("19", None), ("20190", None), ("2019-01-01", None),
+        ("0000", None), (0, None), (10000, None), (-5, None), (True, None), (2019.0, None),
+        ("२०१९", None), ("２０１９", None),
+    ], ids=repr)
+    def test_year(self, raw, expected):
+        assert Book.from_db(book_row(year=raw)).year == expected
+
+    def test_release_date(self):
+        book = Book.from_db(book_row(release_date=600000000.0))
+        assert book.release_date == apple_timestamp_to_datetime(600000000.0)
+        for raw in (DISTANT_PAST, 1e12, "NaN", "2019-01-01"):
+            assert Book.from_db(book_row(release_date=raw)).release_date is None
+
+    @pytest.mark.parametrize("field, raw, expected", [
+        ("series_id", "1234567890", "1234567890"),
+        ("series_id", 1234567890, "1234567890"),
+        ("series_id", "", None),
+        ("series_id", True, None),
+        ("series_id", 1.5, None),
+        ("series_container_id", 42, 42),
+        ("series_container_id", "42", 42),
+        ("series_container_id", 42.0, 42),
+        ("series_container_id", 42.5, None),
+        ("series_container_id", "abc", None),
+        ("series_container_id", True, None),
+        ("series_container_id", float("nan"), None),
+        ("series_sequence", 2, 2.0),
+        ("series_sequence", "2", 2.0),
+        ("series_sequence", 2.5, 2.5),
+        ("series_sequence", "nan", None),
+        ("series_sequence", "inf", None),
+        ("series_sequence", "1e999", None),
+        ("series_sequence", "x", None),
+        ("series_sequence", True, None),
+        ("series_label", "Book 2", "Book 2"),
+        ("series_label", "", None),
+        ("series_label", 2, None),
+        ("series_is_ordered", 1, True),
+        ("series_is_ordered", 0, False),
+        ("series_is_ordered", "1", True),
+        ("series_is_ordered", "0", False),
+        ("series_is_ordered", True, True),
+        ("series_is_ordered", False, False),
+        ("series_is_ordered", 2, None),
+        ("series_is_ordered", "maybe", None),
+        ("series_is_ordered", 1.0, None),
+    ], ids=repr)
+    def test_series(self, field, raw, expected):
+        value = getattr(Book.from_db(book_row(**{field: raw})), field)
+        assert value == expected and type(value) is type(expected)
+
+    @pytest.mark.parametrize("raw, expected", [
+        (0.87, 87.0), ("0.87", 87.0), (1, 100.0), (1.0, 100.0), (0.0001, 0.01),
+        (0, None), (0.0, None), (None, None), ("", None), ("x", None), (float("nan"), None),
+        (float("inf"), None), (True, None),
+    ], ids=repr)
+    def test_high_water_progress(self, raw, expected):
+        value = Book.from_db(book_row(high_water_progress=raw)).high_water_progress
+        assert value == pytest.approx(expected) if expected is not None else value is None
+
+    def test_high_water_like_reading_progress(self):
+        """Same unit and arithmetic as reading_progress."""
+        for raw in (0.1, 0.333, 0.87, 1.0):
+            book = Book.from_db(book_row(reading_progress=raw, high_water_progress=raw))
+            assert book.high_water_progress == book.reading_progress
+
+    def test_conversions_are_idempotent(self):
+        """A Book built from another one's fields keeps the 1.11 fields
+        and the dates (reading_progress and duration are converted again,
+        as in 1.10)."""
+        book = Book.from_db(book_row(
+            language="en", year="2019", release_date=600000000.0, series_id=123,
+            series_container_id="7", series_sequence="2.5", series_label="Book 2",
+            series_is_ordered="1", creation_date=1.0, finished_date=2.0, last_opened_date=3.0,
+            purchased_date=4.0, last_engaged_date=5.0))
+        fields = {f.name: getattr(book, f.name) for f in dataclasses.fields(Book)}
+        clone = Book(**fields)
+        keep = [f for f in BOOK_FIELDS_111 if f != "high_water_progress"] + list(BOOK_DATES)
+        assert {f: getattr(clone, f) for f in keep} == {f: getattr(book, f) for f in keep}
+        assert (clone.language, clone.year, clone.series_id, clone.series_container_id,
+                clone.series_sequence, clone.series_is_ordered) == ("en", 2019, "123", 7, 2.5, True)
+
+    def test_positional_construction_without_the_new_fields(self):
+        book = Book(*[None] * 24)
+        assert {f: getattr(book, f) for f in BOOK_FIELDS_111} == dict.fromkeys(BOOK_FIELDS_111)
+        assert not book.is_pdf
+
+    def test_pickle_and_copy(self):
+        book = Book.from_db(book_row(language="en", year="2019", series_sequence=2,
+                                     high_water_progress=0.5, release_date=600000000.0))
+        for clone in (pickle.loads(pickle.dumps(book)), copy.deepcopy(book), copy.copy(book)):
+            assert clone == book
+            assert (clone.year, clone.series_sequence, clone.high_water_progress) == (2019, 2.0, 50.0)
+
+    def test_repr_shows_the_new_fields(self):
+        text = repr(Book.from_db(book_row(language="en", series_label="Book 2")))
+        assert "language='en'" in text and "series_label='Book 2'" in text
+        assert text.endswith("high_water_progress=None)")
+
+
+class TestIsPdf:
+    @pytest.mark.parametrize("content_type, path, expected", [
+        (3, None, True),
+        (3, "/x/book.epub", True),
+        (1, pathlib.Path("/x/Paper.PDF"), True),
+        (1, "/x/paper.pdf", True),
+        (None, b"/x/paper.Pdf", True),
+        (1, "/x/book.epub", False),
+        (1, None, False),
+        (None, None, False),
+        (1, "/x/pdf", False),
+        (1, "/x/book.pdf.epub", False),
+        (1, 42, False),
+        (5, None, False),
+    ], ids=repr)
+    def test_table(self, content_type, path, expected):
+        book = Book.from_db(book_row(content_type=content_type, path=path))
+        assert book.is_pdf is expected
+
+    def test_constant(self):
+        from py_apple_books.models.book import CONTENT_TYPE_PDF
+
+        assert CONTENT_TYPE_PDF == 3
+
+    def test_no_file_access(self, monkeypatch, tmp_path):
+        """A database-only test: no stat, no open."""
+        import os
+
+        def refuse(*args, **kwargs):
+            raise AssertionError("file access")
+
+        book = Book.from_db(book_row(content_type=1, path=str(tmp_path / "missing.pdf")))
+        monkeypatch.setattr(os, "stat", refuse)
+        monkeypatch.setattr(os, "lstat", refuse)
+        assert book.is_pdf is True
+
+
+class TestBookFieldsFromTheLibrary:
+    def test_columns_are_read(self, api, library):
+        container = library.add_book("A Series", data_source=STORE_SERIES,
+                                     content_type=CONTENT_TYPE_SERIES_CONTAINER,
+                                     raw={"ZSERIESISORDERED": 1, "ZSTOREID": "900"})
+        volume = library.add_book("Volume Two", progress=0.25, raw={
+            "ZLANGUAGE": "en", "ZYEAR": "2019", "ZRELEASEDATE": 600000000.0, "ZSERIESID": "900",
+            "ZSERIESCONTAINER": container["id"], "ZSEQUENCENUMBER": 2, "ZSEQUENCEDISPLAYNAME": "Book 2",
+            "ZBOOKHIGHWATERMARKPROGRESS": 0.87})
+        book = api.get_book_by_id(volume["id"])
+        assert (book.language, book.year, book.series_id, book.series_container_id,
+                book.series_sequence, book.series_label) == ("en", 2019, "900", container["id"], 2.0,
+                                                             "Book 2")
+        assert book.release_date == apple_timestamp_to_datetime(600000000.0)
+        assert book.high_water_progress == pytest.approx(87.0)
+        assert book.reading_progress == pytest.approx(25.0)
+        assert api.get_book_by_id(container["id"]).series_is_ordered is True
+
+    def test_fixture_high_water_follows_progress(self, api, library):
+        """FixtureLibrary writes ZBOOKHIGHWATERMARKPROGRESS = progress."""
+        started = library.add_book("Started", progress=0.4)
+        fresh = library.add_book("Fresh", progress=0.0)
+        unknown = library.add_book("Unknown", progress=0.4, raw={"ZBOOKHIGHWATERMARKPROGRESS": None})
+        assert api.get_book_by_id(started["id"]).high_water_progress == pytest.approx(40.0)
+        assert api.get_book_by_id(fresh["id"]).high_water_progress is None
+        assert api.get_book_by_id(unknown["id"]).high_water_progress is None
+
+    def test_filterable(self, library):
+        library.add_book("Other")
+        one = library.add_book("In series", raw={"ZSERIESID": "900", "ZSEQUENCENUMBER": 1})
+        two = library.add_book("Also", raw={"ZSERIESID": "900", "ZSEQUENCENUMBER": 2})
+        assert [b.id for b in Book.manager.filter(series_id="900", order_by="-series_sequence")] == [
+            two["id"], one["id"]]
+        assert Book.manager.filter(high_water_progress__gt=0.5).count() == 0
+
+    def test_garbage_never_fails_a_list(self, api, library):
+        library.add_book("Clean", progress=0.5)
+        # Text columns turn numbers into text, so their garbage is a blob.
+        library.add_book("Garbage", progress=0.5, raw={
+            "ZLANGUAGE": b"en", "ZYEAR": "n/a", "ZRELEASEDATE": "NaN", "ZSERIESID": b"\x00",
+            "ZSERIESCONTAINER": "abc", "ZSEQUENCENUMBER": "x", "ZSEQUENCEDISPLAYNAME": b"\xff",
+            "ZSERIESISORDERED": "maybe", "ZBOOKHIGHWATERMARKPROGRESS": "lots"})
+        books = {b.title: b for b in api.list_books()}
+        assert set(books) == {"Clean", "Garbage"}
+        assert {f: getattr(books["Garbage"], f) for f in BOOK_FIELDS_111} == dict.fromkeys(BOOK_FIELDS_111)
+        assert {b.title for b in api.get_books_in_progress()} == {"Clean", "Garbage"}
+        assert api.get_library_stats().in_progress_books == 2
+
+
+class TestStoreInfo:
+    def test_missing_columns_lists_the_new_fields(self, make_library):
+        lib = make_library()
+        lib.add_book("Book", progress=0.5, raw={"ZLANGUAGE": "en", "ZYEAR": "2019"})
+        for column in BOOK_FIELDS_111.values():
+            # Renamed rather than dropped: two of them are indexed.
+            lib.execute("library", f"ALTER TABLE ZBKLIBRARYASSET RENAME COLUMN {column} TO {column}_GONE")
+        api = PyAppleBooks(data_dir=lib.data_dir)
+        try:
+            info = api.store_info()
+            assert info.missing_columns["Book"] == list(BOOK_FIELDS_111)
+            [book] = api.list_books()
+            assert {f: getattr(book, f) for f in BOOK_FIELDS_111} == dict.fromkeys(BOOK_FIELDS_111)
+        finally:
+            api.close()
+
+    def test_nothing_missing_on_the_full_schema(self, make_library):
+        api = PyAppleBooks(data_dir=make_library().data_dir)
+        try:
+            assert api.store_info().missing_columns == {"Book": [], "Annotation": [], "Collection": []}
+        finally:
+            api.close()
+

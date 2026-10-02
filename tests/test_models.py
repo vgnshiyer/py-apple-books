@@ -7,6 +7,7 @@ so nothing here touches the Apple Books databases.
 
 import configparser
 import copy
+import dataclasses
 import datetime as dt
 import pathlib
 import pickle
@@ -175,6 +176,10 @@ BOOK_KEYS_191 = [
     "is_store_audiobook", "rating",
 ]
 BOOK_KEYS_110 = ["store_id", "data_source", "can_redownload", "state", "last_engaged_date"]
+BOOK_KEYS_111 = [
+    "language", "year", "release_date", "series_id", "series_container_id", "series_sequence",
+    "series_label", "series_is_ordered", "high_water_progress",
+]
 ANNOTATION_KEYS_191 = [
     "id", "asset_id", "is_deleted", "is_underline", "style", "type", "creation_date",
     "modification_date", "selected_text", "representative_text", "note", "location",
@@ -187,10 +192,27 @@ class TestNewFields:
     @pytest.mark.parametrize("model, old, new", [
         (Book, BOOK_KEYS_191, BOOK_KEYS_110),
         (Annotation, ANNOTATION_KEYS_191, ANNOTATION_KEYS_110),
+        (Book, BOOK_KEYS_191 + BOOK_KEYS_110, BOOK_KEYS_111),
     ])
     def test_new_keys_are_appended(self, model, old, new):
         keys = list(model._get_mappings(model.__name__))
         assert keys[:len(old) + len(new)] == old + new
+
+    @pytest.mark.parametrize("model, keys", [
+        (Book, BOOK_KEYS_191 + BOOK_KEYS_110 + BOOK_KEYS_111),
+    ])
+    def test_every_key_is_listed(self, model, keys):
+        """1.11's keys are the last: a later release appends after them."""
+        assert list(model._get_mappings(model.__name__)) == keys
+
+    @pytest.mark.parametrize("model, keys", [
+        (Book, BOOK_KEYS_110 + BOOK_KEYS_111),
+    ])
+    def test_new_fields_are_last_and_defaulted(self, model, keys):
+        """Positional construction with the 1.9.1 fields keeps working."""
+        fields = [f for f in dataclasses.fields(model) if f.init]
+        assert [f.name for f in fields][-len(keys):] == keys
+        assert all(f.default is None for f in fields[-len(keys):])
 
     def test_purchaser_account_id_is_not_mapped(self):
         """ZPURCHASEDDSID identifies an Apple account; never read it."""
