@@ -85,6 +85,11 @@ _BUSY_MESSAGE = (
     "nothing was changed. Try again in a moment."
 )
 
+_INVALID_TEXT_MESSAGE = (
+    "Some text this write needs to read in the Books library database isn't valid UTF-8; "
+    "nothing was changed."
+)
+
 #: Books assigns sidebar / in-collection order in multiples of 10000.
 SORT_KEY_STEP = 10000
 
@@ -144,6 +149,40 @@ _VERIFIED_MODEL_HASHES = {
     _COLLECTION_ENTITY: frozenset({"SNZFrt9vtP7OHwxpdgQvjG0aDQCjcaPKMvV4xi2f4wY="}),
     _MEMBER_ENTITY: frozenset({"iyiO3gHrQVAI21IxwV8Cp2jsmVbWVAixNI4/dJrLPnc="}),
 }
+
+
+def _strict_text(value: bytes) -> str:
+    """``text_factory`` of write sessions: text decoded as sqlite3 does
+    by default, except that invalid UTF-8 raises a :class:`WriteError`
+    that quotes nothing (sqlite3's own error quotes the cell). A
+    backstop: the writes read the text they handle as bytes (see
+    :func:`_fetch_collection`) or leave it to SQL."""
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    # Out of the except block: the UnicodeDecodeError holds the bytes.
+    # And not in this frame, which the WriteError's traceback keeps: a
+    # tool showing frame locals would show them.
+    del value
+    raise WriteError(_INVALID_TEXT_MESSAGE)
+
+
+def _as_bytes(column: str) -> str:
+    """SQL reading ``column`` with text as its bytes (other values as
+    they are), so that invalid UTF-8 can be read."""
+    return f"CASE WHEN typeof({column}) = 'text' THEN CAST({column} AS BLOB) ELSE {column} END"
+
+
+def _decoded(kind: str, value):
+    """``value`` read by :func:`_as_bytes`, of SQLite type ``kind``: text
+    as ``str`` with U+FFFD for invalid UTF-8; anything else unchanged."""
+    return value.decode("utf-8", "replace") if kind == "text" else value
+
+
+# The library asset's ZASSETID, for comparing and copying it inside SQL
+# without reading it: invalid UTF-8 in it is copied as is.
+_ASSET_ID_OF = f"(SELECT ZASSETID FROM {_ASSET_TABLE} WHERE Z_PK = ?)"
 
 
 def _cd_now() -> float:
@@ -273,6 +312,12 @@ class WriteSession:
     read-only); a commit that fails raises :class:`LibraryBusyError`
     (blocked past :data:`BUSY_TIMEOUT`) or :class:`WriteError`. In each
     case nothing was changed.
+
+    ``conn`` reads text as sqlite3 does by default, except that a value
+    that isn't valid UTF-8 raises :class:`WriteError` (quoting nothing),
+    which rolls the transaction back. Entering reads with it too: store
+    metadata that isn't valid UTF-8 refuses the write, unless the model
+    check is ``'off'``.
     """
 
     def __init__(
@@ -326,7 +371,7 @@ class WriteSession:
         # the transaction explicitly. timeout is SQLite's busy timeout:
         # either we get the write lock promptly or we abort.
         try:
-            return sqlite3.connect(
+            conn = sqlite3.connect(
                 f"file:{quote(str(self.db_path))}?mode=rw", uri=True,
                 timeout=BUSY_TIMEOUT, isolation_level=None,
             )
@@ -336,6 +381,8 @@ class WriteSession:
                 f"Can't open the library store {self.db_path.name} for writing "
                 f"({reason}); nothing was changed."
             ) from e
+        conn.text_factory = _strict_text
+        return conn
 
     def _store_error(self, e: sqlite3.Error, holder: str = "reading") -> WriteError:
         """The error to raise for SQLite refusing the write for the
@@ -435,14 +482,22 @@ def _allocate_pk(cur: sqlite3.Cursor, entity_name: str, table: str) -> tuple[int
 
 
 def _fetch_collection(cur: sqlite3.Cursor, collection_id) -> tuple:
+    """``(pk, sentinel, title)`` of a collection that isn't deleted.
+
+    ``ZCOLLECTIONID`` and ``ZTITLE`` are read as bytes and decoded with
+    U+FFFD for invalid UTF-8: they are only checked and quoted, so text
+    that isn't valid UTF-8 doesn't stop a write.
+    """
     row = cur.execute(
-        f"SELECT Z_PK, ZCOLLECTIONID, ZTITLE, ZDELETEDFLAG "
+        f"SELECT Z_PK, typeof(ZCOLLECTIONID), {_as_bytes('ZCOLLECTIONID')}, "
+        f"typeof(ZTITLE), {_as_bytes('ZTITLE')}, ZDELETEDFLAG "
         f"FROM {_COLLECTION_TABLE} WHERE Z_PK = ?",
         (collection_id,),
     ).fetchone()
     if row is None:
         raise CollectionNotFoundError(f"No collection with id {collection_id}.")
-    pk, sentinel, title, deleted = row
+    pk, sentinel_kind, sentinel, title_kind, title, deleted = row
+    sentinel, title = _decoded(sentinel_kind, sentinel), _decoded(title_kind, title)
     if deleted:
         raise CollectionNotFoundError(
             f"Collection {collection_id} ({title!r}) has been deleted."
@@ -568,21 +623,21 @@ def add_book_to_collection(collection_id, book_id, **session_kwargs) -> bool:
         _ensure_editable(sentinel, title, membership=True)
 
         book_row = cur.execute(
-            f"SELECT Z_PK, ZASSETID FROM {_ASSET_TABLE} WHERE Z_PK = ?",
+            f"SELECT Z_PK, ZASSETID IS NULL FROM {_ASSET_TABLE} WHERE Z_PK = ?",
             (book_id,),
         ).fetchone()
         if book_row is None:
             raise BookNotFoundError(f"No book with id {book_id}.")
-        asset_pk, asset_id = book_row
-        if asset_id is None:
+        asset_pk, no_asset_id = book_row
+        if no_asset_id:
             raise WriteError(
                 f"Book {book_id} has no asset id — cannot create a "
                 "sync-stable membership row."
             )
 
         duplicate = cur.execute(
-            f"SELECT 1 FROM {_MEMBER_TABLE} WHERE ZCOLLECTION = ? AND ZASSETID = ?",
-            (pk, asset_id),
+            f"SELECT 1 FROM {_MEMBER_TABLE} WHERE ZCOLLECTION = ? AND ZASSETID = {_ASSET_ID_OF}",
+            (pk, asset_pk),
         ).fetchone()
         if duplicate:
             return False
@@ -599,8 +654,8 @@ def add_book_to_collection(collection_id, book_id, **session_kwargs) -> bool:
             f"INSERT INTO {_MEMBER_TABLE} "
             "(Z_PK, Z_ENT, Z_OPT, ZSORTKEY, ZASSET, ZCOLLECTION, "
             " ZLOCALMODDATE, ZASSETID, ZTEMPORARYASSETID) "
-            "VALUES (?, ?, 1, ?, ?, ?, ?, ?, NULL)",
-            (member_pk, z_ent, sort_key, asset_pk, pk, now, asset_id),
+            f"VALUES (?, ?, 1, ?, ?, ?, ?, {_ASSET_ID_OF}, NULL)",
+            (member_pk, z_ent, sort_key, asset_pk, pk, now, asset_pk),
         )
         _touch_collection(cur, pk, now)
         return True
@@ -615,16 +670,16 @@ def remove_book_from_collection(collection_id, book_id, **session_kwargs) -> boo
         _ensure_editable(sentinel, title, membership=True)
 
         book_row = cur.execute(
-            f"SELECT ZASSETID FROM {_ASSET_TABLE} WHERE Z_PK = ?",
+            f"SELECT Z_PK FROM {_ASSET_TABLE} WHERE Z_PK = ?",
             (book_id,),
         ).fetchone()
         if book_row is None:
             raise BookNotFoundError(f"No book with id {book_id}.")
-        (asset_id,) = book_row
+        (asset_pk,) = book_row
 
         cur.execute(
-            f"DELETE FROM {_MEMBER_TABLE} WHERE ZCOLLECTION = ? AND ZASSETID = ?",
-            (pk, asset_id),
+            f"DELETE FROM {_MEMBER_TABLE} WHERE ZCOLLECTION = ? AND ZASSETID = {_ASSET_ID_OF}",
+            (pk, asset_pk),
         )
         changed = cur.rowcount > 0
         if changed:
