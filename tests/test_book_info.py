@@ -771,6 +771,25 @@ def test_close_drops_the_memo(three, reader, spy):
     assert spy.files() == [cache_name(V10)]
 
 
+@pytest.mark.parametrize("name", ["a?mode=rwc&x=", "b#frag", "c%41d", "d é space", "e&immutable=0"])
+def test_uri_syntax_in_the_folder_name_stays_a_path(tmp_path, spy, name):
+    # Percent-encoding keeps a folder name from adding URI parameters
+    # (mode=rwc, immutable) or cutting the path short.
+    lib = FixtureLibrary(tmp_path / name)
+    closed = lib.add_book_info_cache([{"asset_id": "A", "title": "wal"}], version=V0)
+    journal = lib.add_book_info_cache([{"asset_id": "B", "title": "journal"}], version=V7, journal_mode="DELETE")
+    before = cases.listing(lib.book_info_dir)
+    api = PyAppleBooks(lib.data_dir)
+    try:
+        got = api.get_cached_book_info(["A", "B"])
+    finally:
+        api.close()
+    assert {k: v.title for k, v in got.items()} == {"A": "wal", "B": "journal"}
+    uris = {unquote(uri[len("file:"):].split("?", 1)[0]): uri.split("?", 1)[1] for uri in spy.uris}
+    assert uris == {str(journal): "mode=ro", str(closed): "mode=ro&immutable=1"}
+    assert cases.listing(lib.book_info_dir) == before
+
+
 def test_the_index_holds_no_library(three, reader):
     reader.get_cached_book_info("A")
     index = index_of(reader)
