@@ -14,6 +14,7 @@ from py_apple_books import PyAppleBooks, _icloud, _opf
 from py_apple_books.db import LibraryDB, use_library
 from py_apple_books.exceptions import InvalidArgumentError, QueryTimeoutError
 from py_apple_books.testing import STORE_SERIES, write_epub_bundle
+from tests import _fs_audit
 
 CONTAINER = ('<?xml version="1.0"?><container version="1.0" '
              'xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles>'
@@ -143,6 +144,31 @@ class TestScope:
         assert lib.ids("evicted") == []
         assert "content.opf" not in opened and evicted
 
+    def test_skipped_books_get_no_file_or_process_event(self, lib, monkeypatch):
+        """The audit hook's view (R13): a book stored only in iCloud
+        (ZSTATE 3), a PDF and a bundle whose folder is an iCloud
+        placeholder are never opened or listed, and the scan starts no
+        process (no du)."""
+        cloud = lib.book(subjects=["Hidden"], state=3)
+        pdf_path = lib.root / "doc.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4")
+        lib.book(path=pdf_path)
+        evicted = lib.book(subjects=["Hidden"])
+        shown = lib.book(genre="Hidden")  # matched by its genre, no file
+        cloud_path, evicted_path = (os.fsdecode(lib.api.get_book_by_id(i).path) for i in (cloud, evicted))
+        real_stat = os.stat
+        monkeypatch.setattr(_icloud, "stat", lambda p: _dataless(real_stat(p)) if os.fspath(p) == evicted_path
+                            else real_stat(p))
+        with _fs_audit.record() as rec:
+            assert lib.ids("hidden") == [shown]
+        for path in (cloud_path, evicted_path, pdf_path):
+            assert not rec.under(path, "open", "os.scandir", "os.listdir"), path
+        # Nothing inside a bundle either (a walk opens entries by name).
+        names = {os.path.basename(os.fsdecode(e.args[0])) for e in rec.of("open", "os.scandir", "os.listdir")
+                 if e.args and isinstance(e.args[0], (str, bytes))}
+        assert not names & {"META-INF", "container.xml", "OEBPS", "content.opf"}, names
+        assert not rec.of(*_fs_audit.PROCESS_EVENTS)
+
     def test_path_stored_as_bytes(self, lib):
         """A ZPATH BLOB is read like the same path stored as text, and
         shares its subject-index entry."""
@@ -158,6 +184,14 @@ class TestScope:
         lib.book(subjects=["Local"])
         monkeypatch.setattr(content, "is_downloaded", lambda path: pytest.fail("is_downloaded called"))
         assert len(lib.ids("local")) == 1
+
+
+def _dataless(st):
+    from types import SimpleNamespace
+
+    values = {name: getattr(st, name) for name in dir(st) if name.startswith("st_")}
+    values["st_flags"] = _icloud.SF_DATALESS
+    return SimpleNamespace(**values)
 
 
 def _blocks0(st):
