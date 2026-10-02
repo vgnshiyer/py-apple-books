@@ -248,6 +248,8 @@ def test_out_of_order_toc_follows_the_reading_order(tmp_path):
         assert content.get_chapter("3", span=span) == "a text."
         assert content.get_chapter("4", span=span) == "X\n\nx text."
         assert content.get_chapter("2", span=span) == "Y\n\ny text."
+        # A manifest id: an entry at the very start of its file doesn't end it.
+        assert content.get_chapter("b", span=span) == "X\n\nx text."
 
 
 def test_named_anchors(tmp_path):
