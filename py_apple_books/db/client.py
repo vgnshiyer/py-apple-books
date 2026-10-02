@@ -641,6 +641,11 @@ class LibraryDB:
         # Set (for good, forks included) once a query met text that
         # isn't valid UTF-8: pooled queries then decode with U+FFFD.
         self._lenient_text = False
+        # Objects derived from this library (_derived_cache), by key. A
+        # forked child sets its parents' aside in _derived_inherited:
+        # kept referenced, never used or discarded.
+        self._derived: dict = {}
+        self._derived_inherited: list = []
 
     def __repr__(self) -> str:
         if not self._explicit:
@@ -783,6 +788,8 @@ class LibraryDB:
             self._pid = pid
             self._inherited = self._inherited + self._idle
             self._idle = []
+            self._derived_inherited = self._derived_inherited + list(self._derived.values())
+            self._derived = {}
             self._lock = threading.RLock()
             self._slots = _Slots(self.max_connections)
             self._generation += 1
@@ -989,18 +996,55 @@ class LibraryDB:
             self._release(pooled, slots)
 
     def close(self) -> None:
-        """Close the idle connections and forget the store paths and
-        schema. Connections checked out now are closed when returned.
-        The library stays usable; it reconnects on the next query."""
+        """Close the idle connections and forget the store paths, the
+        schema and what was derived from the stores. Connections checked
+        out now are closed when returned. The library stays usable; it
+        reconnects on the next query."""
         self._check_fork()
         with self._lock:
             idle, self._idle = self._idle, []
+            derived, self._derived = self._derived, {}
             self._paths = self._paths_expire = self._annotations_attempt = None
             self._schema = None
             self._verified = (None, 0.0)
             self._generation += 1
         for pooled in idle:
             _close_quietly(pooled.conn)
+        # Outside the lock: a discard() that blocks, against its
+        # contract, holds up this call only.
+        for obj in derived.values():
+            _discard_quietly(obj)
+
+    def _derived_cache(self, key: str, factory: Callable[[], _T]) -> _T:
+        """The object derived from this library under ``key``: the one
+        held, or a new one from ``factory()`` if there is none or the one
+        held is ``dead``.
+
+        A slot for per-library state built from the stores (an
+        annotation search index, a book-info memo) that :meth:`close`
+        and a fork must drop. The contract:
+
+        - ``factory()`` is O(1) and does no I/O: it runs under this
+          library's lock, which is held for the lookup and insert only.
+          The object does its work (queries, builds) later, under its
+          own locks; it parses no book file under this library's lock.
+        - The object has a ``dead`` property, true once it must not be
+          used (discarded, or in a forked child), and a ``discard()``
+          that never blocks: it marks the object dead and leaves the
+          release of what it holds to its last user. :meth:`close` calls
+          it, outside this library's lock, on every object it held.
+        - In a forked child the parent's objects are set aside, kept
+          referenced and never used or discarded (they may hold the
+          parent's connections); the child makes its own.
+        - The object keeps no reference to this library (it is passed in
+          per call), so a dropped library is still collected.
+        """
+        self._check_fork()
+        with self._lock:
+            obj = self._derived.get(key)
+            if obj is None or obj.dead:
+                obj = self._derived[key] = factory()
+            return obj
 
     # -- execution --------------------------------------------------------
 
@@ -1204,6 +1248,15 @@ def _close_quietly(conn: sqlite3.Connection) -> None:
         conn.close()
     except Exception:
         pass
+
+
+def _discard_quietly(obj) -> None:
+    """``obj.discard()`` (see :meth:`LibraryDB._derived_cache`); a failure
+    is logged at DEBUG by type only."""
+    try:
+        obj.discard()
+    except Exception as e:
+        logger.debug("discarding a derived %s failed: %s", type(obj).__name__, type(e).__name__)
 
 
 # -- the library in use -------------------------------------------------------
