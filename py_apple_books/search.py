@@ -319,7 +319,8 @@ def _plan(query) -> Optional[_Plan]:
 
 
 class _Dead(Exception):
-    """Internal: the index belongs to another process; get a new one."""
+    """Internal: the index was discarded, or belongs to another process;
+    get a new one."""
 
 
 def _timeout(what: str, limit: Optional[float]) -> QueryTimeoutError:
@@ -465,8 +466,9 @@ class AnnotationIndex:
     that a caller's deadline stops is continued by the next caller.
 
     ``discard()`` never blocks: it stops new use, and the last search
-    inside closes the databases. In a forked child the index is never
-    used (``dead``); the library makes a new one.
+    inside closes the databases (a search already inside finishes on
+    them, a build included). In a forked child the index is never used
+    (``dead``); the library makes a new one.
     """
 
     def __init__(self):
@@ -513,8 +515,9 @@ class AnnotationIndex:
             _close_quietly(gen.conn)
 
     def discard(self) -> None:
-        """Stop new searches from entering; close the databases now if no
-        search is inside, else when the last one leaves. Never blocks."""
+        """Stop new searches from entering (they raise ``_Dead`` and take
+        the library's new index); close the databases now if no search is
+        inside, else when the last one leaves. Never blocks."""
         with self._state:
             self._dead = True
             conns = self._detach_all() if self._inside == 0 else []
@@ -736,14 +739,19 @@ class AnnotationIndex:
     # -- search ---------------------------------------------------------------
 
     def search(self, db: "LibraryDB", plan: _Plan, *, asset_id=None, include_deleted: bool = False,
-               require_all: bool = False) -> List[tuple]:
+               require_all: bool = False, if_discarded: bool = False) -> List[tuple]:
         """``[(annotation id, score, matched_all, method)]``, best first.
 
-        :raises _Dead: the index belongs to another process.
+        :param if_discarded: search even if ``discard()`` was called (the
+            databases are then closed when the search leaves).
+        :raises _Dead: the index belongs to another process, or was
+            discarded (unless ``if_discarded``).
         """
         if os.getpid() != self._pid:
             raise _Dead
         with self._state:
+            if self._dead and not if_discarded:
+                raise _Dead
             self._inside += 1
         try:
             gen = self._pin_fresh(db)
@@ -831,10 +839,15 @@ def _query(conn: sqlite3.Connection, fts: Optional[str], plan: _Plan, asset_id,
 
 
 def _index_hits(db: "LibraryDB", plan: _Plan, **kwargs) -> Tuple[AnnotationIndex, List[tuple]]:
-    for _ in range(3):
+    """The library's index and the hits of ``plan`` in it. An index
+    discarded by ``close()`` once the call got it is replaced by the
+    library's new one; the last attempt uses it anyway, so repeated
+    closes don't fail the search."""
+    attempts = 3
+    for attempt in range(attempts):
         index = db._derived_cache(_INDEX_KEY, AnnotationIndex)
         try:
-            return index, index.search(db, plan, **kwargs)
+            return index, index.search(db, plan, if_discarded=attempt == attempts - 1, **kwargs)
         except _Dead:
             continue
     raise DBQueryError(_FAILED)

@@ -368,6 +368,31 @@ def test_close_never_waits_for_or_aborts_a_build(db, paused_build):
     assert len(ranked(db, limit=None)) == 200 and index_of(db) is not index
 
 
+def test_a_discarded_index_takes_no_new_search(db, monkeypatch):
+    """A search holding the index from before close() moves to the
+    library's new one rather than build the closed one again."""
+    assert len(ranked(db, limit=None)) == 200
+    index = index_of(db)
+    db.close()
+    with pytest.raises(search._Dead):
+        index.search(db, search._plan(QUERY))
+    assert index.builds == 1 and index._ready is None
+    real, handed = db._derived_cache, []
+
+    def derived_cache(key, factory):
+        if not handed:  # the first lookup returns the closed index
+            handed.append(index)
+            return index
+        return real(key, factory)
+
+    monkeypatch.setattr(db, "_derived_cache", derived_cache)
+    assert len(ranked(db, limit=None)) == 200
+    assert handed and index_of(db) is not index and index.builds == 1
+    # The last attempt of a call searches a closed index rather than fail.
+    assert len(index.search(db, search._plan(QUERY), if_discarded=True)) == 200
+    assert index.builds == 2 and index._ready is None and index._inside == 0
+
+
 def test_a_dropped_index_closes_its_database(db):
     ranked(db)
     index = index_of(db)
