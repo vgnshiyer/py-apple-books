@@ -9,17 +9,45 @@ search and multi-word book search (new in 1.11).
 See ``py_apple_books._api`` for the rules mixin code follows.
 """
 
-import functools
-import operator
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 from py_apple_books._api._common import _book_arg, _book_scope, strict_limit, strict_offset
-from py_apple_books.db.clause import Q, _text
+from py_apple_books.db.clause import Clause, Not, Q, Where, WhereGroup, _text
 from py_apple_books.db.client import current_library
 from py_apple_books.models.book import Book
 from py_apple_books.models.manager import ModelIterable
 from py_apple_books.search import _MAX_TERMS, AnnotationHit, _plan, _search_annotations
 from py_apple_books.text import fold_for_match
+
+# Apple Books' placeholder for a book without an author (a Private Use
+# Area glyph, then ASCII letters only: U+E83A + 'UnknownAuthor'), as GLOB
+# patterns: both hold exactly for a fullmatch of
+# models.book._UNKNOWN_AUTHOR_PLACEHOLDER, which Book reads as None.
+_PLACEHOLDER_GLOB = "[\ue000-\uf8ff][A-Za-z]*"
+_NOT_ONLY_LETTERS_GLOB = "?*[^A-Za-z]*"
+
+
+def _title_or_author() -> Callable[[object], Clause]:
+    """A function of ``value``: the clause for ``value`` (``__search``) in
+    the title or the author of a book.
+
+    The author is searched as :class:`Book` shows it: Apple Books'
+    unknown-author placeholder is no author (its letters would match
+    'thor', 'now', 'author', ...). Only titles where the store has no
+    author column.
+    """
+    manager = Book.manager
+    if not manager.has_fields("author"):
+        return lambda value: Q(title__search=value).resolve(manager)
+    column = manager._get_db_field("author")
+    real_author = Not(WhereGroup([Where(column, _PLACEHOLDER_GLOB, "GLOB"),
+                                  Where(column, _NOT_ONLY_LETTERS_GLOB, "NOT GLOB")]))
+
+    def terms(value) -> Clause:
+        return WhereGroup([Q(title__search=value).resolve(manager),
+                           WhereGroup([Q(author__search=value).resolve(manager), real_author])], "OR")
+
+    return terms
 
 
 class _SearchAPI:
@@ -115,8 +143,10 @@ class _SearchAPI:
         The query is folded, then split at spaces; at most 32 distinct
         words are used. Word order doesn't matter, and a word may be part
         of a longer one. '' matches every book with a title or an author;
-        a query whose characters all fold away matches none. Where the
-        store has no author column, only titles are searched. One SQL
+        a query whose characters all fold away matches none. The author
+        is the one :attr:`Book.author` shows: a book Apple Books lists as
+        "Unknown Author" has none. Where the store has no author column,
+        only titles are searched. One SQL
         statement, unordered (storage order) by default, as the other
         book searches.
 
@@ -125,21 +155,17 @@ class _SearchAPI:
         """
         limit = strict_limit(limit)
         offset = strict_offset(offset)
-        fields = ("title", "author") if Book.manager.has_fields("author") else ("title",)
-
-        def any_field(value) -> Q:
-            return functools.reduce(operator.or_, (Q(**{f"{field}__search": value}) for field in fields))
-
+        terms = _title_or_author()
         folded = fold_for_match(_text(query))
         words = list(dict.fromkeys(word for word in (folded or "").split(" ") if word))[:_MAX_TERMS]
         if words:
-            where = functools.reduce(operator.and_, (any_field(word) for word in words))
+            where = WhereGroup([terms(word) for word in words])
         else:
             # '', whitespace, or characters that fold away: the query as
             # given, under the __search lookup's own rules.
-            where = any_field(query)
+            where = terms(query)
         scope = _book_scope(include_store_series)
         owned = scope.pop("where", None)
         if owned is not None:
-            where = owned & where
+            where = WhereGroup([owned.resolve(Book.manager), where])
         return Book.manager.filter(where=where, **scope, limit=limit, order_by=order_by, offset=offset)

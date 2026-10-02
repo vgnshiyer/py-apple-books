@@ -72,6 +72,9 @@ def mcp09(api, query) -> list:
 
 # -- fixtures --------------------------------------------------------------------
 
+# Apple Books' author of a book without one (Book.author reads None).
+PLACEHOLDER = "\ue83aUnknownAuthor"
+
 BOOKS = [
     ("The Lantern and me", "Q. R. Ostrander"),
     ("x y", "Anon"),
@@ -84,6 +87,8 @@ BOOKS = [
     ("Lantern Tales", "Another Ostrander"),
     (None, "Untitled Author"),
     ("Naïve Café", "Zoë Q"),
+    ("Quiet Garden Notes", PLACEHOLDER),
+    ("Glyph Names", "\ue83aBob Smith"),  # a real author: not only letters after the glyph
 ]
 
 
@@ -91,6 +96,7 @@ BOOKS = [
 def lib(make_library):
     lib = make_library()
     lib.ids = {title: lib.add_book(title, author)["id"] for title, author in BOOKS}
+    lib.anonymous = lib.add_book(None, PLACEHOLDER)["id"]  # neither a title nor an author
     lib.series = lib.add_book("Series Lantern Volume", "Q. R. Ostrander", data_source=STORE_SERIES)["id"]
     lib.container = lib.add_book("Lantern Series", "Q. R. Ostrander", data_source=STORE_SERIES,
                                  content_type=5)["id"]
@@ -144,6 +150,7 @@ class TestMatching:
     def test_empty_whitespace_and_folded_away(self, lib, books):
         everything = sorted(lib.ids.values())
         assert found(books, "") == everything  # every book with a title or an author
+        assert lib.anonymous not in everything
         # Whitespace: every book whose title or author has a space.
         spaced = sorted(lib.ids[t] for t, a in BOOKS if " " in (t or "") or " " in (a or ""))
         assert found(books, "   ") == spaced and len(spaced) < len(everything)
@@ -165,7 +172,8 @@ class TestMatching:
 # -- parity with apple-books-mcp 0.9 --------------------------------------------------
 
 EXACT = ["lantern", "gorel", "don't", "-one", "finding", "strasse", "50%", "c++", "_", "%", "author",
-         "", "   ", "\u200b", "´", "x", "e", "ostrander"]
+         "", "   ", "\u200b", "´", "x", "e", "ostrander", "unknown", "thor", "now", "no", "unknownauthor",
+         PLACEHOLDER, "\ue83a", "bob", "\ue83abob smith", "quiet"]
 SUPERSET = ["lantern \u200b", "lantern \u0301", "lantern ´", "x ¨", " lantern", "lantern ostrander", "gorel bakh",
             "the lantern", "esker, bakh"]
 
@@ -204,6 +212,38 @@ class TestParityWithMcp09:
             chars = text[cut:cut + rng.randint(1, 8)]
             for query in (window, chars):
                 assert set(found(books, query)) >= set(mcp09(books, query)), query
+
+
+class TestUnknownAuthor:
+    """Apple Books' unknown-author placeholder is no author, as in Book
+    (and so in apple-books-mcp 0.9's filter)."""
+
+    def test_the_placeholder_is_not_searched(self, lib, books):
+        quiet = lib.ids["Quiet Garden Notes"]
+        assert books.get_book_by_id(quiet).author is None
+        for query in ("unknown", "author", "thor", "now", "known", "unknownauthor", PLACEHOLDER,
+                      "quiet unknown"):
+            assert quiet not in found(books, query), query
+            assert lib.anonymous not in found(books, query, include_store_series=True), query
+        assert found(books, "quiet garden notes") == [quiet]
+        assert lib.anonymous not in found(books, "", include_store_series=True)
+
+    def test_a_real_author_after_a_private_use_glyph_is_searched(self, lib, books):
+        glyph = lib.ids["Glyph Names"]
+        assert books.get_book_by_id(glyph).author == "\ue83aBob Smith"
+        assert found(books, "smith") == [glyph]
+        assert found(books, "bob glyph") == [glyph]
+        assert found(books, "\ue83abob") == [glyph]
+        for author in ("\ue83aBob1", "\ue83aBöb", "\ue83a", "\ue83aBob\n", "UnknownAuthor"):
+            book = lib.add_book(None, author)["id"]
+            assert book in found(books, ""), repr(author)
+        assert found(books, "unknownauthor") == [book]
+
+    def test_without_the_author_column(self, lib, books):
+        lib.execute("library", "ALTER TABLE ZBKLIBRARYASSET DROP COLUMN ZAUTHOR")
+        books.close()
+        assert found(books, "quiet") == [lib.ids["Quiet Garden Notes"]]
+        assert found(books, "unknown") == []
 
 
 # -- scope, paging, statements, drift --------------------------------------------------
