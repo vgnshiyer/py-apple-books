@@ -124,6 +124,16 @@ class TestContext:
         assert (ctx.chapter.title, ctx.match) == ("One", ChapterMatch.FILE)
         assert str(ctx) == api.get_annotation_surrounding_text(aid, 2, 0)
 
+    def test_non_text_hint_outside_the_spine_falls_back_to_the_step(self, api, library, tmp_path):
+        bundle = write_epub_bundle(
+            tmp_path / "Pic.epub",
+            [("c1", p("The quick brown fox.")),
+             ("pic", b"\x89PNG", {"raw": True, "href": "pic.png", "media_type": "image/png", "in_spine": False})],
+            toc=[("One", "c1.xhtml")])
+        aid = add(library, library.add_book("Pic", path=str(bundle)), "quick brown", "epubcfi(/6/2[pic]!/4/2/1:4)")
+        ctx = api.get_annotation_context(aid, 0, 0)
+        assert (ctx.item_id, ctx.spine_index, ctx.highlight, ctx.chapter.title) == ("c1", 0, "quick brown", "One")
+
 
 class TestTiers:
     @pytest.mark.parametrize("text, tier, highlight", [

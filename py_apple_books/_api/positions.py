@@ -571,11 +571,15 @@ class _PositionsAPI:
         target = _target_of(location)
         resolved = boundaries.resolve(target)
         hint = location.chapter_id
+        from py_apple_books.content import _is_text_media_type
+
         if (hint and hint in index.manifest
-                and boundaries.spine_position(_Target(None, hint, None)) is None):
+                and boundaries.spine_position(_Target(None, hint, None)) is None
+                and (resolved is None or _is_text_media_type(index.manifest[hint][1]))):
             # A hint naming a manifest document outside the spine: read
             # as 1.10 read it (its whole file), whatever the spine step
-            # names; the chapter is where resolve() places the location.
+            # names (unless it isn't text and the step names a file); the
+            # chapter is where resolve() places the location.
             item_id, spine_index = hint, None
             chapter, match = (resolved.chapter, resolved.match) if resolved is not None else (None, None)
         elif resolved is not None:
