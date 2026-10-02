@@ -11,10 +11,10 @@ installed. Checks:
   tree (including py.typed and models/mappings.ini), and no tests,
   __pycache__, bytecode or .DS_Store.
 - METADATA declares ``Requires-Python: >=3.10`` and depends
-  unconditionally on exactly ebooklib and beautifulsoup4. The only
-  other requirement allowed is one ``extra == "pdf"`` entry on
-  pyobjc-framework-Quartz (the optional PDF support), with
-  ``Provides-Extra: pdf``.
+  unconditionally on exactly ebooklib and beautifulsoup4. Each extra in
+  ``EXTRAS`` may add one requirement, on its one distribution, declared
+  in ``Provides-Extra``; 1.11 has none (the planned ``pdf`` extra moved
+  to a later release), so no other requirement is allowed.
 - The sdist carries the test suite and no junk.
 
 ``--baseline-wheel`` takes the previous release's wheel (``pip download
@@ -51,14 +51,15 @@ REQUIRED_WHEEL_FILES = [
 REQUIRES_PYTHON = '>=3.10'
 # Unconditional requirements.
 REQUIRES_DIST = {'ebooklib', 'beautifulsoup4'}
-# Optional extras: {extra: the one distribution it may require}.
-EXTRAS = {'pdf': 'pyobjc-framework-quartz'}
+# Optional extras: {extra: the one distribution it may require}. Empty
+# in 1.11: the optional PDF support (``pdf``, on pyobjc-framework-Quartz)
+# moved to a later release, so the wheel must declare no extra.
+EXTRAS = {}
 
-# Package files 1.11 may add on top of the 1.10.0 wheel: the full
-# planned list, registered once so feature streams don't edit this
-# file. (B) marks Tier B files; the release stream drops the entries of
-# any that slipped to 1.12. fnmatch's '*' also matches '/', so
-# 'testing/*' covers subdirectories.
+# Package files 1.11 adds on top of the 1.10.0 wheel. The plan's Tier B
+# files that moved to a later release (_cfi.py, _pdf_worker.py,
+# _pdf_runner.py, pdf.py) are left out, so a stray copy fails the check.
+# fnmatch's '*' also matches '/', so 'testing/*' covers subdirectories.
 ADDED_ALLOWED = [
     'py_apple_books/_icloud.py',
     'py_apple_books/_messages.py',
@@ -66,16 +67,12 @@ ADDED_ALLOWED = [
     'py_apple_books/_content_resolve.py',
     'py_apple_books/_content_reading.py',
     'py_apple_books/_spans.py',
-    'py_apple_books/_cfi.py',  # (B)
     'py_apple_books/_opf.py',
-    'py_apple_books/_prefs.py',  # (B)
-    'py_apple_books/_pdf_worker.py',  # (B)
-    'py_apple_books/_pdf_runner.py',  # (B)
+    'py_apple_books/_prefs.py',
     'py_apple_books/positions.py',
     'py_apple_books/search.py',
     'py_apple_books/engagement.py',
     'py_apple_books/book_info.py',
-    'py_apple_books/pdf.py',  # (B)
     'py_apple_books/_api/*',
     'py_apple_books/models/book_metadata.py',
     'py_apple_books/models/series.py',
