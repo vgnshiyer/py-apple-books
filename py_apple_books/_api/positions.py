@@ -309,12 +309,14 @@ class _PositionsAPI:
             file is touched (``spine_index`` and ``item_id`` are then
             those the CFI records).
         :param infer: Fall back to the newest located annotation (tier 3).
-        :return: The position, or None when nothing records one, or the
-            annotation store lacks the columns positions are read from.
-            At most three queries (two when given a :class:`Book`).
+        :return: The position, or None when nothing records one, or when
+            the annotation store is missing or lacks a column positions
+            are read from (asset id, type, location, deleted flag). At
+            most three queries (two when given a :class:`Book` read from
+            this library).
         :raises BookNotFoundError: no book has that id.
-        :raises AnnotationStoreNotFoundError: there is no annotation
-            store.
+        :raises UnsupportedSchemaError: the library store lacks a column
+            the book is looked up by.
         """
         needs = ("asset_id", "path", "content_type") + (("state",) if resolve_chapter else ())
         book = _book_arg(book_id, needs=needs, get_book=self.get_book_by_id)
