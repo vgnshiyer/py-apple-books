@@ -1059,13 +1059,17 @@ def _container_at(base: pathlib.Path) -> FixtureLibrary:
 
 
 def _assert_not_read(data_dir, spy):
+    """A lookup in the library at ``data_dir`` gives ``{}`` without
+    listing, opening or connecting to anything in its cache folder
+    (as given or resolved)."""
+    folder = pathlib.Path(data_dir).parent / book_info._FOLDER
     api = PyAppleBooks(data_dir)
     try:
         with _fs_audit.record() as rec:
             assert api.get_cached_book_info("A") == {}
     finally:
         api.close()
-    assert not rec.of("os.listdir", "os.scandir") and spy.uris == []
+    assert rec.under(folder) == [] and spy.uris == []
 
 
 @pytest.mark.parametrize("cloud", ["Mobile Documents", "com~apple~CloudDocs", "CloudStorage", "mobile documents"])
@@ -1081,12 +1085,51 @@ def test_folder_resolving_into_cloud_storage_is_never_listed(tmp_path, spy):
     _assert_not_read(FixtureLibrary(link).data_dir, spy)
 
 
+@pytest.mark.parametrize("cloud", ["Mobile Documents", "CloudStorage"])
+def test_folder_named_as_cloud_storage_is_never_looked_up(tmp_path, spy, monkeypatch, cloud):
+    # A path through a folder named as iCloud Drive or cloud storage is
+    # refused as given, before any lookup, even when that folder is a
+    # symlink to an ordinary one (resolved, the path names no cloud).
+    _container_at(tmp_path / "local" / "x")
+    link = tmp_path / "Library" / cloud
+    link.parent.mkdir()
+    link.symlink_to(tmp_path / "local", target_is_directory=True)
+    looked_up = []
+    real_lstat = book_info._icloud.lstat
+
+    def lstat(path, *, dir_fd=None):
+        looked_up.append(os.fspath(path))
+        return real_lstat(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(book_info._icloud, "lstat", lstat)
+    _assert_not_read(FixtureLibrary(link / "x").data_dir, spy)
+    assert not [p for p in looked_up if p.startswith(str(link))]
+
+
 def test_symlinked_cache_folder_is_never_listed(tmp_path, spy):
     elsewhere = _container_at(tmp_path / "elsewhere")
     home = FixtureLibrary(tmp_path / "home")
     home.book_info_dir.parent.mkdir(parents=True)
     home.book_info_dir.symlink_to(elsewhere.book_info_dir, target_is_directory=True)
     _assert_not_read(home.data_dir, spy)
+
+
+@pytest.mark.parametrize("target", ["cloud", "local"])
+def test_symlinked_cache_file_is_never_opened(home, reader, spy, tmp_path, target):
+    # The folder's checks don't cover its files: a cache file that is a
+    # symlink (into iCloud Drive, another container, or anywhere) is
+    # refused on its lstat, before its header is opened.
+    home.add_book_info_cache([{"asset_id": "A", "title": "older"}], version=V0)
+    base = tmp_path / ("Library/Mobile Documents/x" if target == "cloud" else "local")
+    linked = FixtureLibrary(base).add_book_info_cache([{"asset_id": "A", "title": "linked"}], version=V7)
+    link = home.book_info_dir / cache_name(V7)
+    link.symlink_to(linked)
+    with pytest.raises(book_info._Refused):
+        book_info._open_mode(str(link))
+    with _fs_audit.record() as rec:
+        got = reader.get_cached_book_info("A")
+    assert got["A"].title == "older"
+    assert rec.under(linked) == [] and spy.files() == [cache_name(V0)]
 
 
 def _fake_stat(st, **changes):
