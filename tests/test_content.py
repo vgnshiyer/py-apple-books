@@ -849,11 +849,14 @@ class TestBookContentBasics:
         assert content.book_id == 1
 
     def test_threads_share_one_load(self, simple_epub, monkeypatch):
-        loads = []
+        loads, index_loads = [], []
         real_load = content_module._ContainedEpubReader.load
 
         def load(self):
-            loads.append(threading.get_ident())
+            # The full load; the book index (1.11) is read once more, by
+            # its own reader (a subclass), and only its few files.
+            (loads if type(self) is content_module._ContainedEpubReader else index_loads).append(
+                threading.get_ident())
             time.sleep(0.05)
             return real_load(self)
 
@@ -876,6 +879,7 @@ class TestBookContentBasics:
             t.join()
         assert errors == []
         assert len(loads) == 1
+        assert len(index_loads) == 1
         assert len(results) == 8 and all(r == results[0] for r in results)
 
     def test_lock_is_not_held_across_extraction(self, simple_epub, monkeypatch):

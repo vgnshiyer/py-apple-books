@@ -30,8 +30,18 @@ it is looked up, every entry before it is read, and every read runs
 with downloads of evicted files turned off for the reading thread (see
 :mod:`py_apple_books._icloud`), so a missed placeholder fails with
 :class:`BookNotDownloadedError` instead of being downloaded.
+
+Also since 1.11, a process-wide index of each book (its chapter list and
+spine, read from ``container.xml``, the package document and the
+navigation files only; see :mod:`py_apple_books._epub_index`) serves
+repeat :meth:`BookContent.list_chapters` calls and the spine API
+(:meth:`BookContent.list_spine_items`,
+:meth:`BookContent.get_spine_item_text`,
+:meth:`BookContent.iter_spine_text`), which then read only the files
+whose text is asked for. :func:`clear_content_cache` empties it.
 """
 
+import copy
 import errno
 import os
 import pathlib
@@ -43,21 +53,27 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
 from collections import Counter
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 from ebooklib import epub
 
 from py_apple_books import _icloud
+from py_apple_books._content_reading import _ReadingMixin
+from py_apple_books._content_resolve import _ResolveMixin
 from py_apple_books._messages import detail, quote_name, quote_title
 from py_apple_books.exceptions import (
     AppleBooksError,
     BookNotDownloadedError,
     ChapterNotFoundError,
+    DRMProtectedError,
+    InvalidArgumentError,
     NotEpubError,
     UnsafeEpubEntryError,
 )
-from py_apple_books.utils import extract_chapter_text
+from py_apple_books.positions import ReadBoundary, ResolvedBoundary, TextPosition, UnavailableReason
+from py_apple_books.text import normalize_unicode as _normalize_unicode
+from py_apple_books.utils import extract_chapter_text, normalize_whitespace
 
 PathLike = Union[str, pathlib.Path]
 
@@ -333,11 +349,21 @@ def _read_entry_bytes(root: PathLike, href: str, max_bytes: int) -> bytes:
     :raises UnsafeEpubEntryError: see :func:`_safe_bundle_path`; also an
         entry larger than ``max_bytes``.
     :raises BookNotDownloadedError: the entry (or a folder on the way)
-        is an iCloud placeholder.
+        is an iCloud placeholder, or it is missing with an iCloud stub
+        (``.<name>.icloud``) next to it.
     :raises OSError: it can't be read (e.g. :class:`FileNotFoundError`).
         Its text may name a path: wrap it with
         :func:`py_apple_books._messages.detail` before showing it.
     """
+    return _read_entry(root, href, max_bytes)[0]
+
+
+def _read_entry(root: PathLike, href: str, max_bytes: int) -> Tuple[bytes, os.stat_result, bool]:
+    """:func:`_read_entry_bytes`, also returning the ``fstat`` of the open
+    file taken before the read, and whether a second ``fstat`` after the
+    read found it unchanged (same size and modification time): the
+    identity a cache of anything derived from the bytes is keyed by.
+    Same checks and errors as :func:`_read_entry_bytes`."""
     root = pathlib.Path(root)
     with _icloud.no_materialize():
         try:
@@ -368,14 +394,20 @@ def _read_entry_bytes(root: PathLike, href: str, max_bytes: int) -> bytes:
                     if total > max_bytes:
                         raise UnsafeEpubEntryError(_too_large_message(href, max_bytes), entry=href)
                     chunks.append(chunk)
+                after = os.fstat(fd)
             finally:
                 os.close(fd)
         except OSError as e:
             err = _icloud.not_downloaded_error(e)
             if err is not None:
                 raise err from None
+            # A file evicted the older way: gone, with a ".<name>.icloud"
+            # stub next to it.
+            if isinstance(e, FileNotFoundError) and _icloud.icloud_stub(root / posixpath.normpath(href)):
+                raise _not_downloaded() from None
             raise
-    return b"".join(chunks)
+    stable = (after.st_size, after.st_mtime_ns) == (st.st_size, st.st_mtime_ns) == (total, st.st_mtime_ns)
+    return b"".join(chunks), st, stable
 
 
 def _escapes_bundle(href: str) -> bool:
@@ -545,11 +577,21 @@ def _encryption_xml_hides_content(bundle: pathlib.Path) -> bool:
             if st.st_size > _MAX_ENCRYPTION_XML_BYTES:
                 return True
             data = enc.read_bytes()
+    except Exception:
+        # This gate must never raise.
+        return True
+    return _encryption_xml_bytes_hide_content(data)
+
+
+def _encryption_xml_bytes_hide_content(data: bytes) -> bool:
+    """The verdict of :func:`_encryption_xml_hides_content` on the bytes
+    of an ``encryption.xml``: True if it encrypts anything beyond font
+    obfuscation, or can't be parsed. Never raises."""
+    try:
         root = ET.fromstring(data)
     except Exception:
-        # Not just OSError and ParseError: expat raises ValueError or
-        # LookupError for some declared encodings (Shift_JIS, unknown
-        # names). This gate must never raise.
+        # Not just ParseError: expat raises ValueError or LookupError
+        # for some declared encodings (Shift_JIS, unknown names).
         return True
     for data in root.iter():
         if _local_name(data.tag) != "EncryptedData":
@@ -562,6 +604,43 @@ def _encryption_xml_hides_content(bundle: pathlib.Path) -> bool:
         if algorithm not in _FONT_OBFUSCATION_ALGORITHMS:
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Media types whose text is not extracted (1.11)
+# ---------------------------------------------------------------------------
+
+
+# Spine and manifest items of these types have no text to extract:
+# get_spine_item_text() refuses them instead of parsing their bytes as
+# HTML. Any other type (XHTML, HTML, SVG, XML, a missing or unknown type)
+# is read as HTML, as 1.10 read every spine entry.
+_BINARY_MEDIA_MAJOR = frozenset({"image", "audio", "video", "font"})
+_BINARY_MEDIA_TYPES = frozenset({
+    "text/css",
+    "application/x-dtbncx+xml",
+    "application/smil+xml",
+    "application/javascript", "application/x-javascript", "application/ecmascript",
+    "text/javascript", "text/ecmascript",
+    "application/pdf",
+    "application/font-woff", "application/font-woff2", "application/x-font-woff",
+    "application/font-sfnt", "application/x-font-ttf", "application/x-font-truetype",
+    "application/x-font-otf", "application/x-font-opentype", "application/vnd.ms-opentype",
+    "application/vnd.ms-fontobject", "application/x-font-type1",
+})
+
+
+def _is_text_media_type(media_type: Optional[str]) -> bool:
+    """False for a media type with no text to extract (images other than
+    SVG, audio, video, fonts, stylesheets, NCX, SMIL, scripts, PDF);
+    True for every other type, including a missing one. Compared without
+    case or parameters."""
+    if not isinstance(media_type, str):
+        return True
+    mt = media_type.split(";", 1)[0].strip().lower()
+    if not mt or mt == "image/svg+xml":
+        return True
+    return mt.split("/", 1)[0] not in _BINARY_MEDIA_MAJOR and mt not in _BINARY_MEDIA_TYPES
 
 
 # ---------------------------------------------------------------------------
@@ -587,6 +666,14 @@ class Chapter:
     :param order: 1-based position in the flattened ToC.
     :param depth: Nesting level in the ToC tree. 0 = top-level chapter,
         1 = first-level subsection, etc.
+    :param spine_index: (1.11) The 0-based position of the chapter's
+        file in the book's spine (its first, if the spine lists the file
+        more than once), the number ``Location.spine_index`` and
+        :attr:`SpineItem.index` use; None when the file isn't in the
+        spine, or for a :class:`Chapter` built without it (by hand, by
+        1.10, or by a :class:`BookContent` unpickled with its book
+        already read whose index can't be used). Not part of equality,
+        hashing or ``repr``, so chapters compare as in 1.10.
     """
 
     id: str
@@ -595,6 +682,152 @@ class Chapter:
     fragment: str
     order: int
     depth: int
+    spine_index: Optional[int] = field(default=None, compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class SpineItem:
+    """One entry of a book's spine, the reading order its package
+    document lists (1.11). See :meth:`BookContent.list_spine_items`.
+
+    :param index: 0-based position among the element children of the
+        package document's ``<spine>`` (comments and processing
+        instructions don't count; every element does), so it is the
+        number ``Location.spine_index`` gives for a location in this
+        file and the spine index of a
+        :class:`~py_apple_books.positions.TextPosition`.
+    :param item_id: The manifest id the entry names (``idref``), or None
+        for an entry that names none (not an ``itemref``, or one without
+        an ``idref``).
+    :param href: The file's path relative to the book bundle (like
+        :attr:`Chapter.href`), or None when the entry names no manifest
+        item.
+    :param media_type: The file's manifest media type, as written, or
+        None.
+    :param linear: False for an entry marked ``linear="no"`` (notes,
+        pop-ups and other auxiliary content; compared without case or
+        surrounding spaces); True otherwise.
+    :param is_toc_page: True for a table-of-contents page: the EPUB 3
+        navigation document, or a file the package's guide
+        (``type="toc"``) or the navigation document's landmarks
+        (``epub:type="toc"``) points to.
+    :param readable: True when the entry names a manifest document whose
+        text :meth:`BookContent.get_spine_item_text` can extract (not an
+        image, stylesheet, font, audio, video, script or other binary
+        type, and inside the bundle).
+    :param toc_orders: The :attr:`Chapter.order` of every table of
+        contents entry in this file, ascending (empty when none is).
+    """
+
+    index: int
+    item_id: Optional[str]
+    href: Optional[str]
+    media_type: Optional[str]
+    linear: bool
+    is_toc_page: bool
+    readable: bool
+    toc_orders: Tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class SpineText:
+    """Text of one spine item, or a slice of it, from
+    :meth:`BookContent.iter_spine_text` (1.11).
+
+    :param index: The item's spine index (:attr:`SpineItem.index`).
+    :param item_id: Its manifest id (None for an entry that names none).
+    :param href: Its path relative to the book bundle, or None.
+    :param linear: See :attr:`SpineItem.linear`.
+    :param is_toc_page: See :attr:`SpineItem.is_toc_page`.
+    :param offset: Where :attr:`text` starts, in characters into the
+        item's text (:meth:`BookContent.get_spine_item_text`).
+    :param text: The slice of the item's text; empty when
+        :attr:`readable` is False.
+    :param length: The length of the item's whole text (0 when
+        :attr:`readable` is False).
+    :param readable: False for an item whose text couldn't be read
+        (:attr:`SpineItem.readable` is False, or reading it failed);
+        such an item is reported once, with no text.
+    """
+
+    index: int
+    item_id: Optional[str]
+    href: Optional[str]
+    linear: bool
+    is_toc_page: bool
+    offset: int
+    text: str
+    length: int
+    readable: bool = True
+
+    @property
+    def position(self) -> TextPosition:
+        """Where :attr:`text` starts."""
+        return TextPosition(self.index, self.offset)
+
+    @property
+    def end(self) -> TextPosition:
+        """Just after :attr:`text` (exclusive): pass it as ``start`` to
+        continue from here. For an item that isn't :attr:`readable`, the
+        start of the next spine item, so that continuing moves past it."""
+        if not self.readable:
+            return TextPosition(self.index + 1, 0)
+        return TextPosition(self.index, self.offset + len(self.text))
+
+    @property
+    def complete(self) -> bool:
+        """True when :attr:`text` is the item's whole text."""
+        return self.readable and self.offset == 0 and len(self.text) == self.length
+
+
+#: Most hits one page of a book-text search returns.
+MAX_SEARCH_HITS = 1000
+#: Most characters of context a book-text search snippet takes on each
+#: side of a hit.
+MAX_SNIPPET_CONTEXT = 2000
+
+
+@dataclass(frozen=True)
+class TextHit:
+    """One match of a book-text search (1.11).
+
+    :param start: Where the match starts.
+    :param end: Just after the match (exclusive).
+    :param item_id: The manifest id of the spine item it is in, or None.
+    :param snippet: The match with some text around it, on one line.
+    """
+
+    start: TextPosition
+    end: TextPosition
+    item_id: Optional[str]
+    snippet: str
+
+
+@dataclass(frozen=True)
+class TextSearchResult:
+    """One page of book-text search results (1.11).
+
+    :param hits: The matches, in reading order.
+    :param next_start: Where the next page starts (pass it as ``start``),
+        or None when there are no more matches in scope.
+    :param total: How many matches there are in scope, when counted;
+        else None.
+    :param withheld_in_item: Matches in the boundary's own spine item
+        past the boundary, when counted; else None.
+    :param withheld_later: Matches in later spine items, when counted;
+        else None.
+    """
+
+    hits: Tuple[TextHit, ...]
+    next_start: Optional[TextPosition] = None
+    total: Optional[int] = None
+    withheld_in_item: Optional[int] = None
+    withheld_later: Optional[int] = None
+
+    @property
+    def truncated(self) -> bool:
+        """True when more matches follow (:attr:`next_start` is set)."""
+        return self.next_start is not None
 
 
 # ---------------------------------------------------------------------------
@@ -602,13 +835,14 @@ class Chapter:
 # ---------------------------------------------------------------------------
 
 
-class BookContent:
+class BookContent(_ResolveMixin, _ReadingMixin):
     """File-level access to a single book in the Apple Books library.
 
     Wraps a filesystem path with format detection (EPUB bundle directory
     vs single PDF file), iCloud materialization state, DRM detection,
     and — for EPUBs — chapter listing, per-chapter text extraction, and
-    substring search.
+    (1.11) the book's spine: :meth:`list_spine_items`,
+    :meth:`get_spine_item_text` and :meth:`iter_spine_text`.
 
     Construct via :meth:`PyAppleBooks.get_book_content`, which performs
     the pre-filesystem gate checks. Direct construction from a path is
@@ -633,6 +867,19 @@ class BookContent:
         """Per-instance state that is never pickled or copied (locks,
         memos); set up again by :meth:`__setstate__`."""
         self._lock = threading.Lock()
+        # list_chapters(), once computed (a tuple of shared Chapters).
+        self._chapters_memo: Optional[Tuple[Chapter, ...]] = None
+        # get_spine_item_text() default text by manifest id: at most one
+        # book's text, dropped with the instance.
+        self._spine_text_memo: Dict[str, str] = {}
+        # (cache generation, index) of the last gate of the new APIs:
+        # reused while the cache isn't cleared and the index's files are
+        # unchanged, if the cache doesn't keep it (see _gated_index).
+        self._index_memo: Optional[Tuple[int, Any]] = None
+        # (parsed package document, its folder as ebooklib names it) of the
+        # book this instance read, for Chapter.spine_index when the index
+        # can't give the chapter list (see _chapter_list).
+        self._package: Optional[Tuple[Any, str]] = None
 
     # Kept by pickle and copy; everything else is runtime state.
     _PICKLED = ("path", "_book", "_book_id", "_opf_dir_cache")
@@ -747,13 +994,61 @@ class BookContent:
         resort, emits one entry per spine item with a synthetic
         ``Section N`` title.
 
+        Since 1.11 the list is computed once per instance, and other
+        instances on the same bundle are served from a process-wide index
+        while the bundle's ``container.xml``, package document and
+        navigation files are unchanged (same file, size and modification
+        time), so a repeat call reads nothing but file metadata. Each
+        call returns a new list; the :class:`Chapter` objects in it are
+        shared (they are immutable) and carry
+        :attr:`Chapter.spine_index`. The values are those of 1.10: the
+        index is used only after it gave the same list as reading the
+        whole book did. :func:`clear_content_cache` drops the index.
+
         :raises AppleBooksError: if the book is not an EPUB or ebooklib
             cannot read the package.
         """
         self._require_epub()
+        chapters = self._chapters_memo
+        if chapters is None:
+            chapters = self._chapter_list()
+            self._chapters_memo = chapters
+        return list(chapters)
 
+    def _chapter_list(self) -> Tuple[Chapter, ...]:
+        """:meth:`list_chapters`, uncached on this instance: the
+        process-wide index when it is known to give 1.10's list for the
+        bundle as it is now; else 1.10's way, by reading the whole book
+        (with 1.10's errors), after which the index is built (or
+        checked) and kept if it gives the same list."""
+        if self._book is None:
+            index = _epub_index._verified_index(self.path)
+            if index is not None:
+                return index.chapters
         book = self._load_book()
+        chapters = tuple(self._chapters_from_loaded_book(book))
+        index = _epub_index._index_matching(self.path, chapters)
+        if index is not None:
+            return index.chapters
+        return self._with_spine_indexes(chapters)
 
+    def _with_spine_indexes(self, chapters: Tuple[Chapter, ...]) -> Tuple[Chapter, ...]:
+        """``chapters`` (1.10's list, read without the index) with
+        :attr:`Chapter.spine_index` set by the index's rule, from the
+        package document this instance read; as they are if it didn't
+        keep it (an unpickled instance) or the rule fails."""
+        package = self._package
+        if package is None:
+            return chapters
+        try:
+            first = _epub_index._package_spine_indexes(package[0], package[1], self._to_bundle_relative)
+        except Exception:  # noqa: BLE001 (spine_index is then None, as for 1.10 chapters)
+            return chapters
+        return _epub_index._with_spine_indexes(chapters, first)
+
+    def _chapters_from_loaded_book(self, book: epub.EpubBook) -> List[Chapter]:
+        """1.10's chapter list from the loaded book: the ToC, else the
+        NCX found by media type, else one entry per spine item."""
         chapters = self._chapters_from_ebooklib_toc(book)
         if chapters:
             return chapters
@@ -763,6 +1058,241 @@ class BookContent:
             return chapters
 
         return self._chapters_from_spine(book)
+
+    # -- the spine (1.11) -------------------------------------------------------
+
+    def list_spine_items(self) -> List[SpineItem]:
+        """The book's spine (its reading order) as :class:`SpineItem`
+        entries, one per element of the package document's ``<spine>``,
+        in order (1.11).
+
+        Reads only the book's ``container.xml``, package document and
+        navigation files (kept in the process-wide index, like
+        :meth:`list_chapters`); nothing else is opened.
+
+        :raises NotEpubError: the book is not an EPUB bundle.
+        :raises BookNotDownloadedError: part of the book is stored only
+            in iCloud (nothing is downloaded).
+        :raises DRMProtectedError: the book is DRM-protected.
+        :raises AppleBooksError: the book's package can't be read.
+        """
+        return list(self._gated_index().spine)
+
+    def get_spine_item_text(self, item: Union[str, int], *, normalize_unicode: bool = False) -> str:
+        """The plain text of one whole spine file (1.11).
+
+        The text of the entire file, never scoped to a table-of-contents
+        entry: the same text a chapter id or the spine id from an
+        annotation's location gives for a file that holds one chapter,
+        extracted the same way as :meth:`get_chapter` does. Offsets in
+        it are the offsets of
+        :class:`~py_apple_books.positions.TextPosition`.
+
+        :param item: A manifest id (``str``, as in
+            :attr:`SpineItem.item_id` or ``Location.chapter_id``), or a
+            0-based spine index (``int``, as in :attr:`SpineItem.index` or
+            ``Location.spine_index``).
+        :param normalize_unicode: Remove soft hyphens, zero-width spaces
+            and BOMs and compose accents
+            (:func:`py_apple_books.text.normalize_unicode`), then tidy the
+            whitespace again. Offsets then no longer match the default
+            text.
+        :raises ChapterNotFoundError: no such manifest document, or no
+            spine entry at that index (``bool`` and negative indexes
+            included), or it names an image, stylesheet, font, audio,
+            video, script or other binary file.
+        :raises InvalidArgumentError: ``item`` is neither a str nor an
+            int.
+        :raises NotEpubError: the book is not an EPUB bundle.
+        :raises BookNotDownloadedError: the file, or part of the book's
+            package, is stored only in iCloud (nothing is downloaded).
+        :raises DRMProtectedError: the book is DRM-protected.
+        :raises UnsafeEpubEntryError: the file is outside the book
+            bundle, not a regular file or too large.
+        :raises AppleBooksError: the file can't be read.
+        """
+        if isinstance(item, bool) or (isinstance(item, int) and item < 0):
+            raise _no_spine_entry(item)
+        if not isinstance(item, (str, int)):
+            raise InvalidArgumentError(
+                f"item must be a manifest id (str) or a spine index (int), "
+                f"not {type(item).__name__}.")
+        index = self._gated_index()
+        if isinstance(item, int):
+            if item >= len(index.spine):
+                raise _no_spine_entry(item)
+            entry = index.spine[item]
+            missing = f"No text document at spine index {int(item)} in this book."
+            if entry.item_id is None or not entry.readable:
+                raise ChapterNotFoundError(missing)
+            item_id = entry.item_id
+        else:
+            item_id = item
+            missing = f"No text document with id {quote_name(item)} in this book."
+        text = self._spine_text_memo.get(item_id)
+        if text is None:
+            text = self._read_spine_text(index, item_id, missing)
+            self._spine_text_memo[item_id] = text
+        if normalize_unicode:
+            text = normalize_whitespace(_normalize_unicode(text))
+        return text
+
+    def iter_spine_text(
+        self,
+        *,
+        start: Optional[TextPosition] = None,
+        until: Optional[Union[TextPosition, ResolvedBoundary]] = None,
+        include_nonlinear: bool = False,
+        include_toc_pages: bool = False,
+    ) -> Iterator[SpineText]:
+        """The book's text, spine item by spine item, in reading order
+        (1.11).
+
+        Yields one :class:`SpineText` per spine item in scope, from
+        ``start`` up to ``until`` (exclusive): the first item from
+        ``start``'s offset, the ``until`` item cut at ``until``'s offset,
+        nothing after it. Items marked non-linear and table-of-contents
+        pages are left out unless asked for. An item whose slice is
+        empty is skipped; an item in scope whose text can't be read is
+        yielded once, with ``readable=False`` and no text (an item
+        partly stored in iCloud, or a DRM-protected book, raises
+        instead).
+
+        To page through the text, take what you need and continue from
+        the :attr:`SpineText.position` you stopped at (or a slice's
+        :attr:`SpineText.end`). Each item's text is read when the
+        iteration reaches it (:meth:`get_spine_item_text`); nothing is
+        locked between items, so other threads can use the instance
+        meanwhile.
+
+        :param start: Where to start (default: the start of the book).
+        :param until: Where to stop: a
+            :class:`~py_apple_books.positions.TextPosition`, or a
+            :class:`~py_apple_books.positions.ResolvedBoundary` (its
+            ``position``; a ``ReadBoundary`` must be placed first, with
+            ``resolve_boundary``). Default: the end of the book. A
+            boundary is checked against :attr:`book_id`: an instance made
+            from a path alone (``book_id`` None) can't tell which book a
+            boundary was resolved for, and takes its position as is, so
+            use one from :meth:`PyAppleBooks.get_book_content` for a
+            boundary from the library.
+        :param include_nonlinear: Also yield items marked
+            ``linear="no"``.
+        :param include_toc_pages: Also yield table-of-contents pages.
+        :raises InvalidArgumentError: a bad ``start`` or ``until``, or a
+            boundary resolved for another book. Raised by the call, not
+            the first ``next()``.
+        :raises NotEpubError, BookNotDownloadedError,
+            DRMProtectedError, AppleBooksError: as for
+            :meth:`list_spine_items`, from the call.
+        """
+        if start is not None and not isinstance(start, TextPosition):
+            raise InvalidArgumentError("start must be a TextPosition or None.")
+        stop = self._until_position(until)
+        spine = self._gated_index().spine
+        return self._spine_texts(spine, start or TextPosition(0, 0), stop,
+                                 bool(include_nonlinear), bool(include_toc_pages))
+
+    def _until_position(self, until: Any) -> Optional[TextPosition]:
+        """``until`` of :meth:`iter_spine_text` as a position (None: the
+        end of the book)."""
+        if until is None or isinstance(until, TextPosition):
+            return until
+        if isinstance(until, ResolvedBoundary):
+            mine = self._book_id
+            theirs = (until.book_id, getattr(until.boundary, "book_id", None))
+            if mine is not None and any(b is not None and b != mine for b in theirs):
+                raise InvalidArgumentError("This boundary was resolved for another book.")
+            if not isinstance(until.position, TextPosition):
+                raise InvalidArgumentError("The boundary has no TextPosition.")
+            return until.position
+        if isinstance(until, ReadBoundary):
+            raise InvalidArgumentError(
+                "until takes a TextPosition or a ResolvedBoundary: place a ReadBoundary "
+                "in the book's text with resolve_boundary() first.")
+        raise InvalidArgumentError("until must be a TextPosition, a ResolvedBoundary or None.")
+
+    def _spine_texts(self, spine: Tuple[SpineItem, ...], start: TextPosition,
+                     stop: Optional[TextPosition], include_nonlinear: bool,
+                     include_toc_pages: bool) -> Iterator[SpineText]:
+        for entry in spine:
+            if entry.index < start.spine_index:
+                continue
+            if stop is not None and entry.index > stop.spine_index:
+                break
+            if not entry.linear and not include_nonlinear:
+                continue
+            if entry.is_toc_page and not include_toc_pages:
+                continue
+            lo = start.offset if entry.index == start.spine_index else 0
+            hi = stop.offset if stop is not None and entry.index == stop.spine_index else None
+            if hi is not None and hi <= lo:
+                continue
+            text: Optional[str] = None
+            if entry.readable:
+                try:
+                    text = self.get_spine_item_text(entry.index)
+                except (BookNotDownloadedError, DRMProtectedError, NotEpubError):
+                    raise
+                except AppleBooksError:
+                    text = None
+            if text is None:
+                if lo == 0:
+                    yield SpineText(entry.index, entry.item_id, entry.href, entry.linear,
+                                    entry.is_toc_page, 0, "", 0, readable=False)
+                continue
+            piece = text[lo:hi]
+            if piece:
+                yield SpineText(entry.index, entry.item_id, entry.href, entry.linear,
+                                entry.is_toc_page, lo, piece, len(text))
+
+    def _gated_index(self) -> "_epub_index._BookIndex":
+        """The book's index, after the checks every new content API runs
+        (see :func:`py_apple_books._epub_index._gate_path`); raises what
+        they find. The index this instance got last is passed to the gate
+        (one book's index, dropped with the instance or when the cache is
+        cleared)."""
+        self._require_epub()
+        generation = _epub_index._CACHE.generation
+        memo = self._index_memo
+        held = memo[1] if memo is not None and memo[0] == generation else None
+        gated = _epub_index._gate_path(self.path, held)
+        if gated.reason is not None:
+            if gated.reason == UnavailableReason.NOT_EPUB:
+                self._require_epub()
+            raise gated.error
+        # Kept so that a book whose index can't stay in the cache (too
+        # heavy, or evicted) isn't read again by every call (each item of
+        # iter_spine_text); the gate still runs every check each time.
+        self._index_memo = (generation, gated.index)
+        return gated.index
+
+    def _read_spine_text(self, index: "_epub_index._BookIndex", item_id: str, missing: str) -> str:
+        """The text of manifest document ``item_id``, as 1.10's
+        :meth:`_spine_item_text` extracts it: from the book this instance
+        has loaded, else from the index plus one read of the file."""
+        book = self._book if self._book is not None else index.book
+        item = book.get_item_with_id(item_id)
+        if item is None or not _is_text_media_type(getattr(item, "media_type", None)):
+            raise ChapterNotFoundError(missing)
+        try:
+            with _icloud.no_materialize():
+                deferred = getattr(item, "content", None)
+                if isinstance(deferred, _epub_index._Deferred):
+                    filled = copy.copy(item)
+                    filled.content = _read_entry_bytes(self.path, deferred.entry, _MAX_ENTRY_BYTES)
+                    item = filled
+                html_bytes = item.get_content()
+        except AppleBooksError:
+            raise
+        except Exception as e:
+            err = _icloud.not_downloaded_error(e)
+            if err is not None:
+                raise err from None
+            raise AppleBooksError(
+                f"Could not read spine entry {quote_name(item_id)}: {detail(e)}"
+            ) from e
+        return extract_chapter_text(html_bytes, start_anchor=None, stop_anchors=set())
 
     # -- chapter reading ----------------------------------------------------
 
@@ -894,7 +1424,8 @@ class BookContent:
             return book
         with self._lock:
             if self._book is None:
-                book, container = self._read_book()
+                book, container, package = self._read_book()
+                self._package = package
                 if self._opf_dir_cache is None:
                     self._opf_dir_cache = (
                         _opf_dir_from_container_bytes(container)
@@ -904,8 +1435,10 @@ class BookContent:
                 self._book = book
             return self._book
 
-    def _read_book(self) -> Tuple[epub.EpubBook, Optional[bytes]]:
-        """The parsed book, and its ``META-INF/container.xml`` bytes."""
+    def _read_book(self) -> Tuple[epub.EpubBook, Optional[bytes], Optional[Tuple[Any, str]]]:
+        """The parsed book, its ``META-INF/container.xml`` bytes, and its
+        parsed package document with the package's folder (as ebooklib
+        names it)."""
         # Same steps as epub.read_epub(), with the contained reader.
         reader = _ContainedEpubReader(str(self.path))
         try:
@@ -921,7 +1454,9 @@ class BookContent:
             raise AppleBooksError(
                 f"Could not read EPUB {quote_title(self.path.name)}: {detail(e)}"
             ) from e
-        return book, reader.container_bytes
+        opf = getattr(reader, "container", None)
+        package = (opf, reader.opf_dir or "") if opf is not None else None
+        return book, reader.container_bytes, package
 
     def _opf_dir(self) -> pathlib.PurePosixPath:
         """Cached OPF directory relative to the EPUB bundle root.
@@ -944,11 +1479,7 @@ class BookContent:
         bundle-relative path rooted at :attr:`path`."""
         if not opf_relative:
             return opf_relative
-        opf_dir = self._opf_dir()
-        opf_dir_str = str(opf_dir)
-        if opf_dir_str in ("", "."):
-            return opf_relative
-        return f"{opf_dir_str}/{opf_relative}"
+        return _to_bundle_relative(self._opf_dir(), opf_relative)
 
     def _to_opf_relative(self, bundle_relative: str) -> str:
         """Inverse of :meth:`_to_bundle_relative` — strip the OPF-dir
@@ -966,165 +1497,16 @@ class BookContent:
         return bundle_relative
 
     def _chapters_from_ebooklib_toc(self, book: epub.EpubBook) -> List[Chapter]:
-        """Flatten ebooklib's nested ToC into a list of :class:`Chapter`.
-
-        Handles EPUB3 nav documents and EPUB2 NCX transparently (that's
-        what we get ebooklib for). Returns an empty list if ebooklib
-        couldn't locate a ToC — the caller then tries the stdlib
-        fallback.
-        """
-        toc = book.toc
-        if not toc:
-            return []
-
-        # Build a lookup from bundle-relative href to manifest item id
-        # for stable chapter ids. ebooklib stores file_name as
-        # OPF-relative; we normalize to bundle-relative up front so
-        # matching works against whichever convention a ToC entry uses.
-        href_to_item_id = {}
-        for item in book.get_items():
-            name = getattr(item, "file_name", None) or getattr(item, "get_name", lambda: "")()
-            if name:
-                href_to_item_id[self._to_bundle_relative(name)] = item.get_id()
-
-        chapters: List[Chapter] = []
-        order = 0
-
-        # ebooklib sometimes emits duplicate links in the ToC (same href +
-        # fragment). Track what we've seen to keep the output tidy.
-        seen: Set[Tuple[str, str]] = set()
-
-        def walk(nodes: Iterable[Any], depth: int) -> None:
-            nonlocal order
-            for node in nodes:
-                if isinstance(node, tuple):
-                    section, children = node
-                    title = getattr(section, "title", "") or ""
-                    href = getattr(section, "href", "") or ""
-                    if title or href:
-                        emit(title, href, depth)
-                    walk(children, depth + 1)
-                else:  # epub.Link
-                    title = getattr(node, "title", "") or ""
-                    href = getattr(node, "href", "") or ""
-                    if title or href:
-                        emit(title, href, depth)
-
-        def emit(title: str, href: str, depth: int) -> None:
-            nonlocal order
-            title = title.strip()
-            href = href.strip()
-            if not title:
-                return
-
-            bare, _, fragment = href.partition("#")
-            bare = urllib.parse.unquote(bare)
-            fragment = urllib.parse.unquote(fragment)
-
-            # ToC hrefs are OPF-relative in ebooklib; normalize to
-            # bundle-relative so Chapter.href resolves against self.path.
-            bundle_href = self._to_bundle_relative(bare)
-            # Never advertise an entry pointing outside the bundle —
-            # reading it would be refused anyway. An absolute href is
-            # checked before the OPF-dir prefix turns it into an
-            # in-bundle-looking "OEBPS//abs".
-            if bare.startswith("/") or _escapes_bundle(bundle_href):
-                return
-
-            key = (bundle_href, fragment)
-            if key in seen:
-                return
-            seen.add(key)
-
-            order += 1
-            item_id = href_to_item_id.get(bundle_href, "")
-            chapter_id = item_id if item_id else str(order)
-
-            chapters.append(
-                Chapter(
-                    id=chapter_id,
-                    title=title,
-                    href=bundle_href,
-                    fragment=fragment,
-                    order=order,
-                    depth=depth,
-                )
-            )
-
-        walk(toc, 0)
-
-        # When multiple ToC entries in the same file share the same item
-        # id (siblings differing only by fragment), fall back to order
-        # suffixes so Chapter.id stays unique.
-        id_counts = Counter(ch.id for ch in chapters)
-        if any(n > 1 for n in id_counts.values()):
-            chapters = [
-                Chapter(
-                    id=(str(ch.order) if id_counts[ch.id] > 1 else ch.id),
-                    title=ch.title,
-                    href=ch.href,
-                    fragment=ch.fragment,
-                    order=ch.order,
-                    depth=ch.depth,
-                )
-                for ch in chapters
-            ]
-        return chapters
+        """See :func:`_toc_chapters`."""
+        return _toc_chapters(book, self._to_bundle_relative)
 
     def _chapters_from_media_type_ncx(self) -> List[Chapter]:
-        """Override for EPUBs whose OPF doesn't declare ``<spine toc=…>``
-        (real example: *The 4-Hour Workweek*). ebooklib returns an empty
-        ToC for these, so we pick the NCX out of the manifest by
-        ``media-type`` — ebooklib already parsed the manifest, we just
-        ask for the items — and parse the NCX ourselves.
-
-        Returns an empty list if no NCX is found, signaling the caller
-        to try the spine-fallback path.
-        """
-        book = self._load_book()
-        ncx_item = None
-        for item in book.get_items():
-            if getattr(item, "media_type", "") == "application/x-dtbncx+xml":
-                ncx_item = item
-                break
-        if ncx_item is None:
-            return []
-
-        try:
-            ncx_bytes = ncx_item.get_content()
-        except Exception:
-            return []
-
-        # NCX content srcs resolve relative to the NCX file's location.
-        # file_name is OPF-relative, so prepend the OPF dir to get the
-        # bundle-relative directory of the NCX file.
-        ncx_bundle_path = pathlib.PurePosixPath(
-            self._to_bundle_relative(ncx_item.file_name)
-        )
-        return _parse_ncx_bytes(ncx_bytes, ncx_bundle_path.parent)
+        """See :func:`_media_type_ncx_chapters`."""
+        return _media_type_ncx_chapters(self._load_book(), self._to_bundle_relative)
 
     def _chapters_from_spine(self, book: epub.EpubBook) -> List[Chapter]:
-        """Last-resort chapter list from the EPUB spine alone.
-
-        Produces synthetic titles (``Section N``) since there's no
-        navigation document to pull real titles from.
-        """
-        chapters: List[Chapter] = []
-        for order, entry in enumerate(book.spine, start=1):
-            spine_id = entry[0] if isinstance(entry, tuple) else entry
-            item = book.get_item_with_id(spine_id)
-            href = self._to_bundle_relative(item.file_name) if item else ""
-            chapters.append(
-                Chapter(
-                    id=spine_id or str(order),
-                    title=f"Section {order}",
-                    href=href,
-                    fragment="",
-                    order=order,
-                    depth=0,
-                )
-            )
-        return chapters
+        """See :func:`_spine_chapters`."""
+        return _spine_chapters(book, self._to_bundle_relative)
 
     def _read_chapter_bytes(self, href: str) -> bytes:
         """Return raw bytes for a chapter file, given a bundle-relative href.
@@ -1165,6 +1547,199 @@ class BookContent:
             raise AppleBooksError(
                 f"Could not read chapter file {quote_name(href)}: {e.strerror}"
             ) from e
+
+
+# ---------------------------------------------------------------------------
+# Chapter lists (1.10's, shared by BookContent and the book index)
+# ---------------------------------------------------------------------------
+
+
+def _to_bundle_relative(opf_dir: pathlib.PurePosixPath, opf_relative: str) -> str:
+    """An OPF-relative href (ebooklib convention) as a path relative to the
+    bundle, given the OPF's directory in the bundle."""
+    if not opf_relative:
+        return opf_relative
+    opf_dir_str = str(opf_dir)
+    if opf_dir_str in ("", "."):
+        return opf_relative
+    return f"{opf_dir_str}/{opf_relative}"
+
+
+def _book_chapters(book: epub.EpubBook, rel: Callable[[str], str]) -> List[Chapter]:
+    """1.10's chapter list of a loaded book: its ToC
+    (:func:`_toc_chapters`), else the NCX found by media type
+    (:func:`_media_type_ncx_chapters`), else one entry per spine item
+    (:func:`_spine_chapters`). ``rel`` turns an OPF-relative href into a
+    bundle-relative one; it is called only when needed."""
+    chapters = _toc_chapters(book, rel)
+    if chapters:
+        return chapters
+    chapters = _media_type_ncx_chapters(book, rel)
+    if chapters:
+        return chapters
+    return _spine_chapters(book, rel)
+
+
+def _toc_chapters(book: epub.EpubBook, rel: Callable[[str], str]) -> List[Chapter]:
+    """Flatten ebooklib's nested ToC into a list of :class:`Chapter`.
+
+    Handles EPUB3 nav documents and EPUB2 NCX transparently (that's
+    what we get ebooklib for). Returns an empty list if ebooklib
+    couldn't locate a ToC — the caller then tries the stdlib
+    fallback.
+    """
+    toc = book.toc
+    if not toc:
+        return []
+
+    # Build a lookup from bundle-relative href to manifest item id
+    # for stable chapter ids. ebooklib stores file_name as
+    # OPF-relative; we normalize to bundle-relative up front so
+    # matching works against whichever convention a ToC entry uses.
+    href_to_item_id = {}
+    for item in book.get_items():
+        name = getattr(item, "file_name", None) or getattr(item, "get_name", lambda: "")()
+        if name:
+            href_to_item_id[rel(name)] = item.get_id()
+
+    chapters: List[Chapter] = []
+    order = 0
+
+    # ebooklib sometimes emits duplicate links in the ToC (same href +
+    # fragment). Track what we've seen to keep the output tidy.
+    seen: Set[Tuple[str, str]] = set()
+
+    def walk(nodes: Iterable[Any], depth: int) -> None:
+        nonlocal order
+        for node in nodes:
+            if isinstance(node, tuple):
+                section, children = node
+                title = getattr(section, "title", "") or ""
+                href = getattr(section, "href", "") or ""
+                if title or href:
+                    emit(title, href, depth)
+                walk(children, depth + 1)
+            else:  # epub.Link
+                title = getattr(node, "title", "") or ""
+                href = getattr(node, "href", "") or ""
+                if title or href:
+                    emit(title, href, depth)
+
+    def emit(title: str, href: str, depth: int) -> None:
+        nonlocal order
+        title = title.strip()
+        href = href.strip()
+        if not title:
+            return
+
+        bare, _, fragment = href.partition("#")
+        bare = urllib.parse.unquote(bare)
+        fragment = urllib.parse.unquote(fragment)
+
+        # ToC hrefs are OPF-relative in ebooklib; normalize to
+        # bundle-relative so Chapter.href resolves against the bundle.
+        bundle_href = rel(bare)
+        # Never advertise an entry pointing outside the bundle —
+        # reading it would be refused anyway. An absolute href is
+        # checked before the OPF-dir prefix turns it into an
+        # in-bundle-looking "OEBPS//abs".
+        if bare.startswith("/") or _escapes_bundle(bundle_href):
+            return
+
+        key = (bundle_href, fragment)
+        if key in seen:
+            return
+        seen.add(key)
+
+        order += 1
+        item_id = href_to_item_id.get(bundle_href, "")
+        chapter_id = item_id if item_id else str(order)
+
+        chapters.append(
+            Chapter(
+                id=chapter_id,
+                title=title,
+                href=bundle_href,
+                fragment=fragment,
+                order=order,
+                depth=depth,
+            )
+        )
+
+    walk(toc, 0)
+
+    # When multiple ToC entries in the same file share the same item
+    # id (siblings differing only by fragment), fall back to order
+    # suffixes so Chapter.id stays unique.
+    id_counts = Counter(ch.id for ch in chapters)
+    if any(n > 1 for n in id_counts.values()):
+        chapters = [
+            Chapter(
+                id=(str(ch.order) if id_counts[ch.id] > 1 else ch.id),
+                title=ch.title,
+                href=ch.href,
+                fragment=ch.fragment,
+                order=ch.order,
+                depth=ch.depth,
+            )
+            for ch in chapters
+        ]
+    return chapters
+
+
+def _media_type_ncx_chapters(book: epub.EpubBook, rel: Callable[[str], str]) -> List[Chapter]:
+    """Override for EPUBs whose OPF doesn't declare ``<spine toc=…>``
+    (real example: *The 4-Hour Workweek*). ebooklib returns an empty
+    ToC for these, so we pick the NCX out of the manifest by
+    ``media-type`` — ebooklib already parsed the manifest, we just
+    ask for the items — and parse the NCX ourselves.
+
+    Returns an empty list if no NCX is found, signaling the caller
+    to try the spine-fallback path.
+    """
+    ncx_item = None
+    for item in book.get_items():
+        if getattr(item, "media_type", "") == "application/x-dtbncx+xml":
+            ncx_item = item
+            break
+    if ncx_item is None:
+        return []
+
+    try:
+        ncx_bytes = ncx_item.get_content()
+    except Exception:
+        return []
+
+    # NCX content srcs resolve relative to the NCX file's location.
+    # file_name is OPF-relative, so prepend the OPF dir to get the
+    # bundle-relative directory of the NCX file.
+    ncx_bundle_path = pathlib.PurePosixPath(rel(ncx_item.file_name))
+    return _parse_ncx_bytes(ncx_bytes, ncx_bundle_path.parent)
+
+
+def _spine_chapters(book: epub.EpubBook, rel: Callable[[str], str]) -> List[Chapter]:
+    """Last-resort chapter list from the EPUB spine alone.
+
+    Produces synthetic titles (``Section N``) since there's no
+    navigation document to pull real titles from. Follows ebooklib's
+    view of the spine, so a comment in it counts as an entry.
+    """
+    chapters: List[Chapter] = []
+    for order, entry in enumerate(book.spine, start=1):
+        spine_id = entry[0] if isinstance(entry, tuple) else entry
+        item = book.get_item_with_id(spine_id)
+        href = rel(item.file_name) if item else ""
+        chapters.append(
+            Chapter(
+                id=spine_id or str(order),
+                title=f"Section {order}",
+                href=href,
+                fragment="",
+                order=order,
+                depth=0,
+            )
+        )
+    return chapters
 
 
 # ---------------------------------------------------------------------------
@@ -1316,6 +1891,17 @@ def _parse_ncx_bytes(
     return chapters
 
 
+def _no_spine_entry(item: int) -> ChapterNotFoundError:
+    """The error for a spine index that names no entry: the index in the
+    message when it is short, else none (a huge int has no short text,
+    and past 4,300 digits no text at all)."""
+    if isinstance(item, bool):
+        return ChapterNotFoundError(f"No spine entry at index {item!r} in this book.")
+    if -10**12 < item < 10**12:
+        return ChapterNotFoundError(f"No spine entry at index {int(item)} in this book.")
+    return ChapterNotFoundError("No spine entry at that index in this book.")
+
+
 # ---------------------------------------------------------------------------
 # Caches
 # ---------------------------------------------------------------------------
@@ -1329,3 +1915,9 @@ def clear_content_cache() -> None:
     keep the book they already read.
     """
     _icloud.clear_file_caches()
+
+
+# The book index (container, package and navigation files of a book, kept
+# process-wide). Imported last: it builds on the reader and chapter code
+# above, and BookContent's methods use it.
+from py_apple_books import _epub_index  # noqa: E402
