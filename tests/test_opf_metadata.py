@@ -357,10 +357,16 @@ class TestSubjectsAndDescription:
         ("AT&amp;T &eacute;l&egrave;ve &#233; &#x263A;", "AT&T élève é ☺"),
         ("1 <2 >0 and a</ b", "1 <2 >0 and a</ b"),
         ("<p>unterminated <b", "unterminated <b"),  # the same on every Python
+        ('<img alt="a > b"/>caption', "caption"),
+        ('<a title="x>y">text</a> after', "text after"),
+        ("<p class='q>r'>para</p>", "para"),
+        # A quote that isn't a value's, or a value left open: the first '>' ends the tag.
+        ("<p don't>a</p><i x=1>b</i> <a title=\"open>c", "a\nb c"),
         ("&#99999999999; &#xFFFFFFFFFF; &#" + "9" * 6000 + "; &#" + "0" * 6000 + "65; &#00000000065 &#x0041;",
          "\ufffd \ufffd \ufffd A A A"),
     ], ids=["inline-and-break", "comments", "raw-text", "raw-text-case", "skipped", "declarations",
-            "references", "stray-brackets", "unterminated", "huge-references"])
+            "references", "stray-brackets", "unterminated", "quoted-gt-in-void", "quoted-gt", "single-quoted-gt",
+            "quotes-not-values", "huge-references"])
     def test_description_markup(self, markup, expected):
         assert _opf.clean_description(markup) == expected
 
@@ -510,7 +516,8 @@ class TestLimits:
     # Pythons without the CVE-2025-6069 fix (3.10.17, for one): seconds
     # per 16 KiB, minutes per 64 KiB.
     CRAFTED = {"open-attr": "<x ", "open": "<a", "comment": "<!--", "end": "</x", "decl": "<!", "p": "<p",
-               "long-attr": "<a " + "x" * 1100, "charref": "&#", "script": "<script>"}
+               "long-attr": "<a " + "x" * 1100, "charref": "&#", "script": "<script>",
+               "open-quote": '<a x="', "quoted-gt": "<a x='>", "long-quote": '<a x="' + "y>" * 600}
 
     @pytest.mark.parametrize("unit", list(CRAFTED.values()), ids=list(CRAFTED))
     def test_crafted_description_is_linear(self, unit):

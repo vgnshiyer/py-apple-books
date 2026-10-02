@@ -129,6 +129,10 @@ _RAW_TEXT_TAGS = ("script", "style")  # raw text up to the end tag, dropped
 _RAW_TEXT_END = {name: re.compile(rf"</{name}(?=[\s/>]|$)", re.I) for name in _RAW_TEXT_TAGS}
 # How far past a '<' a tag's '>' is looked for (never past the next '<').
 _TAG_SCAN = 1024
+# A tag's body up to its '>', where a quoted attribute value (after '=')
+# may hold '>'. One way to match any text (a quote is consumed only
+# right after '='), so a failed match backtracks in linear time.
+_TAG_BODY = re.compile(r"""(?:[^>"'=]|=\s*"[^"]*"|=\s*'[^']*'|=(?!\s*["']))*>""")
 # A start or end tag's name, right after its '<' (None for '<!' and '<?').
 _TAG_NAME = re.compile(r"(/?)([A-Za-z][^\s/<>]*)")
 # A numeric character reference, as html.unescape finds them.
@@ -314,7 +318,8 @@ def _strip_html(text: str) -> str:
     Here every step either moves past text or looks
     at most :data:`_TAG_SCAN` characters ahead, stopping at the next
     ``<``, so the time is linear in the length of ``text`` and the result
-    is the same on every Python.
+    is the same on every Python. A ``>`` inside a quoted attribute value
+    doesn't end the tag (``<img alt="a > b">``).
     """
     parts: List[str] = []
     pending: List[str] = []  # data since the last tag, unescaped together
@@ -348,7 +353,11 @@ def _strip_html(text: str) -> str:
             continue
         limit = min(end, lt + 1 + _TAG_SCAN)
         next_lt = text.find("<", lt + 1, limit)
-        gt = text.find(">", lt + 1, next_lt if next_lt >= 0 else limit)
+        stop = next_lt if next_lt >= 0 else limit
+        body = _TAG_BODY.match(text, lt + 1, stop)
+        # A quote that isn't an attribute value's (<p don't>), or one
+        # left open: the first '>' ends the tag.
+        gt = body.end() - 1 if body is not None else text.find(">", lt + 1, stop)
         match = _TAG_NAME.match(text, lt + 1, gt) if gt >= 0 else None
         if gt < 0 or (after == "/" and match is None):
             pending.append("<")  # no tag after all: the '<' is text
