@@ -259,6 +259,25 @@ class TestUnavailable:
         assert api.get_reading_position(book["id"]).unavailable == R.NOT_DOWNLOADED
         assert icloud.touched(evicted) == []
 
+    @pytest.mark.parametrize("dataless", ["bundle", "opf"])
+    def test_downloaded_state_with_a_cloud_only_part_opens_nothing_there(
+            self, api, library, tmp_path, icloud, dataless):
+        # ZSTATE 1 (the database says downloaded), but the bundle, or its
+        # package file, is an iCloud placeholder: the gate refuses before
+        # anything there is opened.
+        from tests.conftest import FIXTURE_HOME
+
+        bundle = split_book(tmp_path)
+        book = library.add_book("Evicted", path=str(bundle), state=1)
+        library.add_annotation(book, None, kind="reading_position", location=cfi(2, "s2", "/4/6"))
+        marked = bundle if dataless == "bundle" else bundle / "OEBPS" / "content.opf"
+        icloud.mark(marked)
+        policy = _fs_audit.Policy.for_library(FIXTURE_HOME, books=[marked])
+        with _fs_audit.block(policy) as rec:
+            pos = api.get_reading_position(book["id"])
+        assert (pos.spine_index, pos.item_id, pos.unavailable, pos.chapter) == (2, "s2", R.NOT_DOWNLOADED, None)
+        assert rec.under(marked, "open") == [] and rec.refused == []
+
     def test_location_naming_no_file(self, api, library, split):
         library.add_annotation(split, None, kind="reading_position", location=cfi(9, "gone"))
         pos = api.get_reading_position(split["id"])

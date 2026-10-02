@@ -364,3 +364,22 @@ def test_str_matches_the_wrapper_whenever_it_finds_the_text(api, library, tmp_pa
             assert str(ctx) == legacy
             checked += 1
     assert checked > 50
+
+
+class TestUnsafeFiles:
+    def test_spine_file_symlinked_outside_the_bundle_is_refused_unopened(self, api, library, tmp_path):
+        from py_apple_books.exceptions import UnsafeEpubEntryError
+
+        bundle = write_epub_bundle(tmp_path / "Sym.epub", [("c1", p("alpha beta gamma")), ("c2", p("delta"))],
+                                   toc=[("One", "c1.xhtml"), ("Two", "c2.xhtml")])
+        outside = tmp_path / "outside.xhtml"
+        outside.write_text("<html><body><p>alpha beta gamma outside</p></body></html>")
+        target = bundle / "OEBPS" / "c1.xhtml"
+        target.unlink()
+        target.symlink_to(outside)
+        aid = add(library, library.add_book("Sym", path=str(bundle)), "alpha beta", cfi(0, "c1"))
+        with _fs_audit.block(_fs_audit.Policy(deny=(str(outside),))) as rec:
+            with pytest.raises(UnsafeEpubEntryError) as caught:
+                api.get_annotation_context(aid)
+        assert rec.under(outside, "open") == [] and rec.refused == []
+        assert str(tmp_path) not in str(caught.value) and "outside.xhtml" not in str(caught.value)

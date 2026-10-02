@@ -210,3 +210,16 @@ class TestBookReasons:
         ann = api.get_annotation_by_id(library.add_annotation(book, "x", location=cfi(1, "ch2")))
         (result,) = api.get_annotation_locations([ann]).values()
         assert isinstance(result, ResolvedLocation) and result.unavailable is None
+
+
+def test_toc_hrefs_climbing_out_of_the_bundle_are_never_read(api, library, tmp_path):
+    outside = tmp_path / "out.xhtml"
+    outside.write_text('<html><body><h1 id="a">A</h1><h1 id="b">B</h1></body></html>')
+    bundle = split_book(tmp_path, toc=[("Out A", "../../out.xhtml#a"), ("Out B", "../../out.xhtml#b"),
+                                       ("A", "s0.xhtml#a"), ("B", "s0.xhtml#b"), ("C", "s2.xhtml#c")])
+    book = library.add_book("Climb", path=str(bundle))
+    aid = library.add_annotation(book, "b text.", location=cfi(0, "s0", "/4/8,/1:0,/1:7"))
+    with _fs_audit.block(_fs_audit.Policy(deny=(str(outside),))) as rec:
+        found = api.get_annotation_locations([api.get_annotation_by_id(aid)])
+    assert rec.under(outside, "open") == [] and rec.refused == []
+    assert (found[aid].chapter.title, found[aid].match) == ("B", ChapterMatch.ANCHOR)
