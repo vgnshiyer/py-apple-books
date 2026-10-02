@@ -69,8 +69,6 @@ READ = "read"
 UNREADABLE = "unreadable"
 NOT_DOWNLOADED = "not_downloaded"
 
-MODES = ("full", "subjects")
-
 
 @dataclass(frozen=True)
 class OpfFields:
@@ -959,12 +957,3 @@ def read_subjects(bundle) -> Optional[Tuple[str, ...]]:
     else:
         _subject_index.discard(key)
     return folded
-
-
-def subjects_match(needle: Optional[str], folded: Optional[Iterable[str]]) -> bool:
-    """Whether a ``search``-style needle (already folded) is in any of
-    the folded subjects."""
-    if needle is None or not folded:
-        return False
-    return any(needle in subject for subject in folded)
-
