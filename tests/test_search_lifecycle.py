@@ -526,21 +526,33 @@ def test_closes_during_cold_searches_stack_no_builds(lib, monkeypatch):
     """16 threads search while close() runs 40 times, 20 ms apart, during
     builds: every call returns every hit; a build by a call that can
     move on (not its last attempt) inserts at most the chunk in flight
-    once its index is discarded; and the last attempts share one index,
-    so at most 3 builds run at once (the current index's, the shared
-    one's, and one finishing its chunk). Before, each close() during a
-    build added one more concurrent full build (5-9 here), and at 20,000
-    annotations the calls waiting behind them hit the 30 s timeout."""
+    once its index is discarded; one build at a time per index; and the
+    last attempts share one index until an index completes a build while
+    current (once the closes stop, or if one is slower than a build).
+    So at most two full builds run at once (the current index's and the
+    shared one's), plus at most one chunk in flight on each discarded
+    index. Before, each close() during a build added one more
+    concurrent full build (5-9 here), and at 20,000 annotations the
+    calls waiting behind them hit the 30 s timeout.
+
+    Apart from the 30 s timeout, the bounds asserted hold however the
+    threads are scheduled. The number of fills at once does not (on a
+    busy machine more discarded indexes are still finishing their
+    chunk): reported, not asserted."""
     lib.populate(books=10, annotations_per_book=100)  # 1,000 more rows
     expected = len(PyAppleBooks(data_dir=lib.data_dir).search_annotations(QUERY, limit=None))
     assert expected == 1200
     monkeypatch.setattr(search, "_CHUNK", 50)
+    db = LibraryDB(data_dir=lib.data_dir)  # the default 30 s timeout
     local = threading.local()
     lock = threading.Lock()
     fills = []  # [index, if_discarded, inserts once the index was discarded]
-    running, most = [0], [0]
-    real_search, real_fill, real_run = (search.AnnotationIndex.search, search.AnnotationIndex._fill,
-                                        search._run)
+    running = {}  # index -> fills running on it
+    most_per_index, most = [0], [0]
+    ends = [0]  # builds completed while current: each ends the shared index's run
+    movable_started = threading.Event()
+    real_search, real_fill, real_run, real_end = (search.AnnotationIndex.search, search.AnnotationIndex._fill,
+                                                  search._run, search._end_finisher)
 
     def index_search(self, db, plan, **kwargs):
         local.if_discarded = kwargs.get("if_discarded", False)
@@ -550,15 +562,18 @@ def test_closes_during_cold_searches_stack_no_builds(lib, monkeypatch):
         record = [self, local.if_discarded, 0]
         with lock:
             fills.append(record)
-            running[0] += 1
-            most[0] = max(most[0], running[0])
+            running[self] = running.get(self, 0) + 1
+            most_per_index[0] = max(most_per_index[0], running[self])
+            most[0] = max(most[0], sum(running.values()))
+        if not record[1]:
+            movable_started.set()
         local.fill = record
         try:
             return real_fill(self, db, pending, *args)
         finally:
             local.fill = None
             with lock:
-                running[0] -= 1
+                running[self] -= 1
 
     def run_insert(conn, fn, deadline, limit):
         record = getattr(local, "fill", None)
@@ -568,10 +583,16 @@ def test_closes_during_cold_searches_stack_no_builds(lib, monkeypatch):
             time.sleep(0.005)  # a build spans several close() calls
         return real_run(conn, fn, deadline, limit)
 
+    def end_finisher(of):
+        if of is db:
+            with lock:
+                ends[0] += 1
+        return real_end(of)
+
     monkeypatch.setattr(search.AnnotationIndex, "search", index_search)
     monkeypatch.setattr(search.AnnotationIndex, "_fill", fill)
     monkeypatch.setattr(search, "_run", run_insert)
-    db = LibraryDB(data_dir=lib.data_dir)  # the default 30 s timeout
+    monkeypatch.setattr(search, "_end_finisher", end_finisher)
     stop = threading.Event()
 
     def loop():
@@ -582,6 +603,9 @@ def test_closes_during_cold_searches_stack_no_builds(lib, monkeypatch):
 
     workers = [in_thread(loop) for _ in range(16)]
     try:
+        # A build by a call that can move on is under way before the
+        # first close(), however slowly the threads start.
+        assert movable_started.wait(20)
         for _ in range(40):
             time.sleep(0.02)
             db.close()
@@ -596,7 +620,11 @@ def test_closes_during_cold_searches_stack_no_builds(lib, monkeypatch):
         r and (r[0][0], r[0][0] == "error" and type(r[0][1]).__name__) for r in results]
     movable = [record for record in fills if not record[1]]
     assert movable and max(record[2] for record in movable) <= 1, [record[2] for record in movable]
-    assert most[0] <= 3, most[0]
+    assert most_per_index[0] == 1
+    # A last attempt registers a new shared index only after a build
+    # completed while current ended the previous one's run.
+    shared = {id(record[0]) for record in fills if record[1]}
+    assert len(shared) <= 1 + ends[0], (len(shared), ends[0], most[0])
 
 
 def test_last_attempts_share_one_index(lib, db):
