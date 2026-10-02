@@ -111,9 +111,9 @@ what when where which while who whom why will with would you your yours yourself
 # CJK ideographs (unified, extension A, compatibility, extensions B-H),
 # Hangul syllables and jamo, Thai and Lao, Khmer, Myanmar.
 _NO_SPACE_SCRIPT = re.compile(
-    "[぀-ヿㇰ-ㇿ㐀-䶿一-鿿豈-﫿"
-    "\U00020000-\U000323af가-힯ᄀ-ᇿ㄰-㆏"
-    "฀-໿ក-៿က-႟]")
+    "[\u3040-\u30ff\u31f0-\u31ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+    "\U00020000-\U000323af\uac00-\ud7af\u1100-\u11ff\u3130-\u318f"
+    "\u0e00-\u0eff\u1780-\u17ff\u1000-\u109f]")
 
 
 class MatchMethod(str, Enum):
