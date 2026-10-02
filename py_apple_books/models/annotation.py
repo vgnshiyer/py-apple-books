@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Optional
 
 from py_apple_books.models.base import Model
 from py_apple_books.models.location import Location
-from py_apple_books.utils import apple_timestamp_to_datetime
+from py_apple_books.utils import _apple_datetime_or_none
 
 if TYPE_CHECKING:
     from py_apple_books.models.book import Book
@@ -113,8 +113,9 @@ class Annotation(Model):
         Converts the creation_date and modification_date from timestamp to datetime,
         and wraps the raw CFI string in a Location.
         """
-        self.creation_date = apple_timestamp_to_datetime(self.creation_date)
-        self.modification_date = apple_timestamp_to_datetime(self.modification_date)
+        # Tolerant (1.11): a corrupt date reads as None; a datetime is kept.
+        self.creation_date = _apple_datetime_or_none(self.creation_date)
+        self.modification_date = _apple_datetime_or_none(self.modification_date)
 
         if self.style in AnnotationColor._value2member_map_:
             self.color = AnnotationColor(self.style).name

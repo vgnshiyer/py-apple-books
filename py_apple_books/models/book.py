@@ -3,7 +3,7 @@ from enum import Enum
 from py_apple_books.models.base import Model
 from py_apple_books.models.annotation import _LIVE_ANNOTATIONS, Annotation
 from py_apple_books.models.relations import OneToMany
-from py_apple_books.utils import apple_timestamp_to_datetime
+from py_apple_books.utils import _apple_datetime_or_none
 import pathlib
 import re
 from datetime import datetime
@@ -128,12 +128,13 @@ class Book(Model):
             """The collections the book is in, deleted ones included."""
 
     def __post_init__(self):
-        self.creation_date = apple_timestamp_to_datetime(self.creation_date)
-        self.finished_date = apple_timestamp_to_datetime(self.finished_date)
-        self.last_opened_date = apple_timestamp_to_datetime(self.last_opened_date)
-        self.purchased_date = apple_timestamp_to_datetime(self.purchased_date)
-        if not isinstance(self.last_engaged_date, datetime):
-            self.last_engaged_date = apple_timestamp_to_datetime(self.last_engaged_date)
+        # Tolerant (1.11): a corrupt Core Data date reads as None instead
+        # of failing every list the row is in; a datetime is kept.
+        self.creation_date = _apple_datetime_or_none(self.creation_date)
+        self.finished_date = _apple_datetime_or_none(self.finished_date)
+        self.last_opened_date = _apple_datetime_or_none(self.last_opened_date)
+        self.purchased_date = _apple_datetime_or_none(self.purchased_date)
+        self.last_engaged_date = _apple_datetime_or_none(self.last_engaged_date)
         self.duration = float(self.duration) / 1000 if self.duration else None
         self.reading_progress = float(self.reading_progress) * 100 if self.reading_progress else None
         if self.author and _UNKNOWN_AUTHOR_PLACEHOLDER.fullmatch(self.author):

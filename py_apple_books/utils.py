@@ -10,6 +10,7 @@ collection of pure functions; anything with real domain weight
 from __future__ import annotations
 
 import configparser
+import math
 import pathlib
 import re
 from datetime import datetime
@@ -39,6 +40,34 @@ def apple_timestamp_to_datetime(raw):
     if raw is None:
         return None
     return datetime.fromtimestamp(float(raw) + APPLE_EPOCH_OFFSET)
+
+
+def _apple_datetime_or_none(raw) -> Optional[datetime]:
+    """:func:`apple_timestamp_to_datetime` for model fields, which never
+    raises: a corrupt date reads as None instead of failing every list
+    the row is in.
+
+    A datetime is returned as is, so the conversion is idempotent (a
+    model built from another one's fields keeps its dates). None for
+    None, for anything ``float()`` can't convert, for NaN and the
+    infinities, and for values outside the range a datetime can hold
+    on this platform (``OverflowError``, ``OSError``, ``ValueError``;
+    Core Data's distantPast, 0000-12-30, is one). Every other value
+    gives exactly what :func:`apple_timestamp_to_datetime` gives (naive
+    local time).
+    """
+    if raw is None or isinstance(raw, datetime):
+        return raw
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(seconds):
+        return None
+    try:
+        return datetime.fromtimestamp(seconds + APPLE_EPOCH_OFFSET)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
