@@ -571,8 +571,8 @@ class TestMixins:
             assert vars(mixin).get("__slots__") == ()
         public = {n for n in vars(_ResolveMixin) if not n.startswith("_")}
         assert public == {"resolve"}
-        # Stays the 2.1 stub until stream 3.3 fills it.
-        assert [n for n in vars(_ReadingMixin) if not n.startswith("__")] == []
+        public = {n for n in vars(_ReadingMixin) if not n.startswith("_")}
+        assert public == {"search", "resolve_boundary", "position_at_percent"}
 
     def test_pickling_is_unchanged(self, tmp_path):
         content = BookContent(write_epub(tmp_path / "B.epub", "B"), book_id=2)
