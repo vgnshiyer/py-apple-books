@@ -63,9 +63,15 @@ class TestLocalDay:
         with pytest.raises(InvalidArgumentError, match="^when must be"):
             _local_day("x", name="when")
 
-    def test_out_of_range_aware_datetime(self):
+    @pytest.mark.parametrize("value", [
+        # Instants before 0001-01-01 or after 9999-12-31 UTC: out of range
+        # in every local time zone (UTC itself included).
+        dt.datetime.min.replace(tzinfo=dt.timezone(dt.timedelta(hours=23, minutes=59))),
+        dt.datetime.max.replace(tzinfo=dt.timezone(-dt.timedelta(hours=23, minutes=59))),
+    ])
+    def test_out_of_range_aware_datetime(self, value):
         with pytest.raises(InvalidArgumentError, match="out of the range"):
-            _local_day(dt.datetime.min.replace(tzinfo=UTC))
+            _local_day(value)
 
 
 class TestWindow:
