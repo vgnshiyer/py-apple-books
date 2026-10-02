@@ -918,6 +918,28 @@ def test_data_dir_variable(tmp_path, monkeypatch, fresh_default_library):
     assert PyAppleBooks().get_cached_book_info("A")["A"].title == "Hidden"
 
 
+@pytest.mark.parametrize("form", ["default", "query_timeout", "annotation_db", "library_db_variable",
+                                  "data_dir_variable"])
+def test_every_constructor_form_finds_the_container(tmp_path, monkeypatch, fresh_default_library, form):
+    """No form needs a store: the fake HOME holds the caches only."""
+    lib = _container_at(tmp_path / "fakehome")
+    monkeypatch.setenv("HOME", str(lib.root))
+    for name in ("APPLE_BOOKS_DATA_DIR", "APPLE_BOOKS_LIBRARY_DB", "APPLE_BOOKS_ANNOTATION_DB"):
+        monkeypatch.delenv(name, raising=False)
+    if form == "library_db_variable":
+        monkeypatch.setenv("APPLE_BOOKS_LIBRARY_DB", str(lib.library_path))
+    elif form == "data_dir_variable":
+        monkeypatch.setenv("APPLE_BOOKS_DATA_DIR", str(lib.data_dir))
+    api = {"query_timeout": lambda: PyAppleBooks(query_timeout=5),
+           # The library store is then found in the default container.
+           "annotation_db": lambda: PyAppleBooks(annotation_db=tmp_path / "elsewhere.sqlite"),
+           }.get(form, PyAppleBooks)()
+    try:
+        assert api.get_cached_book_info("A")["A"].title == "Hidden"
+    finally:
+        api.close()
+
+
 def test_a_changed_folder_replaces_the_index(tmp_path, monkeypatch, fresh_default_library):
     first, second = _container_at(tmp_path / "one"), FixtureLibrary(tmp_path / "two")
     second.add_book_info_cache([{"asset_id": "A", "title": "Second"}])
