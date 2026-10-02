@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pickle
 import random
+import re
 import tracemalloc
 
 import pytest
@@ -387,6 +388,34 @@ def test_snap_parts_is_snap_window():
         b, h, a, cs, ce = _snap_parts(text, pos, length, before, after)
         expected = snap_window(text, pos, length, before, after)
         assert ("…" if cs else "") + b + h + a + ("…" if ce else "") == expected
+
+
+def test_snap_parts_splits_at_the_match():
+    """For a match bounded by non-whitespace (what the tiers find), the
+    highlight is the match with its whitespace collapsed, and the parts
+    around it are the rest of the window collapsed, the whitespace next
+    to the match kept in them."""
+    rng = random.Random(3110)
+    for _ in range(20_000):
+        text = _random_text(rng)
+        words = [m.span() for m in re.finditer(r"\S+", text)]
+        if not words:
+            continue
+        i = rng.randrange(len(words))
+        pos, end = words[i][0], words[min(len(words) - 1, i + rng.randrange(0, 4))][1]
+        before, after = rng.randrange(0, 40), rng.randrange(0, 40)
+        b, h, a, cs, ce = _snap_parts(text, pos, end - pos, before, after)
+        # The window, as snap_window cuts it.
+        start = max(0, pos - before)
+        if start > 0 and text.find(" ", start, pos) != -1:
+            start = text.find(" ", start, pos) + 1
+        stop = min(len(text), end + after)
+        if stop < len(text) and text.rfind(" ", end, stop) != -1:
+            stop = text.rfind(" ", end, stop)
+        assert h == re.sub(r"\s+", " ", text[pos:end])
+        assert b == re.sub(r"\s+", " ", text[start:pos]).lstrip()
+        assert a == re.sub(r"\s+", " ", text[end:stop]).rstrip()
+        assert (cs, ce) == (start > 0, stop < len(text))
 
 
 def test_str_matches_the_wrapper_whenever_it_finds_the_text(api, library, tmp_path):
