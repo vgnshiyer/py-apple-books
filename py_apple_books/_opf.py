@@ -35,6 +35,7 @@ an I/O error, a missing file or an iCloud placeholder.
 """
 
 import datetime as _dt
+import html
 import math
 import os
 import posixpath
@@ -42,7 +43,6 @@ import re
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from html.parser import HTMLParser
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 from xml.parsers import expat
@@ -121,7 +121,15 @@ _ISBN_SCHEMES = frozenset({"isbn", "isbn-13", "isbn-10", "isbn13", "isbn10"})
 _ONIX_ISBN = frozenset({"15", "02"})
 _BLOCK_TAGS = frozenset({"p", "br", "div", "li", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6",
                          "blockquote", "tr", "table", "section", "article", "dd", "dt", "hr", "pre"})
-_SKIP_TAGS = frozenset({"script", "style", "head", "title", "template"})
+_SKIP_TAGS = frozenset({"head", "title", "template"})  # content dropped
+_RAW_TEXT_TAGS = ("script", "style")  # raw text up to the end tag, dropped
+_RAW_TEXT_END = {name: re.compile(rf"</{name}(?=[\s/>]|$)", re.I) for name in _RAW_TEXT_TAGS}
+# How far past a '<' a tag's '>' is looked for (never past the next '<').
+_TAG_SCAN = 1024
+# A start or end tag's name, right after its '<' (None for '<!' and '<?').
+_TAG_NAME = re.compile(r"(/?)([A-Za-z][^\s/<>]*)")
+# A numeric character reference, as html.unescape finds them.
+_NUMERIC_REF = re.compile(r"&#(?:([xX])([0-9a-fA-F]+)|([0-9]+))(;?)")
 
 
 def clean_line(value, limit: int = TEXT_MAX) -> Optional[str]:
@@ -269,45 +277,97 @@ def clean_subjects(values: Iterable[Any], *, drop_urls: bool = True) -> Tuple[st
     return tuple(out)
 
 
-class _TextOnly(HTMLParser):
-    """HTML to text with the standard library parser: tags dropped
-    (script and style with their content), character references
-    converted, block tags made line breaks."""
+def _short_ref(match) -> str:
+    """A numeric reference without leading zeros, or U+FFFD (what
+    ``html.unescape`` makes of it) when more than 7 digits are left: no
+    character is that large."""
+    is_hex, hex_digits, digits, semicolon = match.groups()
+    digits = (hex_digits if is_hex else digits).lstrip("0") or "0"
+    return "\ufffd" if len(digits) > 7 else f"&#{is_hex or ''}{digits}{semicolon}"
 
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.parts: List[str] = []
-        self.skip = 0
 
-    def handle_starttag(self, tag, attrs):
-        if tag in _SKIP_TAGS:
-            self.skip += 1
-        elif tag in _BLOCK_TAGS:
-            self.parts.append("\n")
-
-    def handle_startendtag(self, tag, attrs):
-        if tag in _BLOCK_TAGS:
-            self.parts.append("\n")
-
-    def handle_endtag(self, tag):
-        if tag in _SKIP_TAGS:
-            self.skip = max(0, self.skip - 1)
-        elif tag in _BLOCK_TAGS:
-            self.parts.append("\n")
-
-    def handle_data(self, data):
-        if not self.skip:
-            self.parts.append(_SPACES.sub(" ", data))
+def _unescape(data: str) -> str:
+    """``html.unescape`` that can't fail: numeric references are made
+    short first, so ``int()`` never sees more digits than
+    ``sys.get_int_max_str_digits()`` allows (a ValueError otherwise)."""
+    if "&" not in data:
+        return data
+    try:
+        return html.unescape(_NUMERIC_REF.sub(_short_ref, data))
+    except (ValueError, OverflowError):  # pragma: no cover (defensive)
+        return data
 
 
 def _strip_html(text: str) -> str:
-    parser = _TextOnly()
-    try:
-        parser.feed(text)
-        parser.close()
-    except Exception:  # noqa: BLE001 (html.parser on odd input: keep what was read)
-        pass
-    return "".join(parser.parts)
+    """HTML to text: tags dropped (``script`` and ``style`` with their
+    content, ``head``, ``title`` and ``template`` content too), comments,
+    declarations and processing instructions dropped, character
+    references converted, block tags made line breaks; a ``<`` that
+    starts no tag is text.
+
+    A tokenizer of its own rather than ``html.parser``, which takes time
+    quadratic in the length of crafted malformed markup on Pythons
+    without the CVE-2025-6069 fix (3.10.17, for one: minutes for 64 KiB).
+    Here every step either moves past text or looks
+    at most :data:`_TAG_SCAN` characters ahead, stopping at the next
+    ``<``, so the time is linear in the length of ``text`` and the result
+    is the same on every Python.
+    """
+    parts: List[str] = []
+    pending: List[str] = []  # data since the last tag, unescaped together
+    skip = 0
+    pos, end = 0, len(text)
+
+    def flush() -> None:
+        if pending:
+            if not skip:
+                parts.append(_SPACES.sub(" ", _unescape("".join(pending))))
+            pending.clear()
+
+    while pos < end:
+        lt = text.find("<", pos)
+        if lt < 0:
+            pending.append(text[pos:])
+            break
+        if lt > pos:
+            pending.append(text[pos:lt])
+        if text.startswith("<!--", lt):
+            flush()
+            close = text.find("-->", lt + 2)  # "<!-->" is an empty comment
+            if close < 0:
+                break  # an unterminated comment runs to the end
+            pos = close + 3
+            continue
+        after = text[lt + 1:lt + 2]
+        if not (after.isascii() and after.isalpha()) and after not in ("/", "!", "?"):
+            pending.append("<")
+            pos = lt + 1
+            continue
+        limit = min(end, lt + 1 + _TAG_SCAN)
+        next_lt = text.find("<", lt + 1, limit)
+        gt = text.find(">", lt + 1, next_lt if next_lt >= 0 else limit)
+        match = _TAG_NAME.match(text, lt + 1, gt) if gt >= 0 else None
+        if gt < 0 or (after == "/" and match is None):
+            pending.append("<")  # no tag after all: the '<' is text
+            pos = lt + 1
+            continue
+        flush()
+        pos = gt + 1
+        if match is None:
+            continue  # <!DOCTYPE ...>, <![CDATA[...]>, <?...?>: dropped
+        closing, name = match.group(1) == "/", match.group(2).lower()
+        self_closing = not closing and text[gt - 1] == "/"
+        if name in _BLOCK_TAGS:
+            parts.append("\n")
+        elif name in _RAW_TEXT_TAGS and not closing and not self_closing:
+            # Script and style hold raw text up to their end tag.
+            raw_end = _RAW_TEXT_END[name].search(text, pos)
+            close = text.find(">", raw_end.end()) if raw_end is not None else -1
+            pos = end if close < 0 else close + 1
+        elif name in _SKIP_TAGS and not self_closing:
+            skip = max(0, skip - 1) if closing else skip + 1
+    flush()
+    return "".join(parts)
 
 
 def clean_description(value) -> Optional[str]:

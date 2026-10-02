@@ -347,6 +347,23 @@ class TestSubjectsAndDescription:
         text = _opf.clean_description(("word " * 5000).strip())
         assert len(text) <= _opf.DESCRIPTION_MAX and text.endswith("word…")
 
+    @pytest.mark.parametrize("markup, expected", [
+        ("<div><b>Bold</b> and <i>it</i><br/>next<BR>line</div>", "Bold and it\nnext\nline"),
+        ("<p>a</p><!-- <p>hidden</p> --><p>b</p><!-->c", "a\nb\nc"),
+        ("<style>p{}</style><script>if (a<b && c>d) x = '<p>'</script >after", "after"),
+        ("<SCRIPT>x</Script><script/>kept", "kept"),
+        ("<head><title>T</title></head><template><p>no</p></template>yes", "yes"),
+        ("<!DOCTYPE html><?xml version='1.0'?><![CDATA[x]]>text", "text"),
+        ("AT&amp;T &eacute;l&egrave;ve &#233; &#x263A;", "AT&T élève é ☺"),
+        ("1 <2 >0 and a</ b", "1 <2 >0 and a</ b"),
+        ("<p>unterminated <b", "unterminated <b"),  # the same on every Python
+        ("&#99999999999; &#xFFFFFFFFFF; &#" + "9" * 6000 + "; &#" + "0" * 6000 + "65; &#00000000065 &#x0041;",
+         "\ufffd \ufffd \ufffd A A A"),
+    ], ids=["inline-and-break", "comments", "raw-text", "raw-text-case", "skipped", "declarations",
+            "references", "stray-brackets", "unterminated", "huge-references"])
+    def test_description_markup(self, markup, expected):
+        assert _opf.clean_description(markup) == expected
+
 
 class TestSeries:
     def test_calibre(self, tmp_path):
@@ -488,6 +505,32 @@ class TestLimits:
         got = fields(path)
         assert time.process_time() - started < 1
         assert len(got.description) <= _opf.DESCRIPTION_MAX
+
+    # Crafted malformed markup that makes html.parser quadratic on
+    # Pythons without the CVE-2025-6069 fix (3.10.17, for one): seconds
+    # per 16 KiB, minutes per 64 KiB.
+    CRAFTED = {"open-attr": "<x ", "open": "<a", "comment": "<!--", "end": "</x", "decl": "<!", "p": "<p",
+               "long-attr": "<a " + "x" * 1100, "charref": "&#", "script": "<script>"}
+
+    @pytest.mark.parametrize("unit", list(CRAFTED.values()), ids=list(CRAFTED))
+    def test_crafted_description_is_linear(self, unit):
+        text = (unit * (_opf.RAW_DESCRIPTION_MAX // len(unit) + 1))[:_opf.RAW_DESCRIPTION_MAX]
+        started = time.process_time()  # CPU time (wall time varies with load)
+        got = _opf.clean_description(text)
+        assert time.process_time() - started < 1
+        assert got is None or len(got) <= _opf.DESCRIPTION_MAX
+
+    @pytest.mark.parametrize("unit", ["<x ", "<a", "<!--", "</x"], ids=["open-attr", "open", "comment", "end"])
+    def test_crafted_description_in_a_package(self, tmp_path, unit):
+        escaped = unit.replace("&", "&amp;").replace("<", "&lt;")
+        count = _opf.RAW_DESCRIPTION_MAX // len(unit) + 1
+        path = bundle(tmp_path, opf("<dc:description>" + escaped * count + "</dc:description>"
+                                    "<dc:subject>A</dc:subject>"))
+        started = time.process_time()
+        got = fields(path)
+        assert time.process_time() - started < 1
+        assert got.subjects == ("A",)
+        assert got.description is None or len(got.description) <= _opf.DESCRIPTION_MAX
 
     def test_over_the_read_budget(self, tmp_path):
         path = bundle(tmp_path, opf("<dc:subject>A</dc:subject>", "<item/>" * 700_000))

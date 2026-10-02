@@ -114,6 +114,16 @@ class TestRead:
         assert (got.published, got.year) == ("2019-01-01", 2019)
         assert not {"published", "year"} & got.book_file_fields
 
+    def test_crafted_library_description_is_linear(self, lib):
+        """The library's own description goes through the same HTML
+        stripping on every call (read_files=False included)."""
+        book = add(lib)
+        set_columns(lib, book, ZBOOKDESCRIPTION="<x " * 30_000)
+        started = time.process_time()  # CPU time (wall time varies with load)
+        got = lib.api.get_book_metadata(book, read_files=False)
+        assert time.process_time() - started < 1
+        assert got.description is not None and len(got.description) <= 16_000
+
     def test_implausible_library_year_falls_through(self, lib, tmp_path):
         book = add(lib, epub(tmp_path))
         set_columns(lib, book, ZYEAR="0101")
