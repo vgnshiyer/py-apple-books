@@ -1,10 +1,10 @@
 """Engagement: resurfacing highlights, the days they were made,
-highlighted words and highlight activity (1.11).
+highlighted words, highlight activity and reading goals (1.11).
 
 The engagement methods of :class:`~py_apple_books.PyAppleBooks` read the
-Apple Books databases, never a book file. This module holds their types
-and what they share: the date rules of the 1.11 methods and the
-sampling algorithm.
+Apple Books databases (and, for reading goals, Books' preferences
+file), never a book file. This module holds their types and what they
+share: the date rules of the 1.11 methods and the sampling algorithm.
 
 Dates in new methods (1.11):
 
