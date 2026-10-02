@@ -335,3 +335,38 @@ def test_find_passage_long_passage_in_long_text_stays_fast():
     start = time.perf_counter()
     assert len(_find_passage(text, words)) == 1
     assert time.perf_counter() - start < 0.5
+
+
+def fold_1_10(s):
+    """fold_for_match as released in 1.10.0, vendored."""
+    if s is None:
+        return None
+    if not isinstance(s, str):
+        if isinstance(s, (bytes, bytearray)):
+            s = s.decode("utf-8", "replace")
+        else:
+            try:
+                s = str(s)
+            except Exception:
+                return None
+    if s.isascii():
+        return text_module._WHITESPACE.sub(" ", s).lower()
+    try:
+        s.encode("utf-8")
+    except UnicodeEncodeError:
+        s = s.encode("utf-8", "surrogatepass").decode("utf-8", "replace")
+    s = unicodedata.normalize("NFKD", s.casefold()).casefold().translate(text_module._MAP)
+    return text_module._WHITESPACE.sub(" ", unicodedata.normalize("NFC", s))
+
+
+def test_fold_for_match_output_is_unchanged_from_1_10():
+    import random
+
+    rnd = random.Random(19)
+    pool = [chr(cp) for cp in (0x41, 0x61, 0x20, 0x0A, 0xA0, 0xAD, 0xDF, 0xE9, 0x130, 0x301, 0x2019,
+                                0x2014, 0x2026, 0xFB01, 0xD800, 0xDC00, 0x3042, 0x1F600, 0x1D400)]
+    values = list(ODD_INPUTS) + [b"\xff\xfe", 10 ** 5000]
+    for _ in range(3000):
+        values.append("".join(rnd.choice(pool) for _ in range(rnd.randint(0, 12))))
+    for value in values:
+        assert fold_for_match(value) == fold_1_10(value), ascii(value)

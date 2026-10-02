@@ -2,7 +2,7 @@
 break points.
 
 Pure functions on strings: no I/O, and no imports from the rest of the
-package (the models and the database client import this module).
+package (other modules of the package import this one).
 
 Apple Books keeps highlights and titles with typographic punctuation
 (’ “ ” – —), line breaks, non-breaking spaces and accents, while
