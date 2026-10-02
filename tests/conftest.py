@@ -48,7 +48,9 @@ def pytest_unconfigure(config):
 PREFS_PLIST = "Library/Preferences/com.apple.iBooksX.plist"
 BOOK_INFO_CACHES = "Library/Caches/AEEpubInfoSource"
 # Modules (added in 1.11) whose ``default_*_path()``/``default_*_dir()``
-# functions name such files; checked too once they exist.
+# functions name such files; checked too once they exist. Every such
+# function that takes no required argument is called; one may return
+# None (no default here: nothing to read), which the guard skips.
 _DEFAULT_LOCATION_MODULES = ("py_apple_books._prefs", "py_apple_books.book_info")
 
 
@@ -78,7 +80,9 @@ def _library_locations():
             fn = getattr(module, attr)
             if (attr.startswith("default_") and attr.endswith(("_path", "_dir"))
                     and callable(fn) and not isinstance(fn, type) and _no_required_args(fn)):
-                found.append((f"{name}.{attr}()", fn()))
+                location = fn()
+                if location is not None:  # None: no default location, nothing read
+                    found.append((f"{name}.{attr}()", location))
     return found
 
 
