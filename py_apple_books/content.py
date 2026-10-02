@@ -763,7 +763,10 @@ class SpineText:
     @property
     def end(self) -> TextPosition:
         """Just after :attr:`text` (exclusive): pass it as ``start`` to
-        continue from here."""
+        continue from here. For an item that isn't :attr:`readable`, the
+        start of the next spine item, so that continuing moves past it."""
+        if not self.readable:
+            return TextPosition(self.index + 1, 0)
         return TextPosition(self.index, self.offset + len(self.text))
 
     @property

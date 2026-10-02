@@ -410,6 +410,23 @@ class TestIterSpineText:
         assert [(c.index, c.readable, c.text) for c in chunks] == [
             (0, True, "one"), (1, False, ""), (2, False, ""), (3, False, ""), (4, True, "three")]
         assert not chunks[1].complete and chunks[1].length == 0
+        # Continuing from an unreadable item's end moves past it.
+        assert chunks[1].position == TextPosition(1, 0)
+        assert chunks[1].end == TextPosition(2, 0)
+        assert chunks[0].end == TextPosition(0, 3)
+
+        # One chunk per page, each page resumed at the last chunk's end:
+        # terminates and reports every item exactly once.
+        seen, start = [], None
+        for _ in range(20):
+            chunk = next(content.iter_spine_text(start=start), None)
+            if chunk is None:
+                break
+            seen.append((chunk.index, chunk.readable))
+            start = chunk.end
+        else:
+            raise AssertionError(f"paging by chunk.end doesn't terminate: {seen}")
+        assert seen == [(0, True), (1, False), (2, False), (3, False), (4, True)]
 
         def got(**kwargs):
             return [(c.index, c.readable) for c in content.iter_spine_text(**kwargs)]
