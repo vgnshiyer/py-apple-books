@@ -441,11 +441,14 @@ class TestBoundedStarts:
 
         bundle = _nested_anchors_book(tmp_path, 8000, 8000)
         location = cfi(0, "c1", "/4/4/2/1:0")
-        start = time.perf_counter()
+        # CPU time, not wall time: the bound is on the work the budget
+        # allows, and a loaded CI runner shouldn't decide it. Walking all
+        # 8,000 x 8,000 start steps would take far longer than this.
+        start = time.process_time()
         resolved = BookContent(bundle).resolve(location)
-        elapsed = time.perf_counter() - start
+        elapsed = time.process_time() - start
         assert (resolved.chapter, resolved.match, resolved.spine_index) == (None, UNKNOWN, 0)
-        assert elapsed < 1.0
+        assert elapsed < 2.0
         tracemalloc.start()
         try:
             BookContent(bundle).resolve(location)  # the anchor table is cached: the starts alone

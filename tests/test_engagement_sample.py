@@ -468,9 +468,13 @@ class TestPerformance:
         library.populate(books=100, annotations_per_book=count // 100)
         engagement_helpers.realistic_texts(library)
         api.sample_highlights(on=DAY)  # warm: connection and schema
-        start = time.perf_counter()
-        picks = list(api.sample_highlights(on=DAY))
-        elapsed = time.perf_counter() - start
+        # Fastest of three, like test_search_scale.best_of: one slow run
+        # on a loaded machine shouldn't decide the budget.
+        elapsed = float("inf")
+        for _ in range(3):
+            start = time.perf_counter()
+            picks = list(api.sample_highlights(on=DAY))
+            elapsed = min(elapsed, time.perf_counter() - start)
         assert len(picks) == 5
         budget = (0.15 if count == 10_000 else 1.0) if engagement_helpers.SLOW else 3.0
         assert elapsed < budget, f"{count}: {elapsed:.3f} s"
