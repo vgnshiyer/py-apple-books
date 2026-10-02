@@ -30,8 +30,9 @@ _HIGHLIGHT = int(AnnotationType.HIGHLIGHT)
 # parameter limit on older versions).
 _FETCH_BY_ID_MAX = 500
 
-# The columns sample_highlights ranks from (one narrow query).
-_SAMPLE_FIELDS = ("id", "uuid", "asset_id", "type", "note", "selected_text", "creation_date")
+# The columns sample_highlights ranks from (one narrow query; the
+# filters do the rest in SQL).
+_SAMPLE_FIELDS = ("id", "uuid", "asset_id", "note", "selected_text")
 
 
 def _require_annotation_store() -> None:
