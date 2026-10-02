@@ -26,6 +26,10 @@ everything else requires the book itself:
 * :attr:`sort_key` — a tuple of the CFI's step and offset integers;
   sorting by it puts locations in document order.
 
+:class:`PageLocation` is the other position Apple Books records: the
+page (PDFs) or spine item (EPUB bookmarks without a CFI) of a bookmark
+row, kept as a small property list in ``ZPLUSERDATA``.
+
 Nothing here depends on a :class:`~py_apple_books.content.BookContent`
 or on the rest of the library. Resolving ``chapter_id`` to an actual
 chapter, or extracting text around a location, is done at the facade
@@ -37,6 +41,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
+
+# Placeholder for "not in the instance's __dict__".
+_UNSET = object()
 
 
 # ``epubcfi(...)`` wrapper. The body can contain any character; we
@@ -64,13 +71,15 @@ _ASSERTION = re.compile(r"\[(?:\^.?|[^\]^])*(\]|\Z)")
 _STEP_OR_OFFSET = re.compile(r"/(\d+)|:(\d+)")
 
 
-def _cfi_sort_key(cfi: str) -> Optional[Tuple[int, ...]]:
+def _cfi_sort_key(cfi: str, end: bool = False) -> Optional[Tuple[int, ...]]:
     """Document-order sort key: the integers of the CFI's ``/N`` steps and
     ``:N`` offsets, in order.
 
     For a range CFI (``epubcfi(parent,start,end)``) the key covers the
-    parent path followed by the start, so a range sorts where it begins.
-    ``None`` for anything that isn't an ``epubcfi(...)`` with steps.
+    parent path followed by the start, so a range sorts where it begins;
+    with ``end=True``, the parent path followed by the end (the start
+    when the CFI has no end). ``None`` for anything that isn't an
+    ``epubcfi(...)`` with steps.
     """
     if not cfi:
         return None
@@ -80,9 +89,11 @@ def _cfi_sort_key(cfi: str) -> Optional[Tuple[int, ...]]:
     body = _ASSERTION.sub(lambda hit: "" if hit.group(1) else hit.group(0), m.group(1))
     # Assertions are gone, so every remaining comma is top-level.
     parent, _, rest = body.partition(",")
-    start = rest.partition(",")[0]
+    start, _, tail = rest.partition(",")
+    stop = tail.partition(",")[0]
+    path = parent + (stop if end and stop else start)
     try:
-        ints = [int(a or b) for a, b in _STEP_OR_OFFSET.findall(parent + start)]
+        ints = [int(a or b) for a, b in _STEP_OR_OFFSET.findall(path)]
     except ValueError:  # more digits than int() accepts from a string
         return None
     return tuple(ints) or None
@@ -170,6 +181,23 @@ class Location:
         object.__setattr__(self, "sort_key", sort_key)
         object.__setattr__(self, "spine_index", _spine_index(sort_key))
 
+    @property
+    def end_sort_key(self) -> Optional[Tuple[int, ...]]:
+        """The document-order key of where the location ends: for a range
+        CFI, its parent path followed by its end (so a highlight's range
+        lies between ``sort_key`` and ``end_sort_key``); for any other
+        CFI, :attr:`sort_key`. None when :attr:`sort_key` is None.
+
+        Computed on each access rather than stored, so a
+        :class:`Location` pickled by 1.10 loads and has it too.
+        """
+        start = self.__dict__.get("sort_key", _UNSET)
+        if start is _UNSET:  # unpickled from a version without sort_key
+            start = _cfi_sort_key(self.cfi)
+        if start is None:
+            return None
+        return _cfi_sort_key(self.cfi, end=True)
+
     def __bool__(self) -> bool:
         return bool(self.cfi)
 
@@ -177,3 +205,84 @@ class Location:
         """The raw CFI string — lets ``str(location)`` round-trip with
         anyone expecting the underlying representation."""
         return self.cfi
+
+
+# -- page locations -----------------------------------------------------------
+
+#: The largest ``ZPLUSERDATA`` blob :meth:`PageLocation.from_plist` decodes
+#: (a page location is a few small values).
+MAX_PAGE_LOCATION_BYTES = 64 * 1024
+#: The largest page offset or ordinal :meth:`PageLocation.from_plist` accepts.
+MAX_PAGE_INDEX = 10_000_000
+
+
+def _page_index(value) -> bool:
+    """Whether ``value`` is a plausible page offset or ordinal: an int
+    (not a bool) in ``0..MAX_PAGE_INDEX``."""
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_PAGE_INDEX
+
+
+@dataclass(frozen=True)
+class PageLocation:
+    """A position by page, as Apple Books records it on bookmark and
+    reading-position rows (``Annotation.location_data``, a property list
+    of class ``BKPageLocation``).
+
+    :attr ordinal: the 0-based spine index (``super.ordinal``); 0 for a
+        PDF, whose position is :attr:`page_offset`.
+    :attr page_offset: the 0-based page (PDFs), or None when the
+        property list has none.
+
+    Read it from an annotation with :attr:`Annotation.page_location`, or
+    from raw bytes with :meth:`from_plist`.
+    """
+
+    ordinal: int
+    page_offset: Optional[int]
+
+    @property
+    def page(self) -> Optional[int]:
+        """The 1-based page number (``page_offset + 1``), or None."""
+        return None if self.page_offset is None else self.page_offset + 1
+
+    @classmethod
+    def from_plist(cls, data) -> Optional["PageLocation"]:
+        """The page location a ``ZPLUSERDATA`` blob holds, or None.
+
+        Accepts Apple's binary property list (or the XML form) of a
+        dictionary with ``pageOffset`` and/or ``super: {ordinal}``; a
+        missing ``super`` gives ordinal 0. Never raises: None for
+        anything but bytes, for empty data or data over
+        :data:`MAX_PAGE_LOCATION_BYTES`, for data that isn't a property
+        list, for an ``NSKeyedArchiver`` archive, for a top level that
+        isn't a dictionary (or has neither key), and for a page offset or
+        ordinal that isn't an int in ``0..MAX_PAGE_INDEX``.
+        """
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            return None
+        try:
+            size = memoryview(data).nbytes
+        except (TypeError, ValueError):
+            return None
+        if not size or size > MAX_PAGE_LOCATION_BYTES:
+            return None
+        import plistlib  # imported on first use, not when the package is imported
+
+        try:
+            obj = plistlib.loads(bytes(data))
+        except Exception:  # noqa: BLE001 - any malformed input means "no page location"
+            return None
+        if not isinstance(obj, dict) or "$archiver" in obj or "$objects" in obj:
+            return None
+        parent = obj.get("super")
+        if parent is not None and not isinstance(parent, dict):
+            return None
+        has_offset = "pageOffset" in obj
+        has_ordinal = parent is not None and "ordinal" in parent
+        if not (has_offset or has_ordinal):
+            return None
+        page_offset = obj["pageOffset"] if has_offset else None
+        ordinal = parent["ordinal"] if has_ordinal else 0
+        if (has_offset and not _page_index(page_offset)) or not _page_index(ordinal):
+            return None
+        return cls(ordinal=ordinal, page_offset=page_offset)

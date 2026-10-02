@@ -7,6 +7,7 @@ responsibility, tested elsewhere.
 """
 
 import dataclasses
+import pickle
 import random
 
 import pytest
@@ -185,3 +186,79 @@ class TestSortKeyAndSpineIndex:
         assert repr(a) == f"Location(cfi={cfi!r}, chapter_id='c3', char_range=(629, 691))"
         assert [f.name for f in dataclasses.fields(Location) if f.compare] == ["cfi", "chapter_id", "char_range"]
         assert [f.name for f in dataclasses.fields(Location) if f.init] == ["cfi"]
+
+
+class TestEndSortKey:
+    """``end_sort_key`` (1.11): where a location ends, for range checks
+    such as "is this highlight before the reading position"."""
+
+    def test_range_ends_at_its_end(self):
+        loc = Location("epubcfi(/6/4[chap1]!/4/4,/1:0,/1:21)")
+        assert loc.sort_key == (6, 4, 4, 4, 1, 0)
+        assert loc.end_sort_key == (6, 4, 4, 4, 1, 21)
+
+    def test_range_with_offsets_only(self):
+        loc = Location("epubcfi(/6/8[c3]!/4/2[p1]/18/1,:629,:691)")
+        assert loc.end_sort_key == (6, 8, 4, 2, 18, 1, 691)
+
+    def test_range_end_in_another_element(self):
+        loc = Location("epubcfi(/6/8!/4/2,/18/1:5,/20/3:2)")
+        assert (loc.sort_key, loc.end_sort_key) == ((6, 8, 4, 2, 18, 1, 5), (6, 8, 4, 2, 20, 3, 2))
+
+    @pytest.mark.parametrize("cfi", [
+        "epubcfi(/6/2[cover]!/4/2/1:0)",
+        "epubcfi(/6/10!/4/2/2/1:7)",
+        "epubcfi(/6/4!/4/10/1,:3)",       # a start but no end
+        "epubcfi(/6/4!/4/10/1,:3,)",      # an empty end
+    ])
+    def test_otherwise_the_sort_key(self, cfi):
+        loc = Location(cfi)
+        assert loc.sort_key is not None and loc.end_sort_key == loc.sort_key
+
+    @pytest.mark.parametrize("cfi", ["", "x", "epubcfi()", "epubcfi([id])", "epubcfi(,,/4/2:5)",
+                                     "epubcfi(,/1:0,/1:5)x"])
+    def test_none_when_the_sort_key_is(self, cfi):
+        loc = Location(cfi)
+        assert loc.sort_key is None and loc.end_sort_key is None
+
+    def test_assertions_are_ignored(self):
+        plain = Location("epubcfi(/6/4!/4/10/1,:3,:9)")
+        asserted = Location("epubcfi(/6/4[ch^]1]!/4/10[a,b:7/2]/1,:3[x,y],:9[p,q])")
+        assert asserted.end_sort_key == plain.end_sort_key == (6, 4, 4, 10, 1, 9)
+
+    def test_oversized_end_does_not_raise(self):
+        loc = Location("epubcfi(/6/4!/4,/1:0,/1:" + "9" * 5000 + ")")
+        assert loc.sort_key == (6, 4, 4, 1, 0)
+        assert loc.end_sort_key is None or loc.end_sort_key[-1] > 10 ** 4000
+
+    def test_document_order(self):
+        """A range spans from sort_key to end_sort_key: points inside it
+        sort between the two."""
+        for cfi in TestSortKeyAndSpineIndex.DOCUMENT_ORDER:
+            loc = Location(cfi)
+            assert loc.sort_key <= loc.end_sort_key
+        highlight = Location("epubcfi(/6/8[c3]!/4/2[p1]/18/1,:10,:691)")
+        inside = Location("epubcfi(/6/8[c3]!/4/2[p1]/18/1:400)")
+        after = Location("epubcfi(/6/8[c3]!/4/2[p1]/18/1:700)")
+        assert highlight.sort_key < inside.sort_key < highlight.end_sort_key < after.sort_key
+
+    def test_computed_not_stored(self):
+        """Not a field, not in __dict__: ==, hash(), repr() and pickles
+        are as in 1.10, and a 1.10 pickle has it."""
+        cfi = "epubcfi(/6/8[c3]!/4/2[p1]/18/1,:629,:691)"
+        loc = Location(cfi)
+        assert loc.end_sort_key == (6, 8, 4, 2, 18, 1, 691)
+        assert "end_sort_key" not in loc.__dict__
+        assert "end_sort_key" not in {f.name for f in dataclasses.fields(Location)}
+        assert "end_sort_key" not in repr(loc)
+        clone = pickle.loads(pickle.dumps(loc))
+        assert clone == loc and clone.end_sort_key == loc.end_sort_key
+
+    def test_state_without_sort_key(self):
+        """A Location unpickled from a version that had no sort_key."""
+        loc = object.__new__(Location)
+        loc.__dict__.update(cfi="epubcfi(/6/4!/4,/1:0,/1:21)", chapter_id=None, char_range=(0, 21))
+        assert loc.end_sort_key == (6, 4, 4, 1, 21)
+        empty = object.__new__(Location)
+        empty.__dict__.update(cfi="", chapter_id=None, char_range=None)
+        assert empty.end_sort_key is None
