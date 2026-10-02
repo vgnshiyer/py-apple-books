@@ -1,12 +1,6 @@
-"""The :class:`~py_apple_books.PyAppleBooks` mixin for PDF highlights (the optional ``[pdf]``
-extra).
-
-Empty until its stream adds the planned methods:
-
-- ``read_pdf_highlights``
-- ``scan_pdf_highlights``
-- ``get_pdf_highlight``
-- ``get_pdf_highlight_surrounding_text``
+"""A private, empty :class:`~py_apple_books.PyAppleBooks` mixin, kept as
+a placeholder for PDF support in a later release. It adds no methods and
+no public API.
 
 See ``py_apple_books._api`` for the rules mixin code follows.
 """

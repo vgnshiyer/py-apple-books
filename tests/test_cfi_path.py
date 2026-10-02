@@ -2,6 +2,7 @@
 the steps after the first ``!``, with id assertions, for placing a
 location in its spine file."""
 
+import os
 import random
 import time
 
@@ -73,7 +74,7 @@ def test_agrees_with_the_sort_key():
 def test_never_raises_on_noise():
     rng = random.Random(1110)
     alphabet = "/!,:[]^;~@0123456789abc() é"
-    for _ in range(3000):
+    for _ in range(int(os.environ.get("APPLE_BOOKS_FUZZ_ITERATIONS", "3000"))):
         body = "".join(rng.choice(alphabet) for _ in range(rng.randrange(0, 40)))
         result = _content_path(f"epubcfi({body})")
         assert result is None or isinstance(result, tuple)

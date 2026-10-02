@@ -603,16 +603,27 @@ def test_books_closing_a_wal_cache_during_the_read(home, reader, monkeypatch, ca
     books.execute("PRAGMA wal_autocheckpoint=0")
     key = f"{cases.SECRET}ZDATABASEKEY-1"
     real_connect = book_info._connect
+    # Descriptors on the old -wal and -shm keep their inodes allocated, so
+    # the files the read-only open creates get new (st_dev, st_ino) as
+    # they would on APFS: ext4 and overlayfs would otherwise hand the
+    # freed numbers straight back, and the change would be invisible.
+    held = []
 
     def connect(uri, busy):
         if books is not None:
+            held.extend(os.open(f"{path}-{suffix}", os.O_RDONLY) for suffix in ("wal", "shm"))
             books.close()  # checkpoints and removes -wal and -shm
             assert cases.sidecars(path) == []
         return real_connect(uri, busy)
 
     monkeypatch.setattr(book_info, "_connect", connect)
-    with caplog.at_level(logging.DEBUG, logger="py_apple_books"):
-        assert reader.get_cached_book_info(key) == {}
+    try:
+        with caplog.at_level(logging.DEBUG, logger="py_apple_books"):
+            assert reader.get_cached_book_info(key) == {}
+    finally:
+        for fd in held:
+            os.close(fd)
+    assert len(held) == 2
     assert cases.sidecars(path) == [f"{cases.CACHE_NAME}-shm", f"{cases.CACHE_NAME}-wal"]
     assert [r.getMessage() for r in caplog.records] == [
         f"AEBookInfo cache {cases.CACHE_NAME} skipped: SidecarsChanged"]

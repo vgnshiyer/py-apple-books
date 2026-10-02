@@ -50,10 +50,10 @@ jobs:
         run: uv build -p "$PYTHON"
       - name: Check metadata
         run: uvx twine check --strict dist/*
-      - name: Check contents against the 1.9.1 wheel
+      - name: Check contents against the 1.10.0 wheel
         run: |
-          uvx pip download --no-deps --only-binary :all: py-apple-books==1.9.1 -d base/
-          uv run --no-project -p "$PYTHON" python scripts/check_dist.py --baseline-wheel base/py_apple_books-1.9.1-py3-none-any.whl
+          uvx pip download --no-deps --only-binary :all: py-apple-books==1.10.0 -d base/
+          uv run --no-project -p "$PYTHON" python scripts/check_dist.py --baseline-wheel base/py_apple_books-1.10.0-py3-none-any.whl
       - name: Run tests against the installed wheel
         run: |
           venv="$RUNNER_TEMP/venv"

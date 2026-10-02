@@ -2,6 +2,7 @@
 text.find_folded (fold_for_match applied character by character, with
 the matches reported as offsets into the original text)."""
 
+import os
 import random
 import threading
 import time
@@ -198,11 +199,13 @@ def test_whitespace_folds_to_one_space():
 # ZWSP, ß/ẞ, ligatures, ellipsis, combining accents, İ/ı and Σ/σ/ς.
 POOL = list("abcdeEfsSit '’\"“-—– \u00a0\u00ad\u200béÉèßẞﬁﬀ…\u0301\u0308ñÑøØæŒœ\n\t.,İıΣσς")
 ZERO_MARKS = {"\u0301", "\u0308"}
+# Strings per fuzz test; APPLE_BOOKS_FUZZ_ITERATIONS raises it (e.g. 20000).
+ITERATIONS = int(os.environ.get("APPLE_BOOKS_FUZZ_ITERATIONS", "2000"))
 
 
 def test_per_character_fold_equals_fold_for_match_on_latin_text():
     rnd = random.Random(11)
-    for _ in range(2000):
+    for _ in range(ITERATIONS):
         s = "".join(rnd.choice(POOL) for _ in range(rnd.randint(0, 30)))
         assert T._per_char_fold(s) == fold_for_match(s), ascii(s)
 
@@ -211,7 +214,7 @@ def test_fuzz_soundness_and_recall():
     rnd = random.Random(7)
     cases = 0
     start = time.perf_counter()
-    for _ in range(2000):
+    for _ in range(ITERATIONS):
         hay = "".join(rnd.choice(POOL) for _ in range(rnd.randint(5, 40)))
         a = rnd.randint(0, len(hay) - 1)
         b = rnd.randint(a + 1, len(hay))
@@ -233,8 +236,8 @@ def test_fuzz_soundness_and_recall():
             assert hay[s] not in ZERO_MARKS
             assert e == len(hay) or hay[e] not in ZERO_MARKS
             last = e
-    assert cases > 1500
-    assert time.perf_counter() - start < 2
+    assert cases > ITERATIONS * 3 // 4
+    assert time.perf_counter() - start < 2 * max(1, ITERATIONS / 2000)
 
 
 # --- shared state and cost ---------------------------------------------------------

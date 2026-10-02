@@ -35,6 +35,11 @@ ENV_PREFIX = "APPLE_BOOKS_"
 # after every other APPLE_BOOKS_* variable is removed.
 TEST_CONTROL_VARS = ("APPLE_BOOKS_LIVE_TESTS", "APPLE_BOOKS_FUZZ_ITERATIONS", "APPLE_BOOKS_SLOW_TESTS")
 
+# APPLE_BOOKS_SLOW_TESTS: run the scale tests at release-gate sizes and
+# hold the timing tests to their strict budgets (soft by default: CI
+# machines vary).
+SLOW = os.environ.get("APPLE_BOOKS_SLOW_TESTS", "") not in ("", "0")
+
 # The developer's environment as it was before isolate_environment().
 REAL_HOME: Optional[str] = os.environ.get("HOME")
 POPPED_ENV: Dict[str, str] = {}

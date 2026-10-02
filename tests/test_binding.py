@@ -190,7 +190,12 @@ def test_non_sqlite_error_in_execute_is_db_query_error(api, library, monkeypatch
         def execute(self, *args):
             raise RuntimeError("boom")
 
-    monkeypatch.setattr(client, "cursor", FailingCursor())
+    # monkeypatch reads the old value first, through the deprecated
+    # getter: it warns (attributed to _pytest, so the suite's error
+    # filter misses it) unless an earlier read left a cursor behind.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", r"AppleBooksDBClient\.conn is deprecated", DeprecationWarning)
+        monkeypatch.setattr(client, "cursor", FailingCursor())
     with pytest.raises(DBQueryError, match="Unexpected error while executing query: boom") as exc:
         list(api.list_books())
     assert isinstance(exc.value, DBError)  # what 1.9.1 raised here
