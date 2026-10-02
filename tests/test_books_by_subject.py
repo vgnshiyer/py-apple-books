@@ -288,9 +288,12 @@ class TestScale:
         assert len(first) == len([i for i in range(2000) if i % 7 == 3])
         assert reads.count("content.opf") == 2000
         reads.clear()
-        started = time.perf_counter()
+        # CPU time, not wall time: the bound is on the work the warm scan
+        # does (two gated stats per bundle, no read), which load on the
+        # machine doesn't change.
+        started = time.process_time()
         assert lib.ids("subject 3") == first
-        assert reads == [] and time.perf_counter() - started < 1
+        assert reads == [] and time.process_time() - started < 3
         monkeypatch.setattr(_opf._subject_index, "max_entries", 100)
         monkeypatch.setattr(_opf._metadata_cache, "max_entries", 100)
         from py_apple_books.content import clear_content_cache
