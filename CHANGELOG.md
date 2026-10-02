@@ -396,8 +396,9 @@ sums them up.
   `series_container_id`, `series_sequence`, `series_label`,
   `series_is_ordered` (the series fields are provisional) and
   `high_water_progress` (the furthest point Books recorded, in percent;
-  information only). `Book.is_pdf` (from the database alone) and
-  `py_apple_books.models.book.CONTENT_TYPE_PDF`.
+  information only). `Book.is_pdf`, decided from the library row alone
+  (the content type, or a `.pdf` path; no file access, unlike
+  `BookContent.is_pdf`), and `py_apple_books.models.book.CONTENT_TYPE_PDF`.
 - `Annotation` fields `position_fraction`, `furthest_fraction` and
   `location_data` (bookmarks and the reading-position row only), and the
   properties `page_location` (a `PageLocation(ordinal, page_offset)` with
