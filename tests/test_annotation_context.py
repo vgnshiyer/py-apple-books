@@ -114,6 +114,16 @@ class TestContext:
             "notes", None, None, None, "note outside")
         assert str(ctx) == api.get_annotation_surrounding_text(aid, 2, 0)
 
+    def test_hint_outside_the_spine_with_a_step_in_range(self, api, library, book):
+        # The step names c1 (spine 0) but the hint a non-spine document:
+        # read the hint's document, as 1.10 does; the chapter is where the
+        # step places the location.
+        aid = add(library, book, "note outside", "epubcfi(/6/2[notes]!/4/2/1:2)")
+        ctx = api.get_annotation_context(aid, 2, 0)
+        assert (ctx.item_id, ctx.spine_index, ctx.highlight) == ("notes", None, "note outside")
+        assert (ctx.chapter.title, ctx.match) == ("One", ChapterMatch.FILE)
+        assert str(ctx) == api.get_annotation_surrounding_text(aid, 2, 0)
+
 
 class TestTiers:
     @pytest.mark.parametrize("text, tier, highlight", [

@@ -485,7 +485,9 @@ class _PositionsAPI:
         (1.11).
 
         The text is that of the whole spine file the annotation's CFI
-        names (``BookContent.get_spine_item_text``), read after the same
+        names (``BookContent.get_spine_item_text``; when its bracket hint
+        names a document outside the spine, that document, as 1.10
+        reads it, with ``spine_index`` None), read after the same
         checks ``get_book_content`` makes (without downloading anything
         or running ``du``). The highlight is found there by its selected
         text (else its representative text), first as 1.10 does (with
@@ -533,7 +535,7 @@ class _PositionsAPI:
         key = annotation.id
         location = annotation.location
 
-        from py_apple_books._content_resolve import _Boundaries, _target_of, _usable
+        from py_apple_books._content_resolve import _Boundaries, _Target, _target_of, _usable
 
         if not _usable(location):
             raise _unavailable(ContextUnavailableError.NO_LOCATION, key)
@@ -552,7 +554,15 @@ class _PositionsAPI:
         boundaries = _Boundaries(index, book.path)
         target = _target_of(location)
         resolved = boundaries.resolve(target)
-        if resolved is not None:
+        hint = location.chapter_id
+        if (hint and hint in index.manifest
+                and boundaries.spine_position(_Target(None, hint, None)) is None):
+            # A hint naming a manifest document outside the spine: read
+            # as 1.10 read it (its whole file), whatever the spine step
+            # names; the chapter is where resolve() places the location.
+            item_id, spine_index = hint, None
+            chapter, match = (resolved.chapter, resolved.match) if resolved is not None else (None, None)
+        elif resolved is not None:
             item_id, spine_index = resolved.item_id, resolved.spine_index
             chapter, match = resolved.chapter, resolved.match
             if item_id is None or not index.spine[spine_index].readable:
@@ -560,10 +570,6 @@ class _PositionsAPI:
 
                 raise ChapterNotFoundError(
                     f"No text document at spine index {int(spine_index)} in this book.")
-        elif location.chapter_id and location.chapter_id in index.manifest:
-            # A hint naming a manifest document outside the spine: read
-            # as 1.10 read it (its whole file).
-            item_id, spine_index, chapter, match = location.chapter_id, None, None, None
         else:
             raise _unavailable(ContextUnavailableError.NO_LOCATION, key)
 
