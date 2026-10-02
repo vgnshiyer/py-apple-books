@@ -26,12 +26,13 @@ class MetadataFileState(str, Enum):
     NO_FILE = "no_file"
     #: Not an unzipped EPUB bundle (a PDF, a zipped ``.epub`` file, ...).
     NOT_EPUB = "not_epub"
-    #: Stored only in iCloud, or partly evicted: nothing was read (and
-    #: nothing downloaded). Open the book in Apple Books to download it.
+    #: Stored only in iCloud, partly evicted, or the bundle isn't on this
+    #: Mac at all: nothing was read (and nothing downloaded). Open the
+    #: book in Apple Books to download it.
     NOT_DOWNLOADED = "not_downloaded"
-    #: The bundle or its package document is missing, unsafe (a symlink,
-    #: a path leaving the bundle), too large or malformed, or couldn't
-    #: be read.
+    #: The bundle couldn't be looked up, or its package document is
+    #: missing, unsafe (a symlink, a path leaving the bundle), too large
+    #: or malformed, or couldn't be read.
     UNREADABLE = "unreadable"
 
     def __str__(self) -> str:

@@ -201,7 +201,12 @@ def _is_epub_path(path) -> bool:
 
 def _bundle_state(path) -> Optional[MetadataFileState]:
     """The state of the bundle folder itself, from ``lstat`` (and
-    ``stat`` through a symlink), or None if it is a local folder."""
+    ``stat`` through a symlink), or None if it is a local folder.
+
+    A bundle that isn't on this Mac, with or without an iCloud stub next
+    to it, is ``not_downloaded``, as :meth:`get_book_content` reports it
+    and as plan rule R7 lines the reasons up (ZSTATE 3, dataless, stub
+    and missing); any other failure to look it up is ``unreadable``."""
     with _icloud.no_materialize():
         try:
             if _icloud.icloud_stub(path):
@@ -209,6 +214,8 @@ def _bundle_state(path) -> Optional[MetadataFileState]:
             st = _icloud.lstat(path)
             if _stat.S_ISLNK(st.st_mode):
                 st = _icloud.stat(path)
+        except (FileNotFoundError, NotADirectoryError):
+            return MetadataFileState.NOT_DOWNLOADED
         except (OSError, ValueError) as e:
             if _icloud.is_materialize_error(e):
                 return MetadataFileState.NOT_DOWNLOADED

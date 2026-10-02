@@ -18,7 +18,7 @@ import pytest
 
 from py_apple_books import PyAppleBooks, _icloud
 from py_apple_books.db import LibraryDB, use_library
-from py_apple_books.exceptions import BookNotFoundError
+from py_apple_books.exceptions import BookNotDownloadedError, BookNotFoundError
 from py_apple_books.models import BookMetadata, MetadataFileState
 from py_apple_books.testing import write_epub, write_epub_bundle
 from tests import _fs_audit
@@ -212,7 +212,32 @@ class TestStates:
         assert not rec.under(stub, "open") and not rec.of(*_fs_audit.PROCESS_EVENTS)
 
     def test_missing_bundle(self, lib, tmp_path):
-        assert lib.api.get_book_metadata(add(lib, tmp_path / "gone.epub")).file_state is S.UNREADABLE
+        """A recorded bundle that isn't on this Mac (no stub either) is
+        not_downloaded, the reason get_book_content gives for it (R7)."""
+        book = add(lib, tmp_path / "gone.epub")
+        assert lib.api.get_book_metadata(book).file_state is S.NOT_DOWNLOADED
+        with pytest.raises(BookNotDownloadedError):
+            lib.api.get_book_content(book)
+
+    def test_missing_folder_on_the_way(self, lib, tmp_path):
+        """A file where a folder on the bundle's path should be."""
+        (tmp_path / "file").write_bytes(b"")
+        book = add(lib, tmp_path / "file" / "book.epub")
+        assert lib.api.get_book_metadata(book).file_state is S.NOT_DOWNLOADED
+
+    def test_dangling_symlink_bundle(self, lib, tmp_path):
+        (tmp_path / "book.epub").symlink_to(tmp_path / "gone")
+        assert lib.api.get_book_metadata(add(lib, tmp_path / "book.epub")).file_state is S.NOT_DOWNLOADED
+
+    def test_bundle_lookup_failure(self, lib, tmp_path, monkeypatch):
+        """Other lookup failures (permission, I/O) stay unreadable."""
+        path = epub(tmp_path)
+
+        def lstat(p, *, dir_fd=None):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(_icloud, "lstat", lstat)
+        assert lib.api.get_book_metadata(add(lib, path)).file_state is S.UNREADABLE
 
     def test_dataless_bundle(self, lib, tmp_path, monkeypatch):
         path = epub(tmp_path)
@@ -410,8 +435,9 @@ class TestPrivacy:
         (path / "META-INF" / "container.xml").write_text(
             '<container><rootfiles><rootfile full-path="OEBPS/' + self.TITLE
             + '.opf" media-type="application/oebps-package+xml"/></rootfiles></container>')
-        for book in (add(lib, path), add(lib, tmp_path / f"{self.TITLE} gone.epub")):
-            assert lib.api.get_book_metadata(book).file_state is S.UNREADABLE
+        for book, state in ((add(lib, path), S.UNREADABLE),
+                            (add(lib, tmp_path / f"{self.TITLE} gone.epub"), S.NOT_DOWNLOADED)):
+            assert lib.api.get_book_metadata(book).file_state is state
         out, err = capsys.readouterr()
         text = " ".join(r.getMessage() for r in caplog.records) + out + err
         assert self.TITLE not in text and str(tmp_path) not in text
