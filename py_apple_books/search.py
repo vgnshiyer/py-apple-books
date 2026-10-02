@@ -569,15 +569,20 @@ class AnnotationIndex:
     # -- build ----------------------------------------------------------------
 
     def _build(self, db: "LibraryDB", key: tuple, ttl: bool, checked: float) -> _Gen:
+        """The generation for ``key`` (fingerprinted at ``checked``): built,
+        or the build in progress continued. A generation or build from a
+        fingerprint taken since is used instead: never an older one in
+        place of a newer one."""
         deadline, limit = db._statement_deadline()
         _wait(self._build_lock, deadline, limit)
         try:
             with self._state:
                 ready = self._ready
-                if ready is not None and ready.key == key and not ready.expired(_clock()):
+                if (ready is not None and not ready.expired(_clock())
+                        and (ready.key == key or ready.checked >= checked)):
                     return ready
                 pending = self._pending
-            if pending is None or pending.key != key:
+            if pending is None or (pending.key != key and pending.checked < checked):
                 # A new build: the old index is freed first, so two never
                 # coexist.
                 with self._state:
@@ -611,12 +616,12 @@ class AnnotationIndex:
                 after = {} if pending.last is None else {"id__gt": pending.last}
                 rows = manager.filter(only=read, order_by="id", limit=_CHUNK, **after,
                                       **_ALL_ANNOTATIONS).run_query()
+                self.rows_fetched += len(rows)
                 if not rows:
                     return
                 first, last = rows[0][ix["id"]], rows[-1][ix["id"]]
                 live = {row[ix["id"]] for row in manager.filter(
                     only=["id"], id__gte=first, id__lte=last, **_LIVE_ANNOTATIONS).run_query()}
-                self.rows_fetched += len(rows)
                 data = []
                 for row in rows:
                     texts = [fold_for_match(row[ix[f]]) for f in ("selected_text", "note",
