@@ -607,7 +607,10 @@ def test_the_call_budget_caps_the_waits(home, reader, monkeypatch):
         assert time.monotonic() - start < 0.8
 
 
-def test_query_timeout_caps_the_call(home):
+def test_query_timeout_caps_the_call(home, monkeypatch):
+    # A busy wait of 1 s would alone take the call past the bound; only
+    # the library's query_timeout (0.1 s) keeps it under.
+    monkeypatch.setattr(book_info, "_BUSY_WAIT", 1.0)
     path = home.add_book_info_cache([{"asset_id": "A", "title": "x"}], journal_mode="DELETE")
     api = PyAppleBooks(home.data_dir, query_timeout=0.1)
     try:
