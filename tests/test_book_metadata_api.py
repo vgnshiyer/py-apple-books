@@ -331,6 +331,18 @@ class TestDrift:
         refresh(lib)
         assert lib.api.get_book_metadata(book).file_state is S.READ
 
+    @pytest.mark.parametrize("value, expected", [
+        (lambda path: os.fsencode(path), S.READ),  # a BLOB: read like the text
+        (lambda path: b"", S.NO_FILE),
+        (lambda path: str(path) + "\0x.epub", S.UNREADABLE),
+    ])
+    def test_odd_path_values(self, lib, tmp_path, value, expected):
+        """File problems are states, never exceptions, whatever ZPATH
+        holds."""
+        book = add(lib, epub(tmp_path))
+        set_columns(lib, book, ZPATH=value(epub(tmp_path, name="other.epub")))
+        assert lib.api.get_book_metadata(book).file_state is expected
+
 
 class TestPrivacy:
     TITLE = "An Unusually Private Title"

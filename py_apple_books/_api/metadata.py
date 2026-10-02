@@ -165,6 +165,17 @@ class _MetadataAPI:
 # -- get_book_metadata ----------------------------------------------------------
 
 
+def _file_path(raw) -> Optional[str]:
+    """A recorded path as text, or None for no file (None, empty, not a
+    path). A path stored as bytes (a BLOB) is decoded as the file
+    system does, so it is read like the same path stored as text."""
+    try:
+        path = os.fsdecode(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+    return path or None
+
+
 def _is_epub_path(path) -> bool:
     if isinstance(path, bytes):
         return path.rstrip(b"/").lower().endswith(b".epub")
@@ -195,12 +206,8 @@ def _bundle_state(path) -> Optional[MetadataFileState]:
 def _book_file_metadata(book) -> Tuple[MetadataFileState, Optional[_opf.OpfFields]]:
     """Gate, then read the book's package document (see
     :meth:`_MetadataAPI.get_book_metadata` for the order)."""
-    raw = getattr(book, "path", None)
-    if raw is None or raw == "" or raw == b"":
-        return MetadataFileState.NO_FILE, None
-    try:
-        path = os.fspath(raw)
-    except TypeError:
+    path = _file_path(getattr(book, "path", None))
+    if path is None:
         return MetadataFileState.NO_FILE, None
     if not _is_epub_path(path):
         return MetadataFileState.NOT_EPUB, None
