@@ -363,6 +363,36 @@ def test_waiter_gets_the_lock_once_released(db, backups):
     assert dest.exists()
 
 
+def test_no_timeout_waits_until_released(db, backups, monkeypatch):
+    """``BACKUP_LOCK_TIMEOUT = None``: no limit of its own, so the write
+    waits for the holder however long it takes."""
+    monkeypatch.setattr(write_safety, "BACKUP_LOCK_TIMEOUT", None)
+    assert write_safety._lock_deadline(None) == float("inf")
+    fd = _hold_flock(backups)
+    timer = threading.Timer(0.3, os.close, (fd,))
+    timer.start()
+    try:
+        start = time.monotonic()
+        dest = write_safety.backup_library(db, backups)
+        assert time.monotonic() - start >= 0.25
+    finally:
+        timer.join()
+    assert dest.exists()
+
+
+def test_no_timeout_still_capped_by_query_deadline(backups, monkeypatch):
+    monkeypatch.setattr(write_safety, "BACKUP_LOCK_TIMEOUT", None)
+    fd = _hold_flock(backups)
+    try:
+        start = time.monotonic()
+        with query_deadline(0.2), pytest.raises(LibraryBusyError):
+            with write_safety._backup_folder_lock(backups):
+                pass
+        assert time.monotonic() - start < 3
+    finally:
+        os.close(fd)
+
+
 @pytest.mark.parametrize("how", ["deadline", "timeout", "zero"])
 def test_expired_deadline_still_takes_an_uncontended_lock(db, backups, monkeypatch, how):
     """With no time left, each lock is still tried once."""

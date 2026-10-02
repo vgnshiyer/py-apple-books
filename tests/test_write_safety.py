@@ -357,6 +357,43 @@ def test_failed_copy_leaves_no_part(scratch_db, tmp_path, monkeypatch):
     assert os.listdir(backup_dir) == []
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores folder permissions")
+def test_part_that_cannot_be_created_fails_cleanly(scratch_db, tmp_path):
+    """A folder the backup can't be written into fails with WriteError
+    (as 1.10 did), leaving nothing behind."""
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    os.chmod(backup_dir, 0o500)
+    try:
+        with pytest.raises(WriteError, match="Backup failed, aborting write"):
+            write_safety.backup_library(scratch_db, backup_dir)
+    finally:
+        os.chmod(backup_dir, 0o700)
+    assert os.listdir(backup_dir) == []
+
+
+def test_reuse_check_survives_a_vanished_backup(scratch_db, tmp_path, monkeypatch):
+    """The newest backup pruned between listing and the age check (by a
+    1.10 writer, which doesn't take the lock) means a fresh backup, not
+    a crash."""
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    ghost = backup_dir / f"{scratch_db.stem}-20990101-000000-000000.sqlite"
+    real = write_safety._backups_for
+    calls = []
+
+    def listing(db_path, folder):
+        calls.append(1)
+        found = real(db_path, folder)
+        return found + [ghost] if len(calls) == 1 else found
+
+    monkeypatch.setattr(write_safety, "_backups_for", listing)
+    dest = write_safety.backup_library(scratch_db, backup_dir, min_interval=300)
+    assert dest != ghost
+    assert dest.exists()
+    assert not write_safety._younger_than(ghost, 300)
+
+
 def test_backups_leave_only_backups(scratch_db, tmp_path):
     backup_dir = tmp_path / "backups"
     for _ in range(3):
