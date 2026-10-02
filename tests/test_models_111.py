@@ -14,6 +14,7 @@ import pathlib
 import pickle
 import plistlib
 import random
+import threading
 
 import pytest
 
@@ -561,6 +562,29 @@ class TestPageLocationProperty:
     def test_not_a_field(self):
         names = {f.name for f in dataclasses.fields(Annotation)}
         assert not {"page_location", "is_short_selection"} & names
+
+    def test_threads(self):
+        """One annotation read from many threads at once: every thread
+        gets the same value, and nothing raises."""
+        annotation = Annotation.from_db(annotation_row(type=POSITION, location_data=page_blob(7, 2)))
+        barrier = threading.Barrier(16)
+        results, errors = [], []
+
+        def read():
+            try:
+                barrier.wait()
+                for _ in range(200):
+                    results.append(annotation.page_location)
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        workers = [threading.Thread(target=read) for _ in range(16)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        assert errors == [] and len(results) == 16 * 200
+        assert set(results) == {PageLocation(ordinal=2, page_offset=7)}
 
 
 class TestIsShortSelection:
