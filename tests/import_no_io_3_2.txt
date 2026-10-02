@@ -1,0 +1,3 @@
+# Modules added by stream 3.2 (chapter spans) whose import must do no
+# I/O (R19).
+py_apple_books._spans
