@@ -880,7 +880,18 @@ def _query(conn: sqlite3.Connection, fts: Optional[str], plan: _Plan, asset_id,
                 seen.add(rowid)
                 hits.append((rowid, float(score), matched_all, method))
 
-    def substring(items, connector: str, matched_all: bool) -> None:
+    scanned = set()
+
+    def substring(items: Tuple[str, ...], connector: str, matched_all: bool) -> None:
+        # The same scan run again (same statement, parameters and
+        # LIMIT, on the same rows) returns rows already listed, so it
+        # adds nothing: skipped. That is tier 4's every-item scan for a
+        # one-word query whose needle is the word (a no-hit word ran two
+        # identical full scans), and tier 2 after tier 1 for a substring
+        # plan of one item.
+        if (items, connector) in scanned:
+            return
+        scanned.add((items, connector))
         conditions, score_terms = [], []
         for _ in items:
             conditions.append("(" + " OR ".join(f"instr({c}, ?) > 0" for c in _COLUMNS) + ")")
