@@ -600,6 +600,59 @@ def touching(rec, path, *events) -> list:
     return [e for e in rec.of(*events) if e.path and e.path.startswith(root)]
 
 
+@pytest.mark.parametrize("fields", EVICTED)
+def test_evicted_cache_reads_no_byte(lib, folder, tmp_path, monkeypatch, fields):
+    path = folder / CACHE_NAME
+    cases.create(path, "WAL").close()
+    patch_lstat(monkeypatch, path, **fields)
+    with _fs_audit.record() as rec:
+        with pytest.raises(dump_schema.DumpError, match="not a local SQLite file"):
+            dump_schema.dump_book_info(path)
+    assert touching(rec, path, *READS) == []
+    # End to end: the stores are dumped, the cache is not read.
+    with _fs_audit.record() as rec:
+        assert dump(lib, tmp_path / "out") == 0
+    assert rec.under(lib.library_path, "sqlite3.connect")  # the hook saw the stores being read
+    assert touching(rec, path, *READS) == []
+
+
+def test_evicted_folder_is_never_listed_or_read(lib, folder, tmp_path, monkeypatch):
+    cases.create(folder / CACHE_NAME).close()
+    patch_lstat(monkeypatch, folder, st_flags=dump_schema._SF_DATALESS)
+    with _fs_audit.record() as rec:
+        with pytest.raises(dump_schema.DumpError, match="not a local folder"):
+            dump_schema.find_book_info(lib.data_dir)
+        assert dump(lib, tmp_path / "out") == 0
+    assert touching(rec, folder, *READS, *LISTINGS) == []
+
+
+@pytest.mark.parametrize("fields", EVICTED)
+@pytest.mark.parametrize("side", ["-wal", "-shm"])
+def test_evicted_wal_sidecar_is_never_opened(folder, monkeypatch, fields, side):
+    """Only the main file is opened, immutable: SQLite never opens the
+    sidecars (made unreadable here, so an open would fail the read)."""
+    path = folder / CACHE_NAME
+    con = cases.create(path, "WAL")
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # the schema is in the main file
+    con.execute("PRAGMA wal_autocheckpoint=0")
+    cases.fill(con, 1)  # and a committed row in the -wal
+    try:
+        assert cases.sidecars(path) == [f"{CACHE_NAME}-shm", f"{CACHE_NAME}-wal"]
+        patch_lstat(monkeypatch, f"{path}{side}", **fields)
+        for s in ("-wal", "-shm"):
+            os.chmod(f"{path}{s}", 0)
+        with _fs_audit.record() as rec:
+            sql, _ = dump_schema.dump_book_info(path)
+        dump_schema.self_check_book_info(sql)
+    finally:
+        for s in ("-wal", "-shm"):
+            os.chmod(f"{path}{s}", 0o644)
+        con.close()
+    assert touching(rec, f"{path}-", *READS) == []
+    connects = touching(rec, path, "sqlite3.connect")
+    assert connects and all("immutable=1" in os.fsdecode(e.args[0]) for e in connects)
+
+
 def test_evicted_journal_is_never_opened(folder, monkeypatch):
     path = folder / CACHE_NAME
     cases.create(path, "PERSIST").close()
