@@ -18,8 +18,9 @@ if TYPE_CHECKING:
 
 
 def _row_id(book_id) -> Optional[int]:
-    """An int row id from an int, a digit string or a :class:`Book`;
-    None for anything else (a bool included)."""
+    """An int row id from an int, a string of ASCII digits or a
+    :class:`Book`; None for anything else (a bool, or other Unicode
+    digits such as '²' or '٣', which no library id is written with)."""
     book_id = getattr(book_id, "id", book_id)
     if isinstance(book_id, bool):
         return None
@@ -27,8 +28,10 @@ def _row_id(book_id) -> Optional[int]:
         return operator.index(book_id)
     except TypeError:
         pass
-    if isinstance(book_id, str) and book_id.strip().isdigit():
-        return int(book_id.strip())
+    if isinstance(book_id, str):
+        text = book_id.strip()
+        if text.isascii() and text.isdigit():
+            return int(text)
     return None
 
 

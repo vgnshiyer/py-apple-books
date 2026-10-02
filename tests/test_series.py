@@ -168,6 +168,18 @@ class TestSeriesMethods:
         assert got.volume_for(True) is None and got.volume_for(None) is None and got.volume_for(999) is None
         assert got.next_after(999) is None
 
+    @pytest.mark.parametrize("text", ["\u00b2", "\u2460", "arabic-indic", "", " ", "1 2", "+1", "-1"])
+    def test_other_text_is_no_volume(self, lib, text):
+        """Only ASCII digit strings are ids: '²' and '①' don't raise, a
+        volume's id in Arabic-Indic digits ('٣' for 3) isn't read as it."""
+        _, (v1, v2, v3), _ = series_s(lib)
+        got = lib.api.get_series(v1)
+        if text == "arabic-indic":
+            text = "".join(chr(0x0660 + int(d)) for d in str(v2))
+            assert int(text) == v2  # what int() alone would make of it
+        assert got.volume_for(text) is None and got.next_after(text) is None
+        assert got.volume_for(f" {v2} ").ids == (v2,)
+
     def test_current_prefers_the_highest_then_the_latest(self, lib):
         made = lib.fx.add_series("Two open", [
             dict(sequence=1, progress=0.5, last_opened=dt.datetime(2026, 9, 1, tzinfo=UTC)),
