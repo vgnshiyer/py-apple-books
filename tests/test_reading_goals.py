@@ -365,6 +365,14 @@ class TestPath:
         with pytest.raises(InvalidArgumentError, match="prefs_path must be a path"):
             goals_of(lib, prefs_path=5)
 
+        class NotAPath:
+            def __fspath__(self):
+                return 5
+
+        # Passes isinstance(os.PathLike) but has no str or bytes path.
+        with pytest.raises(InvalidArgumentError, match="prefs_path must be a path.*not NotAPath"):
+            goals_of(lib, prefs_path=NotAPath())
+
     def test_default_library(self, library):
         from tests.conftest import FIXTURE_HOME
 

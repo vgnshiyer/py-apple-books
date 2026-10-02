@@ -442,10 +442,15 @@ class _EngagementAPI:
         """
         if prefs_path is None:
             path = _prefs.library_prefs_path(current_library())
-        elif isinstance(prefs_path, (str, bytes, os.PathLike)):
-            path = prefs_path
         else:
-            raise InvalidArgumentError(f"prefs_path must be a path or None, not {type(prefs_path).__name__}.")
+            # os.fspath also rejects a PathLike whose __fspath__ returns
+            # neither str nor bytes.
+            try:
+                path = os.fspath(prefs_path)
+            except TypeError:
+                path = None
+            if path is None:
+                raise InvalidArgumentError(f"prefs_path must be a path or None, not {type(prefs_path).__name__}.")
         return _prefs._read_goals(path)[0]
 
 
