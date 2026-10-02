@@ -8,10 +8,11 @@ phrases (10 %), so timing tests exercise the classifier and the narrow
 queries on varied text rather than on one fixed length.
 """
 
-import os
 import random
 import sqlite3
 from typing import List
+
+from tests import _bootstrap
 
 WORDS = ("the of and a to in is was that for it with as his on be at by had are this from but not "
          "light river window garden letter morning silence harbour lantern meadow").split()
@@ -19,7 +20,7 @@ SHORT = ("ephemeral", "Ubiquitous,", "in medias res", "laconic", "“sonder.”"
 
 # Whether the strict timing budgets run (they are soft by default: CI
 # machines vary).
-SLOW = os.environ.get("APPLE_BOOKS_SLOW_TESTS", "") not in ("", "0")
+SLOW = _bootstrap.SLOW
 
 
 def passage(rng: random.Random, length: int) -> str:
