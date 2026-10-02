@@ -131,10 +131,16 @@ class _Found(NamedTuple):
 
 def _occurrences(text: str, passage: str) -> Tuple[Optional[TextMatch], List[Tuple[int, int]]]:
     """Every match of ``passage`` in ``text`` at the strictest tier that
-    finds one (R18): 1.10's whitespace-flexible pattern (its matches that
-    are character for character the passage report ``EXACT``), then
-    ignoring invisible characters, then folded. ``(None, [])`` when no
-    tier finds it."""
+    finds one (R18): 1.10's whitespace-flexible pattern, then ignoring
+    invisible characters, then folded. ``(None, [])`` when no tier finds
+    it.
+
+    There is no separate exact pass before the whitespace-flexible one:
+    the occurrence chosen there is the one 1.10's window shows (so
+    ``str()`` of the context stays the wrapper's), and it is reported
+    ``EXACT`` when it is character for character the passage (see
+    :func:`_locate_highlight`), even if a verbatim occurrence exists
+    further on."""
     from py_apple_books.text import _find_passage, _passage_pattern, finditer_folded
 
     pattern = _passage_pattern(passage)
@@ -294,8 +300,10 @@ class _PositionsAPI:
         within 0.05 of a whole number (``page_count_estimated``).
 
         :param book_id: The book's id, or a :class:`Book` (used as is
-            when read from this library with its asset id, path and
-            content type; else read again by id).
+            when read from this library with its asset id, path, content
+            type and, with ``resolve_chapter``, state; else read again by
+            id: a book with no file here has no path, so it is read
+            again).
         :param resolve_chapter: Also place the position in the book's
             table of contents (:attr:`~ReadingPosition.chapter`,
             :attr:`~ReadingPosition.match`,
@@ -313,7 +321,8 @@ class _PositionsAPI:
             the annotation store is missing or lacks a column positions
             are read from (asset id, type, location, deleted flag). At
             most three queries (two when given a :class:`Book` read from
-            this library).
+            this library that has those fields, which a book with no file
+            here lacks).
         :raises BookNotFoundError: no book has that id.
         :raises UnsupportedSchemaError: the library store lacks a column
             the book is looked up by.
@@ -493,7 +502,11 @@ class _PositionsAPI:
         text (else its representative text), first as 1.10 does (with
         any whitespace between words), then also ignoring soft hyphens,
         zero-width spaces and BOMs, then folded (case, accents, quote and
-        dash style); :attr:`~AnnotationContext.text_match` says which.
+        dash style); :attr:`~AnnotationContext.text_match` says which
+        (``exact`` when the occurrence found the first way is character
+        for character the text; there is no separate exact pass, so a
+        verbatim occurrence later in the file doesn't take precedence over
+        an earlier one that differs only in whitespace).
         Of several occurrences, the one inside the annotation's
         representative text is taken when that passage occurs once
         (:attr:`~AnnotationContext.disambiguated`), else the first.
@@ -501,7 +514,10 @@ class _PositionsAPI:
         :meth:`get_annotation_surrounding_text` cuts its window: about
         ``chars_before`` and ``chars_after`` characters, snapped to
         spaces, whitespace collapsed; ``str()`` of the result is that
-        window, ellipses included. The chapter is placed as by
+        window, ellipses included, whenever that method finds the
+        highlight, unless the context was disambiguated to another
+        occurrence than the first (that method always takes the first).
+        The chapter is placed as by
         ``BookContent.resolve``. The opening of the file is never given
         in place of a highlight that isn't found.
 

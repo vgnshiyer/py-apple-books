@@ -307,7 +307,10 @@ class TextMatch(str, Enum):
     """How an annotation's text was found in its file, from the strictest
     comparison to the most lenient."""
 
-    #: Character for character.
+    #: Character for character: the occurrence found with whitespace
+    #: runs compared as one space is verbatim the text (an earlier
+    #: occurrence differing only in whitespace is still the one taken,
+    #: and is ``WHITESPACE``).
     EXACT = "exact"
     #: With whitespace runs compared as one space.
     WHITESPACE = "whitespace"

@@ -291,6 +291,16 @@ class TestQueries:
             library.add_annotation(doc, f"p{i}", created=at(3))
         assert self._count(sql_trace, lambda: api.get_reading_position(doc["id"])) <= 2
 
+    @pytest.mark.parametrize("resolve_chapter", [True, False])
+    def test_budget_for_a_book_with_no_file(self, api, library, sql_trace, resolve_chapter):
+        # No path (not on this Mac): the Book is read again, so three.
+        row = library.add_book("Elsewhere", state=3)
+        library.add_annotation(row, "hl", location=cfi(0, "x"), created=at(1))
+        book = api.get_book_by_id(row["id"])
+        assert book.path is None
+        assert self._count(sql_trace, lambda: api.get_reading_position(
+            book, resolve_chapter=resolve_chapter)) <= 3
+
     def test_a_book_from_another_library_is_read_again(self, api, library, split, make_library):
         library.add_annotation(split, None, kind="reading_position", location=cfi(2, "s2"))
         other = make_library()

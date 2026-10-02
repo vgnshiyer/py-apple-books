@@ -139,6 +139,14 @@ class TestTiers:
         ctx = api.get_annotation_context(aid, 0, 0)
         assert (ctx.text_match, ctx.highlight) == (tier, highlight)
 
+    def test_exact_means_the_first_whitespace_match_is_verbatim(self):
+        # No separate exact pass: the first whitespace-flexible occurrence
+        # is taken (as 1.10's window), and it isn't verbatim.
+        text = "A line\nbreak first. Then A line break again."
+        found = _locate_highlight(text, "A line break", None)
+        assert (found.start, found.text_match, found.occurrences) == (0, TextMatch.WHITESPACE, 2)
+        assert _locate_highlight("Then A line break.", "A line break", None).text_match is TextMatch.EXACT
+
     def test_wrapper_stays_frozen_on_curly_quotes(self, api, library, book):
         """1.10's wrapper matches whitespace only: a straight apostrophe
         doesn't find a curly one there, and still doesn't (R10)."""
