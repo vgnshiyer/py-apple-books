@@ -47,6 +47,10 @@ def test_no_content_path_is_the_start_of_the_file(cfi):
     None, "", "junk", "epubcfi()", "epubcfi(/6/4!/4/x)", "epubcfi(/6/4!/4[abc)", "epubcfi(/6/4!4/2)",
     "epubcfi(/6/4!/4//2)", "epubcfi(/6/4!/4/2 /3)", "epubcfi(/6/4!/4/1234567890)", "epubcfi(/6/4!/-4)",
     "epubcfi(/6/4!/٤)", 42, b"epubcfi(/6/4!/4)",
+    # An unclosed assertion in the spine path would swallow the '!' (and
+    # leave "the whole spine item"), or in an offset or a range part.
+    "epubcfi(/6/2[c1!/4/2/1:0)", "epubcfi(/6/2[c1)", "epubcfi(/6/4!/4/2:3[abc)",
+    "epubcfi(/6/4!/4/10,/1:0,/3:5[x)",
 ])
 def test_malformed_is_none(cfi):
     assert _content_path(cfi) is None

@@ -121,10 +121,11 @@ _Step = Tuple[int, Optional[str]]
 _MAX_STEP_DIGITS = 9
 
 
-def _top_level(body: str, separators: str) -> List[str]:
+def _top_level(body: str, separators: str) -> Optional[List[str]]:
     """``body`` split at the characters of ``separators`` that are
     outside ``[...]`` assertions (where ``^`` escapes the next
-    character). An unclosed ``[`` runs to the end of ``body``."""
+    character). None when a ``[`` is never closed (a malformed CFI,
+    whose separators can't be told apart)."""
     parts: List[str] = []
     start = 0
     i, n = 0, len(body)
@@ -134,6 +135,8 @@ def _top_level(body: str, separators: str) -> List[str]:
             i += 1
             while i < n and body[i] != "]":
                 i += 2 if body[i] == "^" else 1
+            if i >= n:
+                return None
         elif ch in separators:
             parts.append(body[start:i])
             start = i + 1
@@ -180,7 +183,7 @@ def _content_path(cfi: str) -> Optional[Tuple[_Step, ...]]:
     Returns ``()`` for a CFI that points at a spine item as a whole (no
     ``!``), and None for anything that isn't an ``epubcfi(...)`` or whose
     content path is malformed (a step without digits, or with more than
-    nine, an unclosed assertion, a stray character). Never raises; time
+    nine, an unclosed assertion anywhere in the CFI, a stray character). Never raises; time
     is linear in the length of the CFI.
     """
     if not isinstance(cfi, str) or not cfi:
@@ -189,8 +192,12 @@ def _content_path(cfi: str) -> Optional[Tuple[_Step, ...]]:
     if not m:
         return None
     ranges = _top_level(m.group(1), ",")
+    if ranges is None:
+        return None  # an unclosed assertion, in the spine path included
     path = ranges[0] + (ranges[1] if len(ranges) > 1 else "")
     documents = _top_level(path, "!")
+    if documents is None:
+        return None
     if len(documents) < 2:
         return ()
     content = documents[1]

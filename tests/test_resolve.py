@@ -129,6 +129,12 @@ class TestAnchors:
         resolved = gutenberg.resolve("epubcfi(/6/4[body]!/4/x/1:0)")
         assert (resolved.chapter, resolved.match, resolved.spine_index) == (None, UNKNOWN, 1)
 
+    def test_unclosed_spine_assertion_is_unknown_not_the_file_start(self, gutenberg):
+        # The unclosed '[' must not swallow the '!' and leave "the whole
+        # spine item", which would place it at the top of the file.
+        resolved = gutenberg.resolve("epubcfi(/6/4[body!/4/10/1:0)")
+        assert (resolved.chapter, resolved.match, resolved.spine_index) == (None, UNKNOWN, 1)
+
 
 class TestUnknownSections:
     @pytest.fixture
