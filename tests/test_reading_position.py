@@ -139,6 +139,25 @@ class TestPages:
         pos = api.get_reading_position(book["id"])
         assert (pos.page, pos.page_count) == (10, 10)
 
+    @pytest.mark.parametrize("fraction", ["1e-310", "1e-300", "4e-6"])
+    def test_a_tiny_fraction_gives_no_page_count(self, api, library, pdf, fraction):
+        # 41 / fraction is infinite, astronomical, or just past the
+        # largest page a page location holds: no count, no error.
+        book = pdf()
+        library.add_annotation(book, None, kind="reading_position", user_data=page_location_blob(40),
+                               position_fraction=fraction)
+        pos = api.get_reading_position(book["id"])
+        assert (pos.page, pos.page_count, pos.page_count_estimated) == (41, None, False)
+
+    def test_the_largest_page_count_is_estimated(self, api, library, pdf):
+        from py_apple_books.models.location import MAX_PAGE_INDEX
+
+        book = pdf()
+        library.add_annotation(book, None, kind="reading_position", user_data=page_location_blob(MAX_PAGE_INDEX),
+                               position_fraction=1.0)
+        pos = api.get_reading_position(book["id"])
+        assert (pos.page, pos.page_count, pos.page_count_estimated) == (MAX_PAGE_INDEX + 1,) * 2 + (True,)
+
     def test_pdf_without_page_data_has_no_inferred_position(self, api, library, pdf):
         book = pdf()
         library.add_annotation(book, "a highlight", location=cfi(0, "x"))

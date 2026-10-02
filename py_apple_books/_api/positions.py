@@ -18,6 +18,7 @@ gate, never with ``du`` or a walk of the bundle. See
 ``py_apple_books._api`` for the rules mixin code follows.
 """
 
+import math
 import re
 from typing import Any, Dict, Iterable, Iterator, NamedTuple, Optional, Tuple, Union
 
@@ -66,15 +67,21 @@ _PAGE_COUNT_RESIDUAL = 0.05
 def _page_count(book: Book, page: Optional[int], fraction: Optional[float]) -> Tuple[Optional[int], bool]:
     """``(page_count, estimated)`` of a PDF: the count Books records when
     it is more than 1; else ``round(page / fraction)`` when that is within
-    :data:`_PAGE_COUNT_RESIDUAL` of a whole number at least ``page``."""
+    :data:`_PAGE_COUNT_RESIDUAL` of a whole number at least ``page`` and
+    at most a page location's largest page (``MAX_PAGE_INDEX + 1``). A
+    tiny fraction (a corrupt cell) gives no count, never an error."""
+    from py_apple_books.models.location import MAX_PAGE_INDEX
+
     recorded = getattr(book, "page_count", None)
     if isinstance(recorded, int) and not isinstance(recorded, bool) and recorded > 1:
         return recorded, False
     if page is None or not fraction or fraction <= 0:
         return None, False
     estimate = page / fraction
+    if not math.isfinite(estimate) or estimate > MAX_PAGE_INDEX + 1 + _PAGE_COUNT_RESIDUAL:
+        return None, False
     count = round(estimate)
-    if count >= page and abs(estimate - count) <= _PAGE_COUNT_RESIDUAL:
+    if page <= count <= MAX_PAGE_INDEX + 1 and abs(estimate - count) <= _PAGE_COUNT_RESIDUAL:
         return count, True
     return None, False
 
