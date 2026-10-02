@@ -371,36 +371,43 @@ def test_scrub_sqlite_message():
     assert scrub(unknown) == "Could not decode to UTF-8"
 
 
-def test_pooled_decode_error_quotes_nothing(noisy):
+def test_pooled_decode_error_quotes_nothing(noisy, caplog):
     """A decode error the retry can't cure (the function insists on
     strict text) names the column only, with a deadline set and words
-    in the cell that would otherwise map it to another error."""
+    in the cell that would otherwise map it to another error. Nothing
+    logged quotes the cell either."""
     def strict(conn):
         conn.text_factory = str
         return conn.execute(TITLES).fetchall()
 
-    with LibraryDB(data_dir=noisy.data_dir, query_timeout=30) as db:
-        for _ in range(2):  # before and after the library turned lenient
-            with pytest.raises(DBQueryError) as exc:
-                db._run(strict)
-            assert not isinstance(exc.value, QueryTimeoutError)
-            _assert_scrubbed(exc.value)
-        assert db.execute(TITLES) == [(NOISY.decode("utf-8", "replace"),)]
-        assert db._idle[0].conn.text_factory is str
+    with caplog.at_level(logging.DEBUG, logger="py_apple_books"):
+        with LibraryDB(data_dir=noisy.data_dir, query_timeout=30) as db:
+            for _ in range(2):  # before and after the library turned lenient
+                with pytest.raises(DBQueryError) as exc:
+                    db._run(strict)
+                assert not isinstance(exc.value, QueryTimeoutError)
+                _assert_scrubbed(exc.value)
+            assert db.execute(TITLES) == [(NOISY.decode("utf-8", "replace"),)]
+            assert db._idle[0].conn.text_factory is str
+    assert len(_warnings(caplog)) == 1
+    assert "SECRET" not in caplog.text
 
 
-def test_assigned_cursor_decode_error_quotes_nothing(noisy):
-    """1.9's assigned cursor (no retry there) gets the same message."""
+def test_assigned_cursor_decode_error_quotes_nothing(noisy, caplog):
+    """1.9's assigned cursor (no retry there) gets the same message, and
+    nothing logged quotes the cell."""
     conn = sqlite3.connect(noisy.library_path)
     db = LibraryDB(data_dir=noisy.data_dir)
     try:
-        client_ = AppleBooksDBClient(db)
-        client_.cursor = conn.cursor()
-        with pytest.raises(DBQueryError) as exc:
-            client_.execute(TITLES)
-        _assert_scrubbed(exc.value)
-        client_.cursor = None
-        assert client_.execute(TITLES) == [(NOISY.decode("utf-8", "replace"),)]
+        with caplog.at_level(logging.DEBUG, logger="py_apple_books"):
+            client_ = AppleBooksDBClient(db)
+            client_.cursor = conn.cursor()
+            with pytest.raises(DBQueryError) as exc:
+                client_.execute(TITLES)
+            _assert_scrubbed(exc.value)
+            client_.cursor = None
+            assert client_.execute(TITLES) == [(NOISY.decode("utf-8", "replace"),)]
+        assert "SECRET" not in caplog.text
     finally:
         conn.close()
         db.close()
