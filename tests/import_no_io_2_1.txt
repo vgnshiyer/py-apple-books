@@ -1,0 +1,5 @@
+# Modules added by stream 2.1 (content index) whose import must do no
+# I/O (R19): the cache registers itself, nothing is read.
+py_apple_books._epub_index
+py_apple_books._content_resolve
+py_apple_books._content_reading
