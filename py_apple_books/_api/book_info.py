@@ -38,8 +38,11 @@ class _BookInfoAPI:
         within its budget, possibly ``{}``. The budget: 0.25 s waiting
         for a lock Books holds and 1 s per cache file, 2 s per call,
         and no more than the library's ``query_timeout`` or an active
-        :meth:`query_deadline`. Files not reached are read at a later
-        call. Up to 1,024 ids are remembered per cache file (fewer if
+        :meth:`query_deadline`. One wait is SQLite's own and can't be
+        cut short: if another process keeps the read locks of a
+        WAL-mode cache (Books holds them only for moments), SQLite
+        retries for about 10 s before giving up on that file. Files not
+        reached are read at a later call. Up to 1,024 ids are remembered per cache file (fewer if
         their values are unusually long): a call with more is not fully
         remembered, so a repeat reads the caches again and may not
         reach the oldest within its budget. Pass the distinct asset ids
