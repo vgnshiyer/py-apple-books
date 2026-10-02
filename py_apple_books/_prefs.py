@@ -23,11 +23,12 @@ year-0 date in it. This module reads it defensively and keeps four keys:
 - any problem gives None and a reason code; only the reason code is
   logged (DEBUG), never a path or a value.
 
-The cloud-folder check is by name only, for the derived path as for a
-custom ``prefs_path``: a symlinked parent folder that leads into iCloud
-Drive is not detected (``O_NOFOLLOW`` protects the last component
-only); the dataless checks and :func:`_icloud.no_materialize` still
-apply to such a path.
+The cloud-folder check is by name, for the derived path as for a
+custom ``prefs_path``: first on the path as given, with no file system
+call, then (under :func:`_icloud.no_materialize`) on its folder with
+symlinks resolved, so a symlinked folder that leads into iCloud Drive
+is refused before the file is looked at. A symlink as the file itself
+is refused by ``lstat`` and ``O_NOFOLLOW``.
 
 Nothing here does I/O at import; ``plistlib`` is imported on first use.
 """
@@ -148,9 +149,24 @@ def _in_cloud_folder(path: str) -> bool:
 # -- reading ------------------------------------------------------------------
 
 
+def _real_folder(path: str) -> str:
+    """The folder of ``path`` with symlinks resolved. Non-strict: a
+    folder that can't be looked at stays as written (a dataless one
+    fails with EDEADLK under :func:`_icloud.no_materialize`)."""
+    return os.path.realpath(os.path.dirname(os.path.abspath(path)))
+
+
 def _read_bytes(path: str) -> Tuple[Optional[bytes], str, Optional[float]]:
     """``(data, reason, mtime)``: the file's bytes, or None and why."""
     with _icloud.no_materialize():
+        # A symlinked folder on the way may lead into a cloud folder the
+        # names as written don't show; the file itself is a symlink only
+        # if lstat says so (not_regular below).
+        try:
+            if _in_cloud_folder(_real_folder(path)):
+                return None, ICLOUD_PATH, None
+        except (OSError, ValueError):
+            return None, UNREADABLE, None
         try:
             st = _icloud.lstat(path)
         except (FileNotFoundError, NotADirectoryError):

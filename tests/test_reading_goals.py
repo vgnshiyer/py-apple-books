@@ -136,6 +136,33 @@ class TestReasons:
             monkeypatch.setattr(os, name, refuse)
         assert _prefs._read_goals(path) == (None, "icloud_path")
 
+    def test_a_symlinked_folder_into_a_cloud_folder(self, lib, monkeypatch, tmp_path):
+        """A folder on the way that is a symlink into a cloud folder is
+        refused before the file is looked at; a symlinked folder that
+        stays local still reads."""
+        cloud = tmp_path / "Mobile Documents" / "com~apple~CloudDocs" / "Folder"
+        cloud.mkdir(parents=True)
+        shutil.copy(lib.write_prefs(), cloud / "p.plist")
+        (tmp_path / "link").symlink_to(cloud)
+        local = tmp_path / "local"
+        local.mkdir()
+        shutil.copy(lib.prefs_path, local / "p.plist")
+        (tmp_path / "locallink").symlink_to(local)
+        seen = []
+        for name in ("lstat", "open"):
+            real = getattr(os, name)
+
+            def spy(path, *args, _real=real, _name=name, **kwargs):
+                seen.append((_name, os.fsdecode(path)))
+                return _real(path, *args, **kwargs)
+
+            monkeypatch.setattr(os, name, spy)
+        assert _prefs._read_goals(tmp_path / "link" / "p.plist") == (None, "icloud_path")
+        assert not [call for call in seen if call[1].endswith("p.plist")], "the file was looked at"
+        monkeypatch.chdir(tmp_path / "link")
+        assert _prefs._read_goals("p.plist") == (None, "icloud_path")
+        assert _prefs._read_goals(tmp_path / "locallink" / "p.plist")[1] == "ok"
+
     @pytest.mark.parametrize("data", [
         b"", b"bplist00", b"garbage" * 10, b"bplist00" + b"\x00" * 40,
         b"bplist00\xd0\x08" + struct.pack(">6xBBQQQ", 1, 1, 1, 0, 9),           # an empty dict: well formed
