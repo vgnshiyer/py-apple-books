@@ -670,6 +670,18 @@ def test_recheck_interval_is_read_at_call_time(three, reader, spy, monkeypatch):
     assert not rec.of("os.listdir")
 
 
+def test_a_new_id_within_the_interval_reads_without_listing(three, reader, spy):
+    # The memo can't answer B, so the files are read; the folder was
+    # looked at moments ago, so it is not listed again.
+    reader.get_cached_book_info("A")
+    spy.reset()
+    with _fs_audit.record() as rec:
+        got = reader.get_cached_book_info(["A", "B"])
+    assert got["B"].title == "Only B"
+    assert spy.selects() and all(params == ["B"] for params in spy.selects())
+    assert not rec.of("os.listdir", "os.scandir")
+
+
 def test_purged_file_rows_disappear(three, reader, monkeypatch):
     assert "B" in reader.get_cached_book_info("B")
     (three.book_info_dir / cache_name(V0)).unlink()
