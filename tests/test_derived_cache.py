@@ -3,6 +3,7 @@ from the stores (the 1.11 annotation search index and book-info memo),
 dropped by ``close()`` and by a fork."""
 
 import os
+import signal
 import threading
 import time
 import warnings
@@ -75,6 +76,14 @@ class Blocking(Derived):
 @pytest.fixture(autouse=True)
 def _reset_count():
     Derived.made = 0
+
+
+def _child_time_limit(seconds: int = 20) -> None:
+    """In a forked child: end it (SIGALRM's default action) if it still
+    runs after ``seconds``, so that a deadlock in it fails the test
+    instead of hanging the suite."""
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    signal.alarm(seconds)
 
 
 def _lock_is_free_elsewhere(db) -> bool:
@@ -423,6 +432,7 @@ def test_fork_child(lib_db):
     if pid == 0:  # pragma: no cover - child
         status = 1
         try:
+            _child_time_limit()
             os.close(read_end)
             mine = lib_db._derived_cache("index", Derived)
             result = (mine is not parents, mine.count_books(lib_db),
@@ -500,6 +510,7 @@ def test_a_child_gets_a_new_fork_lock(lib_db):
         if pid == 0:  # pragma: no cover - child
             status = 1
             try:
+                _child_time_limit()
                 if client._fork_lock.acquire(timeout=5):
                     client._fork_lock.release()
                     mine = lib_db._derived_cache("index", Derived)
