@@ -657,6 +657,11 @@ def _claim_part(backup_dir: Path, stem: str, suffix: str) -> tuple:
     an existing file, never through a symlink), mode 0600; ``dest`` free.
     On a name in use, the next microsecond's timestamp is tried.
 
+    The backup is published with a rename, which would replace a
+    ``dest`` created after this check. Writers using this version claim
+    the ``.part`` first, so only one that doesn't (1.10 or earlier)
+    could create it, and only in the same microsecond.
+
     :raises OSError: creating ``part`` failed for another reason.
     :raises WriteError: no free name in :data:`_NAME_TRIES` tries.
     """
