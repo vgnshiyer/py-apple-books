@@ -8,9 +8,11 @@ year-0 date in it. This module reads it defensively and keeps four keys:
 
 - the path is derived from the library's configured source, without
   opening SQLite (:func:`library_prefs_path`);
-- a path under iCloud Drive (``Mobile Documents``) or a File Provider
-  folder (``CloudStorage``) is refused before any file system call, so
-  a placeholder folder is never even looked up in;
+- a path with an iCloud Drive (``Mobile Documents``) or File Provider
+  (``CloudStorage``) folder among its components, as written or with
+  ``..`` collapsed, is refused before any file system call, so a
+  placeholder folder is never even looked up in (the kernel walks the
+  path as written, ``..`` included);
 - the file must be a regular local file: ``lstat`` first, then an
   ``O_NOFOLLOW | O_NONBLOCK`` open and an ``fstat`` that must show the
   same file, not an iCloud placeholder, at most :data:`MAX_BYTES`; all
@@ -135,7 +137,12 @@ def default_prefs_path() -> Optional[Path]:
 
 
 def _in_cloud_folder(path: str) -> bool:
-    return any(part.casefold() in _CLOUD_FOLDERS for part in Path(os.path.abspath(path)).parts)
+    """Whether a cloud folder is among the components of ``path`` as
+    written (the open walks those, ``..`` included) or as an absolute
+    path with ``..`` collapsed (a relative path's folders). Names only,
+    no I/O."""
+    parts = Path(path).parts + Path(os.path.abspath(path)).parts
+    return any(part.casefold() in _CLOUD_FOLDERS for part in parts)
 
 
 # -- reading ------------------------------------------------------------------

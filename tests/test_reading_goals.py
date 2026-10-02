@@ -123,6 +123,10 @@ class TestReasons:
         "/home/someone/library/MOBILE DOCUMENTS/x.plist",
         "/home/someone/Library/CloudStorage/Provider/x.plist",
         "relative/Mobile Documents/x.plist",
+        # Through a cloud folder and back out: the lookup would still
+        # walk the cloud folder, so the path as written is checked too.
+        "/home/someone/Library/Mobile Documents/com~apple~CloudDocs/Folder/../../../Preferences/p.plist",
+        "relative/CloudStorage/../x.plist",
     ])
     def test_icloud_path_is_never_touched(self, monkeypatch, path):
         def refuse(*args, **kwargs):
