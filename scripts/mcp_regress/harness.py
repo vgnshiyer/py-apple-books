@@ -9,7 +9,8 @@ README.md); both commands refuse the real home. Which py_apple_books
 and apple-books-mcp are used is decided by the interpreter and
 PYTHONPATH; both commands print them. Never calls write tools.
 apple-books-mcp 0.8.2 and 0.9.0 are supported; 0.9.0 adds calls for
-its new tool and arguments.
+its new tool and arguments (each argument it added, on every tool that
+has it, is passed by at least one call).
 
 On macOS both commands first turn off downloads of evicted iCloud files
 for their own process, so a book file that is only in iCloud makes its
@@ -310,6 +311,23 @@ def calls(a, version="0.8.2"):
     ctx = a["context_ids"]
     for aid in ctx[:: max(1, len(ctx) // MAX_SHORT_CONTEXT_ANNOTATIONS)][:MAX_SHORT_CONTEXT_ANNOTATIONS]:
         yield "get_annotation_context", {"annotation_id": aid, "chars_before": 50, "chars_after": 50}
+    # offset on the other paged tools, and order_by "oldest" on every tool
+    # that has it: each reaches its own library query. offset=1, so a small
+    # library still gets a page (rows, not only the past-the-end count).
+    yield "list_all_collections", {"limit": 5, "offset": 1}
+    yield "search_books_by_title", {"title": "the", "limit": 5, "offset": 1}
+    yield "get_books_by_genre", {"genre": "Fiction", "limit": 5, "offset": 1}
+    for tool in ("get_books_in_progress", "get_finished_books", "get_unstarted_books",
+                 "get_recently_read_books"):
+        yield tool, {"limit": 5, "offset": 1}
+    yield "recent_annotations", {"limit": 20, "offset": 1}
+    for color in a["colors"]:
+        yield "get_highlights_by_color", {"color": color, "limit": 50, "order_by": "oldest"}
+    for color in a["colors"][:1]:
+        yield "get_highlights_by_color", {"color": color, "limit": 20, "offset": 1}
+    yield "search_notes", {"note": "the", "limit": 50, "order_by": "oldest"}
+    yield "search_notes", {"note": "the", "limit": 20, "offset": 1}
+    yield "get_annotations_by_date_range", {"after": "2025-01-01", "limit": 50, "offset": 1}
 
 
 def run(args_path, out_path, version):

@@ -111,9 +111,12 @@ A key is `tool(json-args)` with sorted arguments. Calls whose outputs differ
 between A and B are nondeterministic and are ignored. `--mcp-version` makes
 the run exit 2 unless the venv has that apple-books-mcp; without it, the
 installed version is used and recorded. Against 0.9.0 the run adds calls for
-its new tool and arguments (`search_books` with and without `limit`/`offset`,
-`chapter_id` "current", offsets, `order_by`, `chars_before`/`chars_after`). Each run records the MCP version, the `py_apple_books` version
-and, if its sources match one, the release it is.
+its new tool and arguments: `search_books` with and without `limit`/`offset`,
+`chapter_id` "current", `chars_before`/`chars_after`, and every argument 0.9.0
+added on every tool that has it (`offset` on each paged tool, `order_by`
+"oldest" on each tool with an `order_by`); `tests/test_mcp_regress.py` checks
+that none is left out. Each run records the MCP version, the `py_apple_books`
+version and, if its sources match one, the release it is.
 
 **5. Compare.**
 
@@ -172,7 +175,10 @@ python3 scripts/mcp_regress/odd_args.py compare $S/odd-base.json $S/odd-cand.jso
 ```
 
 Each call is stored as `EXC <type>`, `OK notfound` (a short one-line
-not-found answer) or `OK <md5[:8]> len=<n>`.
+not-found answer) or `OK <md5[:8]> len=<n>`. Against 0.9.0 the run adds odd
+values for its new arguments: huge and negative `offset`, an unknown
+`order_by`, `search_books` with a lone surrogate or NUL, and a huge offset
+into the current chapter. None of the calls names a real id.
 `compare` prints a transition table. It exits 1 on `OK` -> `EXC`, on
 `OK notfound` -> anything else, or on a missing call, and 2 if the runs used
 different MCP versions (0.9.0 reports not-found as an error, `EXC

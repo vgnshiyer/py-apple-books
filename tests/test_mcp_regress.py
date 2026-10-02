@@ -1,5 +1,6 @@
 """scripts/mcp_regress on synthetic runs: 1.10.0 baselines allow no
-change, the MCP versions must match, 0.9.0 gets its extra calls.
+change, the MCP versions must match, 0.9.0 gets its extra calls (in
+harness.py and odd_args.py).
 Skipped where scripts/ isn't shipped (the sdist, a copied test tree)."""
 
 import importlib
@@ -15,14 +16,18 @@ pytestmark = pytest.mark.skipif(not (HERE / "compare.py").is_file(),
                                 reason="scripts/mcp_regress not present")
 
 
+MODULES = ("harness", "compare", "expected", "odd_args")
+
+
 @pytest.fixture
 def tools(monkeypatch):
+    # Restores all of sys.path afterwards, odd_args.py's own insert included.
     monkeypatch.syspath_prepend(str(HERE))
-    for name in ("harness", "compare", "expected"):
+    for name in MODULES:
         monkeypatch.delitem(sys.modules, name, raising=False)
-    mods = types.SimpleNamespace(**{n: importlib.import_module(n) for n in ("harness", "compare", "expected")})
+    mods = types.SimpleNamespace(**{n: importlib.import_module(n) for n in MODULES})
     yield mods
-    for name in ("harness", "compare", "expected", "mcp_regress_expected"):
+    for name in (*MODULES, "mcp_regress_expected"):
         sys.modules.pop(name, None)
 
 
@@ -77,23 +82,69 @@ def test_runs_must_share_the_mcp_version_and_a_known_baseline(tools, tmp_path):
     assert tools.compare.main(unknown + ["--baseline-release", "1.10.0"]) == 0
 
 
+# The arguments apple-books-mcp 0.9.0 added to its read tools (from the
+# released 0.8.2 and 0.9.0 sources), and search_books, new in 0.9.0.
+ADDED_IN_090 = {
+    "search_books": {"query", "limit", "offset"},
+    "search_books_by_title": {"limit", "offset"},
+    "list_all_collections": {"offset"},
+    "list_all_books": {"offset"},
+    "get_books_by_genre": {"offset"},
+    "get_books_in_progress": {"offset"},
+    "get_finished_books": {"offset"},
+    "get_unstarted_books": {"offset"},
+    "get_recently_read_books": {"offset"},
+    "list_all_annotations": {"offset"},
+    "list_annotations": {"offset"},
+    "recent_annotations": {"offset"},
+    "get_highlights_by_color": {"offset", "order_by"},
+    "search_notes": {"offset", "order_by"},
+    "search_annotations": {"offset", "order_by"},
+    "get_annotations_by_date_range": {"offset", "order_by"},
+}
+ARGS = dict(book_ids=[1, 2], annotated=[1], collections=[3], context_ids=[4],
+            describe_ids=[4], chapter_calls=[[1, "c1"], [1, "c2"], [2, "x"]],
+            revisit_title="t", colors=["yellow", "green"])
+
+
 def test_090_gets_its_new_calls(tools):
-    args = dict(book_ids=[1, 2], annotated=[1], collections=[3], context_ids=[4],
-                describe_ids=[4], chapter_calls=[[1, "c1"], [1, "c2"], [2, "x"]],
-                revisit_title="t", colors=["yellow"])
-    old = list(tools.harness.calls(args, "0.8.2"))
-    new = list(tools.harness.calls(args, "0.9.0"))
+    old = list(tools.harness.calls(ARGS, "0.8.2"))
+    new = list(tools.harness.calls(ARGS, "0.9.0"))
     assert new[:len(old)] == old
     added = new[len(old):]
     assert ("search_books", {"query": "the"}) in added
     assert [kw for tool, kw in added if tool == "get_chapter_content"] == [{"book_id": 1}, {"book_id": 2}]
     assert all(tool != "search_books" for tool, _ in old)
-    # Every new argument of 0.9.0 is exercised on the real library too.
-    assert ("search_books", {"query": "the", "limit": 5, "offset": 5}) in added
-    assert ("list_annotations", {"book_id": 1, "limit": 5, "offset": 5}) in added
-    assert ("search_annotations", {"text": "the", "limit": 50, "order_by": "oldest"}) in added
     assert ("get_annotation_context", {"annotation_id": 4, "chars_before": 50, "chars_after": 50}) in added
     assert len(set(map(repr, new))) == len(new)  # no call twice: keys must be unique
+
+
+def test_every_argument_090_added_is_passed(tools):
+    """Each argument 0.9.0 added, on every tool that has it, is passed by
+    at least one call, and order_by asks for the non-default order."""
+    added = list(tools.harness.calls(ARGS, "0.9.0"))[len(list(tools.harness.calls(ARGS, "0.8.2"))):]
+    passed = {(tool, name) for tool, kw in added for name in kw}
+    missing = sorted((tool, name) for tool, names in ADDED_IN_090.items() for name in names
+                     if (tool, name) not in passed)
+    assert not missing
+    assert {kw["order_by"] for _, kw in added if "order_by" in kw} == {"oldest"}
+    colors = [kw["color"] for tool, kw in added if tool == "get_highlights_by_color" and "order_by" in kw]
+    assert colors == ARGS["colors"]
+
+
+def test_odd_args_adds_090_calls_only_for_090(tools):
+    odd = tools.odd_args
+    assert odd.calls_for(None) == odd.calls_for("0.8.2") == odd.CALLS
+    new = odd.calls_for("0.9.0")
+    assert new[:len(odd.CALLS)] == odd.CALLS and new[len(odd.CALLS):] == odd.CALLS_090
+    keys = [odd.key_of(name, kwargs) for name, kwargs in new]
+    assert len(set(keys)) == len(keys)
+    assert all(key.isascii() for key in keys)  # a lone surrogate or NUL is printed escaped
+    passed = {(tool, name, repr(value)) for tool, kwargs in odd.CALLS_090 for name, value in kwargs.items()}
+    for tool in ("search_annotations", "list_all_books", "get_highlights_by_color"):
+        assert {(tool, "offset", repr(odd.HUGE)), (tool, "offset", "-1")} <= passed
+    assert ("search_annotations", "order_by", "'sideways'") in passed
+    assert {("search_books", "query", repr(odd.SURROGATE)), ("search_books", "query", repr(chr(0)))} <= passed
 
 
 def test_short_contexts_are_spread_and_capped(tools):
@@ -111,14 +162,23 @@ def test_unscoped_falls_back_only_for_a_missing_keyword(tools, capsys):
     def new_release(limit=None, *, include_deleted=False):
         return ["every row" if include_deleted else "default view"]
 
+    calls = []
+
     def broken(limit=None, *, include_deleted=False):
-        raise TypeError("a bug inside the method")
+        # Fails only in the scoped view, so a fallback to method() that
+        # caught the TypeError would return the default view instead.
+        calls.append(include_deleted)
+        if include_deleted:
+            raise TypeError("a bug inside the method")
+        return ["default view"]
 
     assert tools.harness._unscoped(old_release, include_deleted=True) == ["default view"]
     assert "old_release has no include_deleted" in capsys.readouterr().err
     assert tools.harness._unscoped(new_release, include_deleted=True) == ["every row"]
     with pytest.raises(TypeError, match="a bug inside"):
         tools.harness._unscoped(broken, include_deleted=True)
+    assert calls == [True]
+    assert "note:" not in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("platform, on, allow, exits", [

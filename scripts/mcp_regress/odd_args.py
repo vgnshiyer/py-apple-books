@@ -6,7 +6,11 @@
 ``run`` imports apple_books_mcp.server in-process with the current
 interpreter, so the py_apple_books it imports is the one under test; HOME
 must be a snapshot (see README.md). Arguments are huge or out-of-int64
-ids and limits, lone surrogates, NUL and an unknown colour.
+ids and limits, lone surrogates, NUL and an unknown colour. Against
+apple-books-mcp 0.9.0 and later, the run adds its new arguments with odd
+values (huge and negative offsets, an unknown order_by, odd search_books
+queries, a huge offset into the current chapter); a 0.8.2 run makes the
+original calls only, so runs of one version still compare key for key.
 
 Only the class of each result is stored:
   EXC <ExceptionType>   the tool raised (MCP reports isError)
@@ -31,6 +35,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from harness import (  # noqa: E402
     mcp_version, private_output, require_download_policy, require_snapshot_home, text_of,
+    version_key,
 )
 
 HUGE = 99999999999999999999
@@ -55,10 +60,30 @@ CALLS = [
     ("get_highlights_by_color", {"color": "orange"}),
     ("get_chapter_content", {"book_id": HUGE, "chapter_id": "1"}),
 ]
+# apple-books-mcp 0.9.0 on: odd values for its new arguments. Some reach
+# the library directly (search_annotations passes offset to
+# search_annotation_by_text). No call names a real id, so keys and the
+# printed table carry no library data.
+CALLS_090 = [
+    *((tool, dict(kwargs, offset=offset))
+      for tool, kwargs in (("search_annotations", {"text": "x"}), ("list_all_books", {}),
+                           ("get_highlights_by_color", {"color": "yellow"}))
+      for offset in (HUGE, -1)),
+    ("search_annotations", {"text": "x", "order_by": "sideways"}),
+    ("get_highlights_by_color", {"color": "yellow", "order_by": "sideways"}),
+    ("search_books", {"query": SURROGATE}),
+    ("search_books", {"query": chr(0)}),
+    ("get_chapter_content", {"book_id": HUGE, "chapter_id": "current", "offset": HUGE}),
+]
 # A not-found answer is one short line; longer texts (e.g. every match for
 # 'x') may quote highlights that happen to say 'not found' or a title
 # starting with 'No '.
 NOTFOUND_MAX_LEN = 200
+
+
+def calls_for(version):
+    """The calls for apple-books-mcp ``version`` (None: 0.8.2's)."""
+    return CALLS + (CALLS_090 if version_key(version) >= version_key("0.9.0") else [])
 
 
 def key_of(name, kwargs):
@@ -82,7 +107,7 @@ def run(out_path, allow_downloads=False):
     print(f"py_apple_books {py_apple_books.__version__} from {py_apple_books.__file__}; "
           f"apple-books-mcp {mcp_version()}", file=sys.stderr)
     out = {}
-    for name, kwargs in CALLS:
+    for name, kwargs in calls_for(mcp_version()):
         try:
             result = classify(text_of(getattr(s, name)(**kwargs)))
         except Exception as e:  # the class is the result
