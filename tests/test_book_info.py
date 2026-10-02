@@ -911,7 +911,12 @@ def _child_time_limit(seconds: int = 20) -> None:
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
-def test_fork_while_another_thread_is_reading(three, reader, monkeypatch):
+def test_fork_while_another_thread_is_between_statements(three, reader, monkeypatch):
+    # The reader is paused in Python between two statements, holding the
+    # index's build lock and the process's cache-read lock, never inside
+    # SQLite: a fork while a thread is inside SQLite can leave SQLite's
+    # own mutexes locked in the child (LibraryDB's fork rule), which no
+    # lock of this module can undo.
     entered, release = threading.Event(), threading.Event()
     real = book_info._execute
 

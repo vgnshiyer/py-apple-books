@@ -57,7 +57,11 @@ class _BookInfoAPI:
         forgets them): the cache folder is listed and its files stat'ed
         again at most every
         :data:`~py_apple_books.book_info.BOOK_INFO_RECHECK` seconds, and
-        only changed files are read again. Thread-safe.
+        only changed files are read again. Thread-safe. As for every
+        library call, fork only while no other thread is inside this
+        method: SQLite's internal locks are copied in whatever state
+        they were in, and a call in the child could then wait forever,
+        beyond any budget.
 
         Privacy: the answer also tells whether Books ever opened a book
         with a given id, including books never highlighted. Pass ids
