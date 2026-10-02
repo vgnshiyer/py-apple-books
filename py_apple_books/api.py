@@ -5,9 +5,10 @@ import re
 import sqlite3
 import stat
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple, Union
 from py_apple_books import _icloud, collection_writer
+from py_apple_books import engagement as _engagement
 from py_apple_books._api._common import (  # noqa: F401 (re-exported: 1.10 private names)
     _annotation_scope,
     _book_arg,
@@ -499,14 +500,22 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
         )
         return list(matches)
 
-    def get_annotations_by_date_range(self, after: datetime = None, before: datetime = None,
+    def get_annotations_by_date_range(self, after: Union[datetime, date] = None,
+                                       before: Union[datetime, date] = None,
                                        limit: int = None, order_by: str = None, *,
                                        offset: int = None, include_deleted: bool = False) -> ModelIterable:
         """Get user annotations within a date range.
 
+        Both bounds are inclusive. A datetime is an instant (a naive one
+        is local time). A date (1.11) covers that whole local day:
+        ``after=date(2026, 1, 1)`` starts at local midnight, and
+        ``before=date(2026, 12, 31)`` includes all of 31 December.
+
         Args:
-            after: Only include annotations created after this datetime.
-            before: Only include annotations created before this datetime.
+            after: Only include annotations created at or after this datetime
+                (or from the start of this date).
+            before: Only include annotations created at or before this datetime
+                (or up to the end of this date).
             limit: Maximum number of results.
             order_by: Field to sort by (prefix with - for descending).
             offset: Number of results to skip.
@@ -514,9 +523,15 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
         """
         kwargs = _annotation_scope(include_deleted)
         if after:
-            kwargs["creation_date__gte"] = after.timestamp() - APPLE_EPOCH_OFFSET
+            if _engagement._is_day(after):
+                kwargs["creation_date__gte"] = _engagement._day_start(after)
+            else:
+                kwargs["creation_date__gte"] = after.timestamp() - APPLE_EPOCH_OFFSET
         if before:
-            kwargs["creation_date__lte"] = before.timestamp() - APPLE_EPOCH_OFFSET
+            if _engagement._is_day(before):
+                kwargs["creation_date__lt"] = _engagement._day_end(before)
+            else:
+                kwargs["creation_date__lte"] = before.timestamp() - APPLE_EPOCH_OFFSET
         return Annotation.manager.filter(**kwargs, limit=limit, order_by=order_by, offset=offset)
 
     # -- reading progress actions --
@@ -535,11 +550,27 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
                                    limit=limit, order_by=order_by, offset=offset)
 
     def get_finished_books(self, limit: int = None, order_by: str = None, *,
-                           offset: int = None) -> ModelIterable:
+                           offset: int = None, finished_after: Union[datetime, date] = None,
+                           finished_before: Union[datetime, date] = None) -> ModelIterable:
         """Get books marked as finished, whatever their progress (a
-        finished book is in neither of the other two lists)."""
+        finished book is in neither of the other two lists).
+
+        ``finished_after`` and ``finished_before`` (1.11) keep the books
+        whose finish date (:attr:`Book.finished_date`) is in that window,
+        bounds included: a datetime is an instant (naive means local
+        time), a date covers that whole local day. With either set,
+        books without a finish date are left out. Books records the date
+        a book was marked as finished, so books marked in bulk share one.
+
+        :raises InvalidArgumentError: a bound that isn't a date or a
+            datetime.
+        :raises UnsupportedSchemaError: (when the result is read) a bound
+            is set and the store has no finish date column.
+        """
+        bounds = _engagement._window_filters("finished_date", finished_after, finished_before,
+                                             names=("finished_after", "finished_before"))
         return Book.manager.filter(**_owned_books_filter(), **_STATUS_FILTERS[ReadingStatus.FINISHED],
-                                   limit=limit, order_by=order_by, offset=offset)
+                                   **bounds, limit=limit, order_by=order_by, offset=offset)
 
     def get_unstarted_books(self, limit: int = None, order_by: str = None, *,
                             offset: int = None) -> ModelIterable:
