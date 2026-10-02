@@ -248,15 +248,16 @@ def pick_isbn(identifiers: Iterable[Tuple[str, Optional[str], Optional[str]]]) -
     return first13 or first10
 
 
-def clean_subjects(values: Iterable[Any]) -> Tuple[str, ...]:
+def clean_subjects(values: Iterable[Any], *, drop_urls: bool = True) -> Tuple[str, ...]:
     """Subjects: each one line of at most 120 characters, URL-like
-    entries dropped, duplicates (compared folded, as searches compare
-    text) dropped, at most 30."""
+    entries dropped (unless ``drop_urls`` is False: the library's own
+    genre is kept as Books records it), duplicates (compared folded, as
+    searches compare text) dropped, at most 30."""
     out: List[str] = []
     seen = set()
     for value in values:
         text = clean_line(value, SUBJECT_MAX)
-        if text is None or _URL_LIKE.fullmatch(text):
+        if text is None or (drop_urls and _URL_LIKE.fullmatch(text)):
             continue
         key = (fold_for_match(text) or "").strip()
         if not key or key in seen:

@@ -87,6 +87,13 @@ class TestRead:
         assert got.subjects == ("Fiction", "History") and got.description is None
         assert got.book_file_fields == {"language", "subjects"}
 
+    def test_genre_is_kept_as_books_records_it(self, lib, tmp_path):
+        path = epub(tmp_path, metadata="<dc:subject>www.example.com</dc:subject><dc:subject>B</dc:subject>")
+        got = lib.api.get_book_metadata(add(lib, path, genre=" www.example.org "))
+        assert got.subjects == ("www.example.org", "B")
+        assert lib.api.get_book_metadata(add(lib, path, genre="WWW.EXAMPLE.COM")).subjects == (
+            "WWW.EXAMPLE.COM", "B")
+
     def test_genre_only_is_not_from_the_file(self, lib, tmp_path):
         book = add(lib, epub(tmp_path, metadata="<dc:subject>FICTION</dc:subject>"), genre="Fiction")
         got = lib.api.get_book_metadata(book)

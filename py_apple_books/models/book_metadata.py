@@ -59,8 +59,9 @@ class BookMetadata:
     #: ISBN, checksum-verified, without hyphens; an ISBN-13 when the book
     #: has one, else an ISBN-10 (which may end in ``X``).
     isbn: Optional[str] = None
-    #: The library's genre first, then the book's subjects, without
-    #: duplicates (compared like searches compare text); at most 30.
+    #: The library's genre first, then the book's subjects (URL-like
+    #: ones dropped), without duplicates (compared like searches compare
+    #: text); at most 30.
     subjects: Tuple[str, ...] = ()
     #: Plain text, at most 16,000 characters.
     description: Optional[str] = None

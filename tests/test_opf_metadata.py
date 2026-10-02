@@ -329,6 +329,9 @@ class TestSubjectsAndDescription:
                                     "www.example.com", "https://x.example/a", "example.org",
                                     "  ", None, 3, "A\x00 \n  B"]) == ("Philosophie", "Gödel", "A B")
 
+    def test_urls_kept_on_request(self):
+        assert _opf.clean_subjects(["www.example.com", "A"], drop_urls=False) == ("www.example.com", "A")
+
     def test_subject_caps(self):
         many = [f"Subject {i}" for i in range(40)]
         assert _opf.clean_subjects(many) == tuple(many[:30])

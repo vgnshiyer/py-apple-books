@@ -257,8 +257,10 @@ def _merge(book, state: MetadataFileState, fields: Optional[_opf.OpfFields]) -> 
         description = opf.description
         from_file.add("description")
 
-    genre = _opf.clean_subjects([getattr(book, "genre", None)])
-    subjects = _opf.clean_subjects([*genre, *opf.subjects])
+    # The genre as Books records it (whitespace and length cleaned
+    # only); the book's subjects were cleaned when read.
+    genre = _opf.clean_subjects([getattr(book, "genre", None)], drop_urls=False)
+    subjects = _opf.clean_subjects([*genre, *opf.subjects], drop_urls=False)
     if len(subjects) > len(genre):
         from_file.add("subjects")
 
