@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import logging
 import os
 import pathlib
@@ -990,6 +991,105 @@ def test_reads_run_with_materialization_off(home, reader, monkeypatch):
     monkeypatch.setattr(book_info, "_list_folder", lambda f: depth["seen"].append(depth["now"]) or real_list(f))
     assert reader.get_cached_book_info("A")
     assert depth["seen"] == [1, 1]
+
+
+_CASE = {case.name: case for case in cases.CASES}
+
+
+@pytest.mark.parametrize("case, side, mode", [
+    ("wal_live", "-wal", cases.WAL_IMMUTABLE),  # opens no sidecar
+    ("wal_live", "-shm", cases.WAL_IMMUTABLE),
+    ("wal_persist_journal", "-journal", cases.REFUSED),  # SQLite would read a byte of it
+    ("persist_journal", "-journal", cases.REFUSED),
+    ("journal_empty_wal", "-wal", cases.REFUSED),  # SQLite would open it
+], ids=lambda v: v if isinstance(v, str) else "refused")
+def test_evicted_sidecars(home, monkeypatch, case, side, mode):
+    folder = home.book_info_dir
+    folder.mkdir(parents=True)
+    with _CASE[case].make(folder) as path:
+        assert book_info._open_mode(str(path)) == _CASE[case].mode  # as found
+        _patch_lstat(monkeypatch, f"{path}{side}", st_flags=book_info._icloud.SF_DATALESS)
+        if mode is cases.REFUSED:
+            with pytest.raises(book_info._Refused):
+                book_info._open_mode(str(path))
+        else:
+            assert book_info._open_mode(str(path)) == mode
+
+
+def _fail_header_read(monkeypatch, name):
+    real = os.open
+
+    def fake(path, *args, **kwargs):
+        if os.fspath(path).endswith("/" + name):
+            raise OSError(errno.EDEADLK, "Resource deadlock avoided")  # a dataless file
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fake)
+
+
+def _fail_connect(monkeypatch, name):
+    real = book_info._connect
+
+    def fake(uri, busy):
+        if name in uri:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(uri, busy)
+
+    monkeypatch.setattr(book_info, "_connect", fake)
+
+
+def _fail_select(monkeypatch, name):
+    real = book_info._execute
+
+    def fake(con, sql, params=()):
+        if sql.startswith("SELECT") and any(row[2].endswith("/" + name) for row in con.execute(
+                "PRAGMA database_list")):
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(con, sql, params)
+
+    monkeypatch.setattr(book_info, "_execute", fake)
+
+
+@pytest.mark.parametrize("fail", [_fail_header_read, _fail_connect, _fail_select],
+                         ids=["header_edeadlk", "connect_io_error", "select_io_error"])
+def test_a_failed_read_is_skipped_and_tried_again(home, reader, monkeypatch, fail):
+    # The backstop under the lstat gates: a read that would download
+    # (EDEADLK) or fails is skipped without raising, and nothing about the
+    # file is remembered, so the next call reads it.
+    home.add_book_info_cache([{"asset_id": "A", "title": "older"}], version=V0)
+    home.add_book_info_cache([{"asset_id": "A", "title": "newer"}], version=V7)
+    with monkeypatch.context() as patch:
+        fail(patch, cache_name(V7))
+        assert reader.get_cached_book_info("A")["A"].title == "older"
+    assert cache_name(V7) not in index_of(reader)._memos
+    assert reader.get_cached_book_info("A")["A"].title == "newer"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="the I/O policy is macOS's")
+def test_reads_run_with_the_thread_materialization_policy_off(home, reader, monkeypatch):
+    icloud = book_info._icloud
+    functions = icloud._policy_functions()
+    if functions is None:
+        pytest.skip("getiopolicy_np is not available")
+    get = functions[0]
+
+    def policy():
+        return get(icloud.IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, icloud.IOPOL_SCOPE_THREAD)
+
+    home.add_book_info_cache([{"asset_id": "A", "title": "x"}])
+    seen = []
+    real_list, real_open, real_connect = book_info._list_folder, os.open, book_info._connect
+    monkeypatch.setattr(book_info, "_list_folder", lambda f: seen.append(("list", policy())) or real_list(f))
+    monkeypatch.setattr(os, "open", lambda p, *a, **k: (seen.append(("open", policy()))
+                                                        if "AEBookInfo-" in os.fspath(p) else None)
+                        or real_open(p, *a, **k))
+    monkeypatch.setattr(book_info, "_connect",
+                        lambda uri, busy: seen.append(("connect", policy())) or real_connect(uri, busy))
+    before = policy()
+    assert reader.get_cached_book_info("A")["A"].title == "x"
+    off = icloud.IOPOL_MATERIALIZE_DATALESS_FILES_OFF
+    assert seen == [("list", off), ("open", off), ("connect", off)]
+    assert policy() == before  # restored
 
 
 # -- folder derivation ----------------------------------------------------------------
