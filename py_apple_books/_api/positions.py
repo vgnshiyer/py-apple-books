@@ -19,7 +19,7 @@ gate, never with ``du`` or a walk of the bundle. See
 """
 
 import re
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Iterator, NamedTuple, Optional, Tuple, Union
 
 from py_apple_books._api._common import (
     _book_arg,
@@ -129,64 +129,123 @@ class _Found(NamedTuple):
     disambiguated: bool
 
 
-def _occurrences(text: str, passage: str) -> Tuple[Optional[TextMatch], List[Tuple[int, int]]]:
-    """Every match of ``passage`` in ``text`` at the strictest tier that
-    finds one (R18): 1.10's whitespace-flexible pattern, then ignoring
-    invisible characters, then folded. ``(None, [])`` when no tier finds
-    it.
+def _whitespace_spans(text: str, passage: str) -> Iterator[Tuple[int, int]]:
+    """1.10's matches of ``passage`` (its whitespace-flexible pattern),
+    left to right, one at a time."""
+    from py_apple_books.text import _passage_pattern
+
+    source = _passage_pattern(passage)
+    if source is None:
+        return iter(())
+    try:
+        pattern = re.compile(source)
+    except (re.error, OverflowError, RecursionError):
+        return iter(())
+    return (m.span() for m in pattern.finditer(text))
+
+
+def _invisible_spans(text: str, passage: str) -> Iterator[Tuple[int, int]]:
+    """``text._find_passage(text, passage)``, one span at a time: the
+    whitespace-flexible pattern of the passage without soft hyphens,
+    zero-width spaces and BOMs, run on ``text`` without them, the spans
+    mapped back. Holds one copy of ``text`` and no list of matches or of
+    deleted characters."""
+    from py_apple_books.text import _DELETE_INVISIBLE, _INVISIBLE_RE
+
+    if not text or not passage:
+        return
+    clean_passage = passage.translate(_DELETE_INVISIBLE)
+    if _INVISIBLE_RE.search(text) is None:
+        yield from _whitespace_spans(text, clean_passage)
+        return
+    clean = text.translate(_DELETE_INVISIBLE)
+    # A cleaned offset c is c plus the number of deleted characters whose
+    # successor's cleaned offset is at most c. The offsets asked for only
+    # grow (matches don't overlap), so one pass over the deletions does.
+    deleted = enumerate(_INVISIBLE_RE.finditer(text))
+    passed, pending = 0, next(deleted, None)
+
+    def source(c: int) -> int:
+        nonlocal passed, pending
+        while pending is not None and pending[1].start() - pending[0] <= c:
+            passed += 1
+            pending = next(deleted, None)
+        return c + passed
+
+    for a, b in _whitespace_spans(clean, clean_passage):
+        start = source(a)
+        yield start, source(b - 1) + 1
+
+
+def _tier_spans(text: str, passage: str, tier: TextMatch) -> Iterator[Tuple[int, int]]:
+    """The matches of ``passage`` in ``text`` at one tier of R18, left to
+    right, one at a time."""
+    from py_apple_books.text import finditer_folded
+
+    if tier is TextMatch.WHITESPACE:
+        return _whitespace_spans(text, passage)
+    if tier is TextMatch.INVISIBLE:
+        return _invisible_spans(text, passage)
+    return finditer_folded(text, passage)
+
+
+_TIERS = (TextMatch.WHITESPACE, TextMatch.INVISIBLE, TextMatch.FOLDED)
+
+
+def _first_tier(text: str, passage: str) -> Tuple[Optional[TextMatch], Optional[Tuple[int, int]],
+                                                   Iterator[Tuple[int, int]]]:
+    """The strictest tier that finds ``passage`` in ``text`` (R18):
+    1.10's whitespace-flexible pattern, then ignoring invisible
+    characters, then folded. ``(tier, first span, the later spans)``, or
+    ``(None, None, empty)`` when no tier finds it.
 
     There is no separate exact pass before the whitespace-flexible one:
-    the occurrence chosen there is the one 1.10's window shows (so
+    the occurrence found there is the one 1.10's window shows (so
     ``str()`` of the context stays the wrapper's), and it is reported
     ``EXACT`` when it is character for character the passage (see
     :func:`_locate_highlight`), even if a verbatim occurrence exists
     further on."""
-    from py_apple_books.text import _find_passage, _passage_pattern, finditer_folded
-
-    pattern = _passage_pattern(passage)
-    if pattern is None:
-        return None, []
-    try:
-        spans = [m.span() for m in re.finditer(pattern, text)]
-    except (re.error, OverflowError, RecursionError):
-        spans = []
-    if spans:
-        return TextMatch.WHITESPACE, spans
-    spans = _find_passage(text, passage)
-    if spans:
-        return TextMatch.INVISIBLE, spans
-    spans = list(finditer_folded(text, passage))
-    if spans:
-        return TextMatch.FOLDED, spans
-    return None, []
+    for tier in _TIERS:
+        spans = _tier_spans(text, passage, tier)
+        first = next(spans, None)
+        if first is not None:
+            return tier, first, spans
+    return None, None, iter(())
 
 
 def _locate_highlight(text: str, selected: Optional[str], representative: Optional[str]) -> Optional[_Found]:
     """Where an annotation's text is in its file's ``text``: the
     selected text (else the representative text, as 1.10), at the first
-    tier that finds it (see :func:`_occurrences`). Of several
+    tier that finds it (see :func:`_first_tier`). Of several
     occurrences the first is taken, unless the representative text (the
     passage around the selection) occurs exactly once and holds one of
-    them: then that one (``disambiguated``). None when it isn't found."""
+    them: then that one (``disambiguated``). None when it isn't found.
+
+    Matches are counted, never kept: memory doesn't grow with the number
+    of occurrences (a file full of a one-letter highlight)."""
     selected = (selected or "").strip()
     representative = (representative or "").strip()
     passage = selected or representative
     if not passage:
         return None
-    tier, spans = _occurrences(text, passage)
+    tier, chosen, rest = _first_tier(text, passage)
     if tier is None:
         return None
-    chosen, disambiguated = spans[0], False
-    if len(spans) > 1 and selected and len(representative) > len(selected):
-        _, around = _occurrences(text, representative)
-        if len(around) == 1:
-            lo, hi = around[0]
-            inside = [s for s in spans if lo <= s[0] and s[1] <= hi]
-            if inside:
-                chosen, disambiguated = inside[0], True
+    occurrences = 1 + sum(1 for _ in rest)
+    disambiguated = False
+    if occurrences > 1 and selected and len(representative) > len(selected):
+        _, around, others = _first_tier(text, representative)
+        if around is not None and next(others, None) is None:
+            lo, hi = around
+            for span in _tier_spans(text, passage, tier):
+                if span[0] >= hi:
+                    break
+                if lo <= span[0] and span[1] <= hi:
+                    chosen, disambiguated = span, True
+                    break
     if tier is TextMatch.WHITESPACE and text[chosen[0]:chosen[1]] == passage:
         tier = TextMatch.EXACT
-    return _Found(chosen[0], chosen[1], tier, len(spans), disambiguated)
+    return _Found(chosen[0], chosen[1], tier, occurrences, disambiguated)
 
 
 # Fixed, path-free messages for ContextUnavailableError (annotation-level

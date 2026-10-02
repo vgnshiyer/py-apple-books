@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pickle
 import random
+import tracemalloc
 
 import pytest
 
@@ -185,6 +186,51 @@ class TestTiers:
     def test_representative_text_alone(self, api, library, book):
         aid = add(library, book, None, cfi(0, "c1"), raw={"ZANNOTATIONREPRESENTATIVETEXT": " lazy dog. "})
         assert api.get_annotation_context(aid, 0, 0).highlight == "lazy dog."
+
+    def test_memory_does_not_grow_with_the_occurrences(self):
+        """Matches are counted, not kept: a file full of a one-letter
+        highlight (a million occurrences, at each tier) costs at most a
+        copy or two of the text (the invisible and folded tiers), never
+        a span per occurrence."""
+        n = 1_000_000
+        # Bytes per occurrence allowed: 0 (the text is searched in
+        # place), the cleaned copy, the fold of the text. A kept span
+        # would be over 60.
+        for text, selected, tier, per in (("a " * n, "a", TextMatch.EXACT, 0),
+                                          ("a \u00ad" * n, "a\u00ad", TextMatch.INVISIBLE, 4),
+                                          ("A " * n, "a", TextMatch.FOLDED, 6)):
+            tracemalloc.start()
+            try:
+                found = _locate_highlight(text, selected, "a a a")
+                peak = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+            assert (found.start, found.text_match, found.occurrences) == (0, tier, n)
+            assert peak < per * n + 2 * 1024 * 1024, (tier, peak)
+
+    def test_disambiguation_scans_without_a_list(self):
+        text = "yes " * 100_000 + "so he said yes to it. " + "yes " * 100_000
+        tracemalloc.start()
+        try:
+            found = _locate_highlight(text, "yes", "he said yes to it")
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        assert (found.start, found.occurrences, found.disambiguated) == (400_011, 200_001, True)
+        assert peak < 1024 * 1024
+
+    def test_invisible_tier_is_find_passage(self):
+        """The streaming invisible tier gives ``text._find_passage``'s
+        spans, in order."""
+        from py_apple_books._api.positions import _invisible_spans
+        from py_apple_books.text import _find_passage
+
+        rng = random.Random(1611)
+        pieces = ["a", "b", "ab", " ", "\n", "\u00ad", "\u200b", "\ufeff", "a b", "é"]
+        for _ in range(20_000):
+            text = "".join(rng.choice(pieces) for _ in range(rng.randrange(0, 30)))
+            passage = "".join(rng.choice(pieces) for _ in range(rng.randrange(0, 6)))
+            assert list(_invisible_spans(text, passage)) == _find_passage(text, passage), (text, passage)
 
     def test_never_the_chapter_opening(self, api, library, book):
         aid = add(library, book, "words that are nowhere", cfi(0, "c1"))
