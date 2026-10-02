@@ -863,6 +863,48 @@ def test_two_libraries_on_one_folder(three):
         two.close()
 
 
+def test_libraries_never_read_cache_files_at_once(three, monkeypatch):
+    # Opening a cache's header (os.open/os.close) drops every POSIX lock
+    # the process holds on it, a read lock of another library's open
+    # connection included: one library's read must keep the others' out
+    # of every cache file until its connection is closed.
+    one, two = PyAppleBooks(three.data_dir), PyAppleBooks(three.data_dir)
+    entered, release = threading.Event(), threading.Event()
+    opened_while_held = []
+    real_execute, real_open_mode = book_info._execute, book_info._open_mode
+
+    def execute(con, sql, params=()):
+        if threading.current_thread().name == "one" and sql.startswith("SELECT"):
+            entered.set()
+            assert release.wait(timeout=20)
+        return real_execute(con, sql, params)
+
+    def open_mode(path):
+        if threading.current_thread().name != "one" and entered.is_set() and not release.is_set():
+            opened_while_held.append(os.path.basename(path))
+        return real_open_mode(path)
+
+    monkeypatch.setattr(book_info, "_execute", execute)
+    monkeypatch.setattr(book_info, "_open_mode", open_mode)
+    worker = threading.Thread(target=lambda: one.get_cached_book_info("A"), name="one")
+    worker.start()
+    try:
+        assert entered.wait(timeout=10)  # library one has a cache open, mid-read
+        start = time.monotonic()
+        with two.query_deadline(0.3):
+            assert two.get_cached_book_info("A") == {}  # waited for its turn, read nothing
+        assert time.monotonic() - start < 1.5
+        assert opened_while_held == []
+    finally:
+        release.set()
+        worker.join(timeout=30)
+    try:
+        assert two.get_cached_book_info("A")["A"].title == "A in 26.10"  # nothing was remembered
+    finally:
+        one.close()
+        two.close()
+
+
 def _child_time_limit(seconds: int = 20) -> None:
     signal.signal(signal.SIGALRM, signal.SIG_DFL)
     signal.alarm(seconds)
