@@ -86,8 +86,12 @@ _NAME = re.compile(r"AEBookInfo-[A-Za-z0-9._-]{1,100}\.sqlite")
 _CLOUD_PARTS = frozenset(p.casefold() for p in ("Mobile Documents", "com~apple~CloudDocs", "CloudStorage"))
 # The newest this many cache files (natural order of their names) are read.
 _MAX_FILES = 32
-# Ids remembered per cache file (least recently used dropped).
+# Ids remembered per cache file (least recently used dropped), and the
+# most characters of text (ids and values) remembered per cache file:
+# far more than 1,024 real rows take, so it binds only on a damaged or
+# crafted cache.
 _MEMO_IDS = 1024
+_MEMO_TEXT = 1 << 20
 # Ids bound per statement.
 _CHUNK = 500
 # A longer id (in bytes, UTF-8) is never looked up: see _bindable.
@@ -390,9 +394,10 @@ def _connect(uri: str, busy: float) -> sqlite3.Connection:
     return sqlite3.connect(uri, uri=True, timeout=busy, isolation_level=None, check_same_thread=False)
 
 
-def _execute(con: sqlite3.Connection, sql: str, params: Sequence = ()) -> list:
-    """``con.execute(sql, params).fetchall()``. The tests' patch point."""
-    return con.execute(sql, params).fetchall()
+def _execute(con: sqlite3.Connection, sql: str, params: Sequence = ()) -> Iterable[tuple]:
+    """``con.execute(sql, params)``: its rows, fetched as they are
+    iterated. The tests' patch point."""
+    return con.execute(sql, params)
 
 
 def _capped(column: str) -> str:
@@ -404,7 +409,8 @@ def _capped(column: str) -> str:
 def _select(con: sqlite3.Connection, have: set, ids: Sequence[str]) -> Dict[str, _Row]:
     """The best row per id: the newest row with a title, else the newest
     with an author (newest by ``Z_PK``). A value over
-    :data:`_MAX_VALUE_BYTES` reads as NULL."""
+    :data:`_MAX_VALUE_BYTES` reads as NULL. Rows are taken one at a time
+    and at most one is kept per id, however many a damaged cache holds."""
     columns = ", ".join(_capped(c) if c in have else "NULL" for c in _COLUMNS)
     order = " ORDER BY Z_PK DESC" if "Z_PK" in have else ""
     wanted = set(ids)
@@ -416,11 +422,11 @@ def _select(con: sqlite3.Connection, have: set, ids: Sequence[str]) -> Dict[str,
         for key, *values in _execute(con, sql, chunk):
             if not isinstance(key, str) or key not in wanted:
                 continue
-            row = _row(values)
-            if row is None:
-                continue
             best = found.get(key)
-            if best is None or (best.title is None and row.title is not None):
+            if best is not None and best.title is not None:
+                continue  # the newest row with a title is kept
+            row = _row(values)
+            if row is not None and (best is None or row.title is not None):
                 found[key] = row
     return found
 
@@ -541,14 +547,21 @@ _REFUSED = "refused"  # retried at the next look at the folder
 
 class _FileMemo:
     """What one cache file gave, valid for the file's ``sig``: ``rows``
-    maps id -> row (None: no usable row), least recently used first."""
+    maps id -> row (None: no usable row), least recently used first;
+    ``text`` is their :func:`_text_size` total."""
 
-    __slots__ = ("sig", "rows", "unusable")
+    __slots__ = ("sig", "rows", "text", "unusable")
 
     def __init__(self, sig: tuple, unusable: Optional[str] = None):
         self.sig = sig
         self.rows: "collections.OrderedDict[str, Optional[_Row]]" = collections.OrderedDict()
+        self.text = 0
         self.unusable = unusable
+
+
+def _text_size(asset_id: str, row: Optional[_Row]) -> int:
+    """The characters of text one memo entry holds."""
+    return len(asset_id) + (0 if row is None else sum(len(v) for v in row if v is not None))
 
 
 class _BookInfoIndex:
@@ -734,10 +747,13 @@ class _BookInfoIndex:
             if memo is None or memo.sig != sig or memo.unusable:
                 memo = self._memos[name] = _FileMemo(sig)
             for i, row in keep:
+                if i in memo.rows:
+                    memo.text -= _text_size(i, memo.rows[i])
                 memo.rows[i] = row
                 memo.rows.move_to_end(i)
-            while len(memo.rows) > _MEMO_IDS:
-                memo.rows.popitem(last=False)
+                memo.text += _text_size(i, row)
+            while len(memo.rows) > _MEMO_IDS or memo.text > _MEMO_TEXT:
+                memo.text -= _text_size(*memo.rows.popitem(last=False))
             self._sigs[name] = sig
         return got
 

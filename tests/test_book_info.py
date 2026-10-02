@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+import tracemalloc
 import types
 import warnings
 from urllib.parse import unquote
@@ -816,6 +817,42 @@ def test_a_memo_hit_makes_an_id_recently_used(home, reader, monkeypatch):
     assert list(memo.rows) == ["k1", "k2", "k0"]
     reader.get_cached_book_info("k3")  # read: the least recently used (k1) goes
     assert list(memo.rows) == ["k2", "k0", "k3"]
+
+
+def test_memo_text_is_bounded_per_file(home, reader, monkeypatch):
+    # The memo also holds at most _MEMO_TEXT characters of ids and values
+    # per file (least recently used dropped first), so long values in a
+    # damaged cache can't make 1,024 ids take hundreds of megabytes.
+    monkeypatch.setattr(book_info, "_MEMO_TEXT", 100)
+    home.add_book_info_cache([{"asset_id": f"k{i}", "title": "t" * 30} for i in range(10)])
+    reader.get_cached_book_info([f"k{i}" for i in range(6)])
+    (memo,) = index_of(reader)._memos.values()
+    assert list(memo.rows) == ["k3", "k4", "k5"] and memo.text == 3 * 32
+    reader.get_cached_book_info(["k6", "absent"])  # 102 characters with k4: k4 goes
+    assert list(memo.rows) == ["k5", "k6", "absent"] and memo.text == 2 * 32 + 6
+    assert memo.text == sum(book_info._text_size(i, row) for i, row in memo.rows.items())
+
+
+def test_duplicate_rows_are_taken_one_at_a_time(home, reader):
+    # A damaged cache with thousands of rows for one key: the read keeps
+    # one row per id as it goes, rather than loading every row first.
+    path = home.add_book_info_cache([{"asset_id": "B", "title": "b"}], journal_mode="DELETE")
+    con = sqlite3.connect(path)
+    try:
+        con.execute("INSERT INTO ZAEBOOKINFO (ZDATABASEKEY, ZBOOKAUTHOR) SELECT 'A', printf('%.*c', 4000, 'a') "
+                    "FROM (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n LIMIT 3000) SELECT x FROM n)")
+        con.commit()
+    finally:
+        con.close()
+    assert reader.get_cached_book_info("B")["B"].title == "b"  # any first-use work done
+    tracemalloc.start()
+    try:
+        got = reader.get_cached_book_info("A")
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert got == {"A": CachedBookInfo("A", None, "a" * 4000, source=cache_name(V7))}
+    assert peak < 2_000_000  # every row at once: over 12 MB
 
 
 def test_many_ids_all_found(home, reader):

@@ -39,11 +39,11 @@ class _BookInfoAPI:
         for a lock Books holds and 1 s per cache file, 2 s per call,
         and no more than the library's ``query_timeout`` or an active
         :meth:`query_deadline`. Files not reached are read at a later
-        call. Up to 1,024 ids are remembered per cache file: a call with
-        more is not fully remembered, so a repeat reads the caches
-        again and may not reach the oldest within its budget. Pass the
-        distinct asset ids of annotations whose book is gone, not every
-        annotation's.
+        call. Up to 1,024 ids are remembered per cache file (fewer if
+        their values are unusually long): a call with more is not fully
+        remembered, so a repeat reads the caches again and may not
+        reach the oldest within its budget. Pass the distinct asset ids
+        of annotations whose book is gone, not every annotation's.
 
         No library store is needed: the caches of the Books container
         holding this instance's library are read (its ``Documents``
