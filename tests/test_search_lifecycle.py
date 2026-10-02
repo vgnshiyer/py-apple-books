@@ -571,6 +571,45 @@ def test_only_the_stores_and_memory_are_opened(lib):
     assert not rec.of(*_fs_audit.PROCESS_EVENTS)
 
 
+def test_book_files_and_icloud_drive_are_never_touched(make_library):
+    """Books whose bundles are under iCloud Drive (one evicted: ZSTATE 3
+    and an .icloud stub): both searches, book_id given as a Book, and the
+    hits' books, all under block(), which refuses the bundles and
+    anything under Mobile Documents."""
+    lib = make_library()
+    docs = lib.root / "Library" / "Mobile Documents" / "iCloud~com~apple~iBooks" / "Documents"
+    bundles = []
+    for i in range(3):
+        bundle = docs / f"Bundle{i}.epub"
+        (bundle / "OEBPS").mkdir(parents=True)
+        (bundle / "OEBPS" / "chapter.xhtml").write_text("<html/>")
+        bundles.append(bundle)
+    (docs / ".Bundle2.epub.icloud").write_text("stub")
+    books = [lib.add_book(f"Lantern {i}", "Quill Author", path=bundle, state=3 if i == 2 else 1)
+             for i, bundle in enumerate(bundles)]
+    for book in books:
+        for j in range(5):
+            lib.add_annotation(book, f"lantern passage {j}", note="lantern note")
+    db = LibraryDB(data_dir=lib.data_dir)
+    try:
+        with use_library(db):
+            api = PyAppleBooks()
+            with _fs_audit.block(_fs_audit.Policy.for_library(lib.root, books=bundles)) as rec:
+                hits = api.search_annotations("lantern passage", limit=None)
+                evicted = api.get_book_by_id(books[2]["id"])
+                mine = api.search_annotations("lantern", book_id=evicted, limit=None)
+                found = list(api.search_books("lantern quill"))
+                seen = [(hit.annotation.book.title, hit.annotation.book.path) for hit in hits + mine]
+    finally:
+        db.close()
+    assert len(hits) == 15 and len(mine) == 5 and len(found) == 3
+    assert all(title and path for title, path in seen)
+    assert rec.refused == []
+    paths = {e.path for e in rec.of(*_fs_audit.PATH_EVENTS)}
+    assert paths and not any("mobile documents" in path.casefold() for path in paths)
+    assert not rec.of(*_fs_audit.PROCESS_EVENTS)
+
+
 def test_the_audit_control(tmp_path):
     """The hook sees what the test above rules out."""
     archive = tmp_path / "x.zip"
