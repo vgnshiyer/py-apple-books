@@ -2,7 +2,8 @@
 
 sqlite3 refuses to read such a cell, and up to 1.10 that failed every
 query that met one: one bad title broke ``list_books``. Reads now show
-U+FFFD in place of the invalid bytes, and errors never quote the cell.
+U+FFFD in place of the invalid bytes, errors never quote the cell, and
+the collection writes neither stop at such text nor change it.
 
 Synthetic libraries only; the invalid bytes are written with
 ``CAST(? AS TEXT)``.
@@ -11,14 +12,29 @@ Synthetic libraries only; the invalid bytes are written with
 import logging
 import sqlite3
 import threading
+import uuid
 
 import pytest
 
 from py_apple_books import PyAppleBooks
+from py_apple_books.collection_writer import (
+    WriteSession,
+    add_book_to_collection,
+    delete_collection,
+    remove_book_from_collection,
+    rename_collection,
+)
 from py_apple_books.db import LibraryDB
 from py_apple_books.db import client
 from py_apple_books.db.client import INVALID_TEXT_WARNING, AppleBooksDBClient
-from py_apple_books.exceptions import DBQueryError, QueryTimeoutError
+from py_apple_books.exceptions import (
+    CollectionNotFoundError,
+    DBQueryError,
+    QueryTimeoutError,
+    SystemCollectionError,
+    WriteError,
+)
+from py_apple_books.testing import FixtureLibrary
 
 BAD_TITLE = b"AB\xffC"
 # A UTF-16 surrogate encoded as UTF-8 (CESU-8), which UTF-8 forbids.
@@ -290,3 +306,123 @@ def test_assigned_cursor_decode_error_quotes_nothing(noisy):
     finally:
         conn.close()
         db.close()
+
+
+# -- collection writes --------------------------------------------------------------
+
+
+@pytest.fixture
+def writable(tmp_path):
+    """Built-in collections, a user collection holding a book, and
+    another book: every title, collection id and asset id valid."""
+    lib = FixtureLibrary.create(tmp_path / "home")
+    lib.system = lib.seed_system_collections()
+    lib.shelf = lib.add_collection("Shelf")
+    lib.book = lib.add_book("Synthetic Book A")
+    lib.other = lib.add_book("Synthetic Book B")
+    lib.add_to_collection(lib.shelf, lib.book)
+    return lib
+
+
+def _kwargs(lib):
+    return dict(db_path=lib.library_path, backup=False, require_books_closed=False)
+
+
+def _raw(lib, sql, params=()):
+    return lib.execute("library", sql, params)
+
+
+def test_rename_and_delete_a_collection_with_an_invalid_title(writable):
+    lib = writable
+    pk = lib.shelf["id"]
+    _set_text(lib, "library", "ZBKCOLLECTION", "ZTITLE", pk, BAD_TITLE)
+    rename_collection(pk, "Renamed", **_kwargs(lib))
+    assert _raw(lib, "SELECT ZTITLE FROM ZBKCOLLECTION WHERE Z_PK = ?", (pk,)) == [("Renamed",)]
+    _set_text(lib, "library", "ZBKCOLLECTION", "ZTITLE", pk, BAD_TITLE)
+    delete_collection(pk, **_kwargs(lib))
+    rows = _raw(lib, "SELECT ZDELETEDFLAG, CAST(ZTITLE AS BLOB) FROM ZBKCOLLECTION WHERE Z_PK = ?", (pk,))
+    assert rows == [(1, BAD_TITLE)]  # soft-deleted, its title untouched
+    with pytest.raises(CollectionNotFoundError, match=r"^Collection \d+ \('AB�C'\) has been deleted\.$"):
+        rename_collection(pk, "Back", **_kwargs(lib))
+
+
+def test_add_and_remove_a_book_with_an_invalid_asset_id(writable):
+    lib = writable
+    shelf, book = lib.shelf["id"], lib.other["id"]
+    asset = lib.other["asset_id"].encode() + b"\xff"
+    _set_text(lib, "library", "ZBKLIBRARYASSET", "ZASSETID", book, asset)
+    assert add_book_to_collection(shelf, book, **_kwargs(lib)) is True
+    members = "SELECT typeof(ZASSETID), CAST(ZASSETID AS BLOB), ZASSET FROM ZBKCOLLECTIONMEMBER WHERE ZCOLLECTION = ? ORDER BY Z_PK"
+    assert _raw(lib, members, (shelf,))[-1] == ("text", asset, book)  # copied byte for byte
+    assert add_book_to_collection(shelf, book, **_kwargs(lib)) is False  # found again
+    assert len(_raw(lib, members, (shelf,))) == 2
+    assert remove_book_from_collection(shelf, book, **_kwargs(lib)) is True
+    assert remove_book_from_collection(shelf, book, **_kwargs(lib)) is False
+    assert [row[1] for row in _raw(lib, members, (shelf,))] == [lib.book["asset_id"].encode()]
+
+
+def test_membership_writes_with_valid_text_are_unchanged(writable):
+    lib = writable
+    shelf = lib.shelf["id"]
+    assert add_book_to_collection(shelf, lib.other["id"], **_kwargs(lib)) is True
+    rows = _raw(lib, "SELECT typeof(ZASSETID), ZASSETID FROM ZBKCOLLECTIONMEMBER "
+                     "WHERE ZCOLLECTION = ? ORDER BY Z_PK", (shelf,))
+    assert rows == [("text", lib.book["asset_id"]), ("text", lib.other["asset_id"])]
+    assert remove_book_from_collection(shelf, lib.book["id"], **_kwargs(lib)) is True
+    no_asset = lib.add_book("No Asset Id", raw={"ZASSETID": None})
+    with pytest.raises(WriteError, match="has no asset id"):
+        add_book_to_collection(shelf, no_asset["id"], **_kwargs(lib))
+    assert remove_book_from_collection(shelf, no_asset["id"], **_kwargs(lib)) is False
+
+
+def test_an_invalid_collection_id_is_not_a_user_collection(writable):
+    lib = writable
+    pk = lib.shelf["id"]
+    _set_text(lib, "library", "ZBKCOLLECTION", "ZCOLLECTIONID", pk,
+              str(uuid.uuid4()).upper().encode() + b"\xff")
+    for write in (lambda: rename_collection(pk, "X", **_kwargs(lib)),
+                  lambda: delete_collection(pk, **_kwargs(lib)),
+                  lambda: add_book_to_collection(pk, lib.other["id"], **_kwargs(lib))):
+        with pytest.raises(SystemCollectionError, match=r"^'Shelf' is not a user-created collection"):
+            write()
+    assert _raw(lib, "SELECT ZTITLE, ZDELETEDFLAG FROM ZBKCOLLECTION WHERE Z_PK = ?", (pk,)) == [("Shelf", 0)]
+
+
+def test_a_built_in_collection_with_an_invalid_title_is_refused(writable):
+    lib = writable
+    pk = lib.system["Books_Collection_ID"]["id"]
+    _set_text(lib, "library", "ZBKCOLLECTION", "ZTITLE", pk, BAD_TITLE)
+    with pytest.raises(SystemCollectionError, match="^'AB�C' is not a user-created collection"):
+        rename_collection(pk, "X", **_kwargs(lib))
+
+
+def test_a_blob_collection_id_is_refused_as_before(writable):
+    """Only text is decoded: a BLOB id still isn't a UUID, as in 1.10."""
+    lib = writable
+    pk = lib.shelf["id"]
+    _raw(lib, "UPDATE ZBKCOLLECTION SET ZCOLLECTIONID = CAST(ZCOLLECTIONID AS BLOB) WHERE Z_PK = ?", (pk,))
+    with pytest.raises(SystemCollectionError):
+        rename_collection(pk, "X", **_kwargs(lib))
+
+
+def test_write_sessions_refuse_other_invalid_text_without_quoting_it(writable):
+    """The backstop: text a write reads through sqlite3 that isn't valid
+    UTF-8 raises a WriteError that quotes nothing, and the transaction
+    is rolled back."""
+    lib = writable
+    _raw(lib, "UPDATE Z_PRIMARYKEY SET Z_NAME = CAST(? AS TEXT) WHERE Z_NAME = 'BKJaliscoStatus'", (NOISY,))
+    before = _raw(lib, "SELECT Z_MAX FROM Z_PRIMARYKEY ORDER BY Z_ENT")
+    with pytest.raises(WriteError) as exc:
+        with WriteSession(**_kwargs(lib)) as session:
+            session.conn.execute("UPDATE Z_PRIMARYKEY SET Z_MAX = Z_MAX + 1")
+            session.conn.execute("SELECT Z_NAME FROM Z_PRIMARYKEY").fetchall()
+    assert type(exc.value) is WriteError
+    assert str(exc.value) == ("Some text this write needs to read in the Books library database "
+                              "isn't valid UTF-8; nothing was changed.")
+    assert exc.value.__cause__ is None and exc.value.__context__ is None
+    assert _raw(lib, "SELECT Z_MAX FROM Z_PRIMARYKEY ORDER BY Z_ENT") == before
+    # Valid text reads as sqlite3 reads it.
+    with WriteSession(**_kwargs(lib)) as session:
+        names = [n for (n,) in session.conn.execute(
+            "SELECT Z_NAME FROM Z_PRIMARYKEY WHERE Z_NAME = 'BKCollection'")]
+    assert names == ["BKCollection"]
