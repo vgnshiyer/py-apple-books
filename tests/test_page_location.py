@@ -7,6 +7,7 @@ shape Books writes (``BKPageLocation`` with a ``BKLocation`` super).
 
 import copy
 import dataclasses
+import os
 import pickle
 import plistlib
 import random
@@ -115,7 +116,7 @@ class TestFromPlist:
     def test_random_bytes_never_raise(self):
         rng = random.Random(17)
         base = blob(211)
-        for i in range(2000):
+        for i in range(int(os.environ.get("APPLE_BOOKS_FUZZ_ITERATIONS", "2000"))):
             if i % 2:
                 data = bytes(rng.randrange(256) for _ in range(rng.randrange(1, 200)))
                 if i % 4 == 1:

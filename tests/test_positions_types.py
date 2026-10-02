@@ -10,6 +10,7 @@ import copy
 import dataclasses
 import enum
 import json
+import os
 import pathlib
 import pickle
 import random
@@ -380,7 +381,7 @@ def test_parse_takes_a_str_subclass():
 
 def test_parse_round_trips():
     rng = random.Random(1107)
-    for _ in range(2000):
+    for _ in range(int(os.environ.get("APPLE_BOOKS_FUZZ_ITERATIONS", "2000"))):
         spine = rng.choice([0, 1, rng.randrange(10 ** rng.randint(1, 9))])
         offset = rng.choice([0, 1, rng.randrange(10 ** rng.randint(1, 12))])
         p = P.TextPosition(spine, offset)
