@@ -526,8 +526,8 @@ def test_write_prefs_defaults(lib):
     without = plistlib.loads(lib.write_prefs(finished={"ASSET-A": dt.datetime(2026, 6, 1, 8)},
                                              year_zero_date=False).read_bytes())
     assert without == {
-        "ReadingGoals.BooksFinished": {"goal": 8, "date": dt.datetime(2026, 1, 2, 9)},
-        "ReadingGoals.StreakDay": {"goal": 5400.0, "date": dt.datetime(2026, 1, 3, 9)},
+        "ReadingGoals.BooksFinished": {"goal": 3, "date": dt.datetime(2026, 1, 2, 9)},
+        "ReadingGoals.StreakDay": {"goal": 300.0, "date": dt.datetime(2026, 1, 3, 9)},
         "ReadingHistory.CurrentStreak": 0,
         "BKFinishedAssetsCache": {"ASSET-A": dt.datetime(2026, 6, 1, 8)},
     }
@@ -536,10 +536,10 @@ def test_write_prefs_defaults(lib):
 def test_write_prefs_values(lib):
     aware = dt.datetime(2026, 2, 1, 12, tzinfo=dt.timezone(dt.timedelta(hours=2)))
     doc = plistlib.loads(lib.write_prefs(
-        books_goal="8", books_goal_set=aware, daily_goal_seconds=None, current_streak={"x": 1},
+        books_goal="3", books_goal_set=aware, daily_goal_seconds=None, current_streak={"x": 1},
         finished={}, extra={"Other": [1, "two"], "ReadingHistory.CurrentStreak": 3},
         year_zero_date=False).read_bytes())
-    assert doc == {"ReadingGoals.BooksFinished": {"goal": "8", "date": dt.datetime(2026, 2, 1, 10)},
+    assert doc == {"ReadingGoals.BooksFinished": {"goal": "3", "date": dt.datetime(2026, 2, 1, 10)},
                    "ReadingHistory.CurrentStreak": 3, "BKFinishedAssetsCache": {}, "Other": [1, "two"]}
     assert plistlib.loads(lib.write_prefs(books_goal=None, daily_goal_seconds=None, current_streak=None,
                                           year_zero_date=False).read_bytes()) == {}

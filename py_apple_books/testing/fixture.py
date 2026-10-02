@@ -623,7 +623,7 @@ class FixtureLibrary:
 
     # -- Books' preferences plist -------------------------------------------
 
-    def write_prefs(self, *, books_goal: Any = 8, books_goal_set=None, daily_goal_seconds: Any = 5400.0,
+    def write_prefs(self, *, books_goal: Any = 3, books_goal_set=None, daily_goal_seconds: Any = 300.0,
                     daily_goal_set=None, current_streak: Any = 0,
                     finished: Optional[Mapping[str, Any]] = None,
                     extra: Optional[Mapping[str, Any]] = None, year_zero_date: bool = True,
@@ -643,18 +643,19 @@ class FixtureLibrary:
           (:data:`YEAR_ZERO`) when ``year_zero_date``. Books writes one,
           and it makes plain ``plistlib.loads`` reject the whole file.
 
-        A None ``books_goal``, ``daily_goal_seconds``, ``current_streak``
-        or ``finished`` leaves its key out. Values are written as given,
-        so wrong types can be tested (``books_goal='8'``). ``extra`` adds
-        or replaces top-level keys, last; its values are plain plist
-        values.
+        The default goals (3 books a year, 300 seconds a day) are
+        arbitrary synthetic values. A None ``books_goal``,
+        ``daily_goal_seconds``, ``current_streak`` or ``finished`` leaves
+        its key out. Values are written as given, so wrong types can be
+        tested (``books_goal='3'``). ``extra`` adds or replaces top-level
+        keys, last; its values are plain plist values.
 
         Dates (``books_goal_set``, ``daily_goal_set``, the values of
         ``finished``) are datetimes (naive means UTC), dates (midnight
-        UTC) or Core Data seconds (int or float), written as dates exactly, so
-        :data:`YEAR_ZERO`, ``float('nan')`` and other values ``datetime``
-        can't hold give the unreadable dates found in real files. A
-        ``*_set`` of None is a fixed date in January 2026.
+        UTC) or Core Data seconds (int or float), written as dates
+        exactly, so :data:`YEAR_ZERO`, ``float('nan')`` and other values
+        ``datetime`` can't hold give the unreadable dates found in real
+        files. A ``*_set`` of None is a fixed date in January 2026.
 
         ``fmt`` is ``'binary'`` (what Books writes) or ``'xml'``; an XML
         plist can hold no unreadable date but :data:`YEAR_ZERO`.
