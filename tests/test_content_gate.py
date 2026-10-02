@@ -495,3 +495,48 @@ def test_failure_after_the_load_is_unreadable(tmp_path):
             call()
         assert type(exc.value) is AppleBooksError
         assert isinstance(exc.value.__cause__, RecursionError)
+
+
+class TestPerFileStubs:
+    """Files evicted the older way: gone, with a ``.<name>.icloud`` stub
+    next to them, inside the bundle (a stub next to the bundle itself is
+    covered above). The 1.11 paths report them as not downloaded."""
+
+    @staticmethod
+    def _evict(path):
+        path.unlink()
+        (path.parent / f".{path.name}.icloud").write_bytes(b"")
+
+    @staticmethod
+    def _book(bundle):
+        return SimpleNamespace(path=bundle, state=1, is_store_series_item=False)
+
+    def test_chapter(self, tmp_path):
+        bundle = _epub_shapes.plain(tmp_path)
+        self._evict(bundle / "OEBPS" / "ch2.xhtml")
+        content = BookContent(bundle)
+        assert len(content.list_spine_items()) == 3  # the index doesn't need it
+        assert _epub_index._book_gate(self._book(bundle))[0] is None
+        for item in ("ch2", 1):
+            with pytest.raises(BookNotDownloadedError):
+                content.get_spine_item_text(item)
+        it = content.iter_spine_text()
+        assert next(it).item_id == "ch1"
+        with pytest.raises(BookNotDownloadedError):
+            next(it)
+        # Gone with no stub: unreadable, as before.
+        (bundle / "OEBPS" / ".ch2.xhtml.icloud").unlink()
+        with pytest.raises(AppleBooksError) as exc:
+            BookContent(bundle).get_spine_item_text("ch2")
+        assert not isinstance(exc.value, BookNotDownloadedError)
+
+    @pytest.mark.parametrize("name", ["content.opf", "nav.xhtml", "toc.ncx"])
+    @pytest.mark.parametrize("warm", [False, True])
+    def test_package_and_navigation_files(self, tmp_path, name, warm):
+        bundle = _epub_shapes.plain(tmp_path)
+        if warm:
+            assert _epub_index._book_gate(self._book(bundle))[0] is None
+        self._evict(bundle / "OEBPS" / name)
+        assert _epub_index._book_gate(self._book(bundle)) == (UnavailableReason.NOT_DOWNLOADED, None)
+        with pytest.raises(BookNotDownloadedError):
+            BookContent(bundle).list_spine_items()

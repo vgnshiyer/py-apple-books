@@ -528,7 +528,8 @@ def _current_key(root: pathlib.Path, root_st: os.stat_result,
     file.
 
     :raises BookNotDownloadedError: a folder or file is an iCloud
-        placeholder.
+        placeholder, or a file is gone with an iCloud stub
+        (``.<name>.icloud``) next to it.
     """
     checked: Set[str] = set()
     files = []
@@ -538,6 +539,8 @@ def _current_key(root: pathlib.Path, root_st: os.stat_result,
             st = _icloud.stat(root / name)
         except (OSError, ValueError) as e:
             if _icloud.is_materialize_error(e):
+                raise _content._not_downloaded() from None
+            if isinstance(e, FileNotFoundError) and _icloud.icloud_stub(root / name):
                 raise _content._not_downloaded() from None
             return None
         if _icloud.is_dataless(st):

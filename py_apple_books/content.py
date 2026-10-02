@@ -349,7 +349,8 @@ def _read_entry_bytes(root: PathLike, href: str, max_bytes: int) -> bytes:
     :raises UnsafeEpubEntryError: see :func:`_safe_bundle_path`; also an
         entry larger than ``max_bytes``.
     :raises BookNotDownloadedError: the entry (or a folder on the way)
-        is an iCloud placeholder.
+        is an iCloud placeholder, or it is missing with an iCloud stub
+        (``.<name>.icloud``) next to it.
     :raises OSError: it can't be read (e.g. :class:`FileNotFoundError`).
         Its text may name a path: wrap it with
         :func:`py_apple_books._messages.detail` before showing it.
@@ -400,6 +401,10 @@ def _read_entry(root: PathLike, href: str, max_bytes: int) -> Tuple[bytes, os.st
             err = _icloud.not_downloaded_error(e)
             if err is not None:
                 raise err from None
+            # A file evicted the older way: gone, with a ".<name>.icloud"
+            # stub next to it.
+            if isinstance(e, FileNotFoundError) and _icloud.icloud_stub(root / posixpath.normpath(href)):
+                raise _not_downloaded() from None
             raise
     stable = (after.st_size, after.st_mtime_ns) == (st.st_size, st.st_mtime_ns) == (total, st.st_mtime_ns)
     return b"".join(chunks), st, stable
