@@ -16,13 +16,13 @@ COUNT_BOOKS = "SELECT count(*) FROM ZBKLIBRARYASSET"
 
 class Derived:
     """A well-behaved derived object: O(1) to make, queries later under
-    its own lock, never blocks in ``discard()``."""
+    its own build lock; ``dead`` and ``discard()`` never block."""
 
-    made = 0
+    made = 0  # objects of this class and its subclasses
 
     def __init__(self):
-        type(self).made += 1
-        self._state = threading.Lock()
+        Derived.made += 1
+        self._build = threading.Lock()
         self._dead = False
         self.discarded = 0
         self.queries = 0
@@ -36,9 +36,40 @@ class Derived:
         self._dead = True
 
     def count_books(self, db):
-        with self._state:
+        with self._build:
             self.queries += 1
             return db.execute(COUNT_BOOKS)[0][0]
+
+
+class Guarded(Derived):
+    """As a cache that must be safe on free-threaded builds may be
+    written: its fields behind a lock held only around reading or
+    writing them, which ``dead`` and ``discard()`` take; never the build
+    lock, held while it queries."""
+
+    def __init__(self):
+        super().__init__()
+        self._fields = threading.Lock()
+
+    @property
+    def dead(self) -> bool:
+        with self._fields:
+            return self._dead
+
+    def discard(self) -> None:
+        with self._fields:
+            self.discarded += 1
+            self._dead = True
+
+
+class Blocking(Derived):
+    """Against the contract: ``dead`` waits for the build lock, which is
+    held while the object queries."""
+
+    @property
+    def dead(self) -> bool:
+        with self._build:
+            return self._dead
 
 
 @pytest.fixture(autouse=True)
@@ -124,16 +155,6 @@ def test_concurrent_first_use_makes_one_object(tmp_path):
     assert Derived.made == 1 and all(obj is got[0] for obj in got)
 
 
-class Guarded(Derived):
-    """``dead`` read under the object's own lock, as a cache that must be
-    safe on free-threaded builds may well do."""
-
-    @property
-    def dead(self) -> bool:
-        with self._state:
-            return self._dead
-
-
 def test_dead_is_read_outside_the_lock(tmp_path):
     db = LibraryDB(data_dir=tmp_path / "nowhere")
     seen = []
@@ -149,22 +170,22 @@ def test_dead_is_read_outside_the_lock(tmp_path):
     assert seen == [True]
 
 
-def test_dead_may_wait_for_an_object_that_is_querying(lib_db):
-    """One thread holds the object's lock and queries, which takes the
-    library's lock; another looks the object up, holding the library's
-    lock first, and reads ``dead``, which waits for the object's lock.
-    Neither waits for the other: ``dead`` is read after the library's
-    lock is released."""
+def test_a_dead_that_blocks_does_not_hold_up_the_library(lib_db):
+    """A defence, against the contract: ``dead`` waits for the build
+    lock, which one thread holds while it queries (taking the library's
+    lock). Another looks the object up, taking the library's lock first.
+    As ``dead`` is read after that lock is released, the query finishes
+    and the lookup with it."""
     lib_db.fixture.add_book("Synthetic Book")
     # Not lib_db: a deadlocked library would hang the fixture's close().
     db = LibraryDB(data_dir=lib_db.fixture.data_dir, query_timeout=20)
-    obj = db._derived_cache("index", Guarded)
+    obj = db._derived_cache("index", Blocking)
     inside = threading.Event()
     counts, found, errors = [], [], []
 
     def query():
         try:
-            with obj._state:
+            with obj._build:
                 inside.set()
                 time.sleep(0.2)  # the lookup reaches dead meanwhile
                 counts.append(db.execute(COUNT_BOOKS)[0][0])
@@ -173,7 +194,7 @@ def test_dead_may_wait_for_an_object_that_is_querying(lib_db):
 
     def lookup():
         try:
-            found.append(db._derived_cache("index", Guarded))
+            found.append(db._derived_cache("index", Blocking))
         except BaseException as e:  # pragma: no cover - reported below
             errors.append(e)
 
@@ -189,6 +210,58 @@ def test_dead_may_wait_for_an_object_that_is_querying(lib_db):
     assert not querier.is_alive() and not looker.is_alive(), "deadlock"
     assert not errors and counts == [1] and found == [obj]
     db.close()
+
+
+def test_a_lookup_inside_connection_while_the_object_queries(lib_db):
+    """``max_connections=1``: one thread holds an object's build lock and
+    queries, waiting for the one connection; another holds it, inside
+    ``connection()``, and looks the object up (and so reads ``dead``).
+    The lookup needs no connection and ``dead`` takes the field lock
+    only, so it returns, the connection goes back and the query runs."""
+    lib_db.fixture.add_book("Synthetic Book")
+    # No time limit, so a deadlock can't end in QueryTimeoutError; the
+    # threads are daemons and the joins bounded, so it fails the test.
+    db = LibraryDB(data_dir=lib_db.fixture.data_dir, max_connections=1, query_timeout=None)
+    obj = db._derived_cache("index", Guarded)
+    building, holding = threading.Event(), threading.Event()
+    counts, found, errors = [], [], []
+
+    def query():
+        try:
+            with obj._build:
+                building.set()
+                assert holding.wait(timeout=10)
+                counts.append(db.execute(COUNT_BOOKS)[0][0])
+        except BaseException as e:  # pragma: no cover - reported below
+            errors.append(e)
+
+    def lookup():
+        try:
+            assert building.wait(timeout=10)
+            with db.connection():
+                holding.set()
+                deadline = time.monotonic() + 10
+                while not db._slots._waiters and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert db._slots._waiters  # the query waits for this connection
+                found.append(db._derived_cache("index", Guarded))
+                obj.discard()  # never blocks either
+                found.append(db._derived_cache("index", Guarded))
+        except BaseException as e:  # pragma: no cover - reported below
+            errors.append(e)
+
+    querier = threading.Thread(target=query, daemon=True)
+    looker = threading.Thread(target=lookup, daemon=True)
+    querier.start()
+    looker.start()
+    looker.join(timeout=15)
+    querier.join(timeout=5)
+    try:
+        assert not querier.is_alive() and not looker.is_alive(), "deadlock"
+        assert not errors and counts == [1]
+        assert found[0] is obj and found[1] is not obj and isinstance(found[1], Guarded)
+    finally:
+        db.close()
 
 
 def test_a_dead_object_is_replaced_once(tmp_path):
@@ -249,11 +322,11 @@ def test_close_never_blocks_on_a_busy_object(lib_db):
     object; and even a ``discard()`` that blocks (against the contract)
     holds up only that ``close()`` call, not the library."""
     lib_db.fixture.add_book("Synthetic Book")
-    busy = lib_db._derived_cache("index", Derived)
+    busy = lib_db._derived_cache("index", Guarded)
     in_use, done = threading.Event(), threading.Event()
 
     def use():
-        with busy._state:  # a long query on the object
+        with busy._build:  # a long query on the object
             in_use.set()
             done.wait(timeout=30)
 
@@ -294,8 +367,9 @@ def test_close_never_blocks_on_a_busy_object(lib_db):
 
 
 def test_a_factory_whose_object_queries_later_does_not_deadlock(lib_db):
-    """One connection: lookups don't need it, and the objects' queries
-    run outside the library's lock, also from inside connection()."""
+    """One connection: lookups don't need it, the objects' queries run
+    outside the library's lock, and ``dead`` never waits for a query, so
+    lookups are safe inside connection() too."""
     lib_db.fixture.add_book("Synthetic Book")
     db = LibraryDB(data_dir=lib_db.fixture.data_dir, max_connections=1, query_timeout=20)
     errors = []
@@ -303,11 +377,11 @@ def test_a_factory_whose_object_queries_later_does_not_deadlock(lib_db):
     def worker(n):
         try:
             for i in range(20):
-                obj = db._derived_cache(f"index-{i % 3}", Derived)
+                obj = db._derived_cache(f"index-{i % 3}", Guarded)
                 assert obj.count_books(db) == 1
                 if n == 0 and i % 5 == 0:
                     with db.connection():
-                        db._derived_cache("index-0", Derived)
+                        db._derived_cache("index-0", Guarded)
         except BaseException as e:  # pragma: no cover - reported below
             errors.append(e)
 

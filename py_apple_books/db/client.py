@@ -1051,13 +1051,20 @@ class LibraryDB:
           own locks; it parses no book file under this library's lock.
         - The object has a ``dead`` property, true once it must not be
           used (discarded, or in a forked child), and a ``discard()``
-          that never blocks: it marks the object dead and leaves the
-          release of what it holds to its last user. :meth:`close` calls
-          it, outside this library's lock, on every object it held.
-          ``dead`` is read outside this library's lock, so it may take
-          the object's own lock even while another thread holds that
-          lock and queries (the lock order is the object's locks, then
-          this library's; never the reverse).
+          that marks it dead and leaves the release of what it holds to
+          its last user. :meth:`close` calls ``discard()``, outside this
+          library's lock, on every object it held.
+        - ``dead`` and ``discard()`` never block: a plain attribute, or
+          at most a lock held only around reads and writes of the
+          object's fields, never one held while the object queries or
+          builds. A lookup may run while its caller holds one of this
+          library's connections (inside :meth:`connection`, or in a
+          query), and with ``max_connections=1`` the thread holding a
+          build lock may be waiting for that very connection.
+        - Lock order: the object's build lock, then its field lock, then
+          this library's lock and connections (any query, or a block
+          inside :meth:`connection`); never the reverse. So an object
+          that queries must not be used inside :meth:`connection`.
         - In a forked child the parent's objects are set aside, kept
           referenced and never used or discarded (they may hold the
           parent's connections); the child makes its own.
@@ -1071,9 +1078,9 @@ class LibraryDB:
                 if obj is None:
                     obj = self._derived[key] = factory()
                     return obj
-            # Outside the lock: dead is the object's code, and may wait
-            # for the object's own lock, whose holder may be waiting for
-            # this library's.
+            # Outside the lock: dead is the object's code, which must not
+            # block; read here, one that does (against the contract) at
+            # least doesn't hold up every other use of this library.
             if not obj.dead:
                 return obj
             with self._lock:
