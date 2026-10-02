@@ -224,7 +224,7 @@ def test_lstat_failure_is_a_note_without_the_path(lib, tmp_path, capsys):
     fixture = fixture_dir(tmp_path / "out")
     assert sorted(p.name for p in fixture.iterdir()) == STORE_FILES
     err = capsys.readouterr().err
-    assert "note: AEBookInfo.sql not written: [Errno" in err
+    assert "note: AEBookInfo.sql not written: AEEpubInfoSource can't be looked up: [Errno" in err
     assert str(lib.data_dir.parent) not in err
 
 
@@ -899,7 +899,41 @@ def test_open_flags_do_not_follow_symlinks(folder, monkeypatch):
     assert seen and all(f & os.O_NOFOLLOW and not f & (os.O_WRONLY | os.O_RDWR | os.O_CREAT) for f in seen)
 
 
-def test_lstat_wrapper():
-    # The patch point returns None for a missing path, never raises.
+def test_lstat_wrapper(tmp_path):
+    # The patch point returns None for a missing path; any other failure
+    # is a DumpError without the path, never a bare OSError.
     assert dump_schema._lstat("/nonexistent/AEBookInfo-x.sqlite") is None
     assert stat.S_ISDIR(dump_schema._lstat("/").st_mode)
+    (tmp_path / "file").write_text("")
+    with pytest.raises(dump_schema.DumpError, match=r"^AEBookInfo-x.sqlite can't be looked up: \[Errno") as info:
+        dump_schema._lstat(tmp_path / "file" / "AEBookInfo-x.sqlite")  # ENOTDIR
+    assert str(tmp_path) not in str(info.value)
+
+
+def test_lookup_failures_are_dump_errors(tmp_path, monkeypatch):
+    """Each helper the library's reader may reuse keeps to its documented
+    error, DumpError, when a lookup fails with something other than
+    'no such file'."""
+    lib_docs = tmp_path / "Data" / "Documents"
+    folder = lib_docs.parent / dump_schema.BOOK_INFO_DIR
+    folder.mkdir(parents=True)
+    path = folder / CACHE_NAME
+    cases.create(path).close()
+    real = os.lstat
+
+    def denied_for(suffix):
+        def fake(p, *a, **k):
+            if os.fspath(p).endswith(suffix):
+                raise PermissionError(13, "Permission denied", os.fspath(p))
+            return real(p, *a, **k)
+        return fake
+
+    for suffix, call in (("AEEpubInfoSource", lambda: dump_schema.find_book_info(lib_docs)),
+                         (".sqlite", lambda: dump_schema.book_info_open_mode(path)),
+                         ("-wal", lambda: dump_schema.book_info_open_mode(path)),
+                         ("-journal", lambda: dump_schema.book_info_open_mode(path)),
+                         ("-shm", lambda: dump_schema.dump_book_info(path))):
+        monkeypatch.setattr(dump_schema.os, "lstat", denied_for(suffix))
+        with pytest.raises(dump_schema.DumpError, match=r"can't be looked up: \[Errno 13\]") as info:
+            call()
+        assert str(tmp_path) not in str(info.value)

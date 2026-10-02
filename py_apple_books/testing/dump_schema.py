@@ -364,11 +364,16 @@ def table_columns(sql: str) -> Dict[str, Dict[str, str]]:
 # -- book info caches -------------------------------------------------------
 
 def _lstat(path) -> Optional[os.stat_result]:
-    """``os.lstat``, or None when nothing is there. Patched by the tests."""
+    """``os.lstat``, or None when nothing is there. Any other failure (a
+    path component that is not a folder, no permission) raises
+    :class:`DumpError` naming only the last component and the errno.
+    Patched by the tests."""
     try:
         return os.lstat(path)
     except FileNotFoundError:
         return None
+    except OSError as e:
+        raise DumpError(f"{os.path.basename(path)} can't be looked up: {_os_error(e)}") from None
 
 
 def _is_dataless(st) -> bool:
@@ -413,11 +418,12 @@ def find_book_info(data_dir) -> Optional[pathlib.Path]:
     """The newest AEBookInfo cache file for ``data_dir`` (natural order of
     the names, which carry Books' version), or None if there is none.
 
-    Raises :class:`DumpError` when the folder isn't a local folder (a
-    symlink, a file, evicted to iCloud) or is or resolves into iCloud
-    Drive or a cloud-storage folder (names compared case-insensitively;
-    the given path is checked before the first lookup, the resolved one
-    before the folder is listed).
+    Raises :class:`DumpError` (never another error) when the folder isn't
+    a local folder (a symlink, a file, evicted to iCloud), is or resolves
+    into iCloud Drive or a cloud-storage folder (names compared
+    case-insensitively; the given path is checked before the first
+    lookup, the resolved one before the folder is listed), or can't be
+    looked up or listed.
     """
     folder = book_info_dir(data_dir)
     if folder is None:
@@ -636,7 +642,7 @@ def _book_info_or_none(data_dir: pathlib.Path) -> Optional[Tuple[str, dict]]:
     except DumpError as e:
         print(f"note: {BOOK_INFO}.sql not written: {e}", file=sys.stderr)
         return None
-    except OSError as e:  # an lstat on the way failed: not a missing file
+    except OSError as e:  # not expected: the helpers above raise DumpError
         print(f"note: {BOOK_INFO}.sql not written: {_os_error(e)}", file=sys.stderr)
         return None
     return sql, info
