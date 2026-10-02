@@ -1,0 +1,4 @@
+# Modules added by stream 2.5 (engagement) whose import must do no I/O
+# (R19). Its mixin, py_apple_books._api.engagement, is listed by 0.2.
+py_apple_books.engagement
+py_apple_books._prefs

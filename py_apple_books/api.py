@@ -5,9 +5,10 @@ import re
 import sqlite3
 import stat
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple, Union
 from py_apple_books import _icloud, collection_writer
+from py_apple_books import engagement as _engagement
 from py_apple_books._api._common import (  # noqa: F401 (re-exported: 1.10 private names)
     _annotation_scope,
     _book_arg,
@@ -123,6 +124,13 @@ class LibraryStats:
     None). ``annotations_per_book`` holds ``(book id, title, count)``
     for every book with annotations, most annotated first (ties by id);
     the title is None for a book without one.
+
+    ``orphan_assets`` (1.11) breaks ``orphan_annotations`` down by the
+    asset id the annotations name: ``(asset id, count)`` for every asset
+    id no book row has; its counts add up to ``orphan_annotations``. Most
+    annotations first; among equal counts None comes last, and other ids
+    sort by type name, then value. The ids are as stored, so None, ``''``
+    and a bytes value are distinct entries.
     """
 
     total_books: int
@@ -132,6 +140,7 @@ class LibraryStats:
     total_annotations: int
     orphan_annotations: int
     annotations_per_book: Tuple[Tuple[int, Optional[str], int], ...] = ()
+    orphan_assets: Tuple[Tuple[Optional[str], int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -499,14 +508,22 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
         )
         return list(matches)
 
-    def get_annotations_by_date_range(self, after: datetime = None, before: datetime = None,
+    def get_annotations_by_date_range(self, after: Union[datetime, date] = None,
+                                       before: Union[datetime, date] = None,
                                        limit: int = None, order_by: str = None, *,
                                        offset: int = None, include_deleted: bool = False) -> ModelIterable:
         """Get user annotations within a date range.
 
+        Both bounds are inclusive. A datetime is an instant (a naive one
+        is local time). A date (1.11) covers that whole local day:
+        ``after=date(2026, 1, 1)`` starts at local midnight, and
+        ``before=date(2026, 12, 31)`` includes all of 31 December.
+
         Args:
-            after: Only include annotations created after this datetime.
-            before: Only include annotations created before this datetime.
+            after: Only include annotations created at or after this datetime
+                (or from the start of this date).
+            before: Only include annotations created at or before this datetime
+                (or up to the end of this date).
             limit: Maximum number of results.
             order_by: Field to sort by (prefix with - for descending).
             offset: Number of results to skip.
@@ -514,9 +531,15 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
         """
         kwargs = _annotation_scope(include_deleted)
         if after:
-            kwargs["creation_date__gte"] = after.timestamp() - APPLE_EPOCH_OFFSET
+            if _engagement._is_day(after):
+                kwargs["creation_date__gte"] = _engagement._day_start(after)
+            else:
+                kwargs["creation_date__gte"] = after.timestamp() - APPLE_EPOCH_OFFSET
         if before:
-            kwargs["creation_date__lte"] = before.timestamp() - APPLE_EPOCH_OFFSET
+            if _engagement._is_day(before):
+                kwargs["creation_date__lt"] = _engagement._day_end(before)
+            else:
+                kwargs["creation_date__lte"] = before.timestamp() - APPLE_EPOCH_OFFSET
         return Annotation.manager.filter(**kwargs, limit=limit, order_by=order_by, offset=offset)
 
     # -- reading progress actions --
@@ -535,11 +558,27 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
                                    limit=limit, order_by=order_by, offset=offset)
 
     def get_finished_books(self, limit: int = None, order_by: str = None, *,
-                           offset: int = None) -> ModelIterable:
+                           offset: int = None, finished_after: Union[datetime, date] = None,
+                           finished_before: Union[datetime, date] = None) -> ModelIterable:
         """Get books marked as finished, whatever their progress (a
-        finished book is in neither of the other two lists)."""
+        finished book is in neither of the other two lists).
+
+        ``finished_after`` and ``finished_before`` (1.11) keep the books
+        whose finish date (:attr:`Book.finished_date`) is in that window,
+        bounds included: a datetime is an instant (naive means local
+        time), a date covers that whole local day. With either set,
+        books without a finish date are left out. Books records the date
+        a book was marked as finished, so books marked in bulk share one.
+
+        :raises InvalidArgumentError: a bound that isn't a date or a
+            datetime.
+        :raises UnsupportedSchemaError: (when the result is read) a bound
+            is set and the store has no finish date column.
+        """
+        bounds = _engagement._window_filters("finished_date", finished_after, finished_before,
+                                             names=("finished_after", "finished_before"))
         return Book.manager.filter(**_owned_books_filter(), **_STATUS_FILTERS[ReadingStatus.FINISHED],
-                                   limit=limit, order_by=order_by, offset=offset)
+                                   **bounds, limit=limit, order_by=order_by, offset=offset)
 
     def get_unstarted_books(self, limit: int = None, order_by: str = None, *,
                             offset: int = None) -> ModelIterable:
@@ -620,14 +659,17 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
         per_book = sorted(((books[asset].id, books[asset].title, n)
                            for asset, n in per_asset.items() if asset in books),
                           key=lambda entry: (-entry[2], entry[0]))
+        orphans = sorted(((asset, n) for asset, n in per_asset.items() if asset not in books),
+                         key=_orphan_order)
         return LibraryStats(
             total_books=sum(counts.values()),
             finished_books=counts[ReadingStatus.FINISHED],
             in_progress_books=counts[ReadingStatus.IN_PROGRESS],
             unstarted_books=counts[ReadingStatus.UNSTARTED],
             total_annotations=sum(per_asset.values()),
-            orphan_annotations=sum(n for asset, n in per_asset.items() if asset not in books),
+            orphan_annotations=sum(n for _, n in orphans),
             annotations_per_book=tuple(per_book),
+            orphan_assets=tuple(orphans),
         )
 
     # -- content actions --
@@ -863,6 +905,15 @@ class PyAppleBooks(_PositionsAPI, _ReadingAPI, _SearchAPI, _MetadataAPI, _Engage
             chars_before,
             chars_after,
         )
+
+
+def _orphan_order(entry) -> tuple:
+    """Sort key of a ``LibraryStats.orphan_assets`` entry: most
+    annotations first, then None last, then by type name and value, so
+    raw keys of mixed types (None, str, bytes) never compare across
+    types."""
+    key, count = entry
+    return (-count, key is None, type(key).__name__, key if key is not None else "")
 
 
 def _quoted_title(book) -> str:
