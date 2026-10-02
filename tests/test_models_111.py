@@ -2,8 +2,9 @@
 Annotation fields and the properties built on them.
 
 Unit tables feed rows through ``Model.from_db`` (no database); the rest
-reads synthetic libraries. Column values are written with raw SQL, so
-nothing here depends on the 1.11 fixture helpers.
+reads synthetic libraries, with the new columns set through the
+fixture's ``raw=`` overrides, so nothing here depends on the 1.11
+fixture helpers.
 """
 
 import copy
@@ -180,8 +181,8 @@ class TestTolerantModelDates:
         assert stats.total_books == 2 and stats.total_annotations == 2
         assert math.isclose(api.get_book_by_id(good["id"]).reading_progress, 50.0)
 
-    def test_drifted_store_with_a_corrupt_date(self, make_library):
-        """A separate library: the facade reads it through its own LibraryDB."""
+    def test_another_library_with_a_corrupt_date(self, make_library):
+        """A library of its own, read through its own LibraryDB."""
         lib = make_library()
         lib.add_book("Book", raw={"ZDATEFINISHED": "garbage", "ZISFINISHED": 1})
         db = LibraryDB(data_dir=lib.data_dir)
