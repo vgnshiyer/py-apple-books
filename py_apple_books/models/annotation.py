@@ -27,6 +27,21 @@ class AnnotationType(IntEnum):
     READING_POSITION = 3  # Books' automatic "current reading position" row
 
 
+# Scope of the user-facing annotation queries (the facade's lists and
+# searches, Book.annotations, and the 1.11 search index), defined once
+# here so every reader of it uses the same rows. Live: not soft-deleted
+# (ZANNOTATIONDELETED, NULL-safe), not a type-0 deletion tombstone and
+# not the reading-position row. ``include_deleted=True`` gives the
+# pre-1.10 set (everything but the reading-position row). Shared
+# objects: copy before adding keys (``api._annotation_scope`` does).
+_LIVE_ANNOTATIONS = {
+    "type__gt": int(AnnotationType.TOMBSTONE),
+    "type__ne": int(AnnotationType.READING_POSITION),
+    "is_deleted__isnot": 1,
+}
+_ALL_ANNOTATIONS = {"type__ne": int(AnnotationType.READING_POSITION)}
+
+
 @dataclass
 class Annotation(Model):
     """
