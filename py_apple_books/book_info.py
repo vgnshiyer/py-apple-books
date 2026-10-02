@@ -56,9 +56,13 @@ class CachedBookInfo:
     """One book's details as Apple Books cached them when it last parsed
     the book.
 
-    Each text field is None when the cache has no value (or an empty
-    one). ``year`` is the cached publication year as text (``'2001'``).
-    ``source`` is the bare name of the cache file the values come from
+    Each text field is None when the cache has no usable value: none,
+    an empty or blank one, a blob, or one over 4,096 bytes (a damaged
+    cache); other text is kept as cached. ``title`` and ``author`` are
+    never both None. ``year`` is the cached publication year as text:
+    an integral number reads as its digits (``2001`` and ``2001.0``
+    give ``'2001'``), any other number as Python writes it
+    (``'2001.5'``). ``source`` is the bare name of the cache file the values come from
     (``'AEBookInfo-v20250715-26.0.sqlite'``, never a folder), which names
     the Books version that wrote it: the values are cache-derived.
     """
