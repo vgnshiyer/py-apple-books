@@ -322,7 +322,9 @@ def _wait(lock: threading.Lock, deadline: Optional[float], limit: Optional[float
     """
     if deadline is None:
         lock.acquire()
-    elif not lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+    # Clamped as the pool's waits are: a huge (valid) timeout would
+    # otherwise overflow acquire().
+    elif not lock.acquire(timeout=min(max(0.0, deadline - time.monotonic()), threading.TIMEOUT_MAX)):
         raise _timeout("Timed out waiting for the annotation search index", limit)
 
 

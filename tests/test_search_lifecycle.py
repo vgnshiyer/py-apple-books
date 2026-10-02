@@ -4,6 +4,7 @@ collection, fork, error privacy, and which files it touches.
 
 Synthetic libraries only (``FixtureLibrary.populate``)."""
 
+import contextlib
 import gc
 import hashlib
 import os
@@ -204,6 +205,23 @@ def test_a_wait_for_another_build_ends_at_the_query_timeout(lib, paused_build):
         pause.release()
         builder.join(30)
         assert built == [("ok", 200)]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("how", ["query_timeout", "query_deadline"])
+def test_a_timeout_beyond_the_lock_maximum(lib, how):
+    """A valid timeout longer than threading.TIMEOUT_MAX: the lock waits
+    are clamped as the pool's are (no OverflowError)."""
+    huge = 1e12
+    assert huge > threading.TIMEOUT_MAX
+    db = LibraryDB(data_dir=lib.data_dir, query_timeout=huge if how == "query_timeout" else None)
+    try:
+        scope = query_deadline(huge) if how == "query_deadline" else contextlib.nullcontext()
+        with use_library(db), scope:
+            api = PyAppleBooks()
+            assert len(api.search_annotations(QUERY, limit=None)) == 200  # cold: the build lock
+            assert len(api.search_annotations(QUERY, limit=None)) == 200  # warm: the index lock
     finally:
         db.close()
 
