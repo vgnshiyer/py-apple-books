@@ -60,7 +60,10 @@ class _MetadataAPI:
         ``.epub`` path (``not_epub``), Books not recording the book as
         stored only in iCloud (``ZSTATE`` 3), all three without touching
         the disk; the bundle being a local folder with no iCloud stub
-        next to it; :func:`~py_apple_books.content.is_downloaded`; then
+        next to it; every folder and file in it being on this Mac (each
+        folder checked before it is listed), as
+        :meth:`get_book_content` checks; then
+        :func:`~py_apple_books.content.is_downloaded`; then, again,
         every folder and file on the way to the package document. DRM
         doesn't matter: package documents are never encrypted. Results
         read from the files are cached while they are unchanged.
@@ -216,6 +219,13 @@ def _book_file_metadata(book) -> Tuple[MetadataFileState, Optional[_opf.OpfField
     refused = _bundle_state(path)
     if refused is not None:
         return refused, None
+    # The bundle-level checks get_book_content runs before du (R2, owner
+    # decision Q1 (a)): every folder and file in the bundle on this Mac,
+    # each folder checked before it is listed, so du (which lists every
+    # folder) never reaches an iCloud placeholder folder, and a partly
+    # evicted book is not_downloaded here as it is for the content APIs.
+    if _icloud.walk_bundle_local(path) in (_icloud.FileState.DATALESS, _icloud.FileState.ICLOUD_STUB):
+        return MetadataFileState.NOT_DOWNLOADED, None
     # Owner decision Q3 (b): a single-book read keeps 1.10's
     # is_downloaded check after the bundle-level ones.
     from py_apple_books import content

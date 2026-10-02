@@ -142,7 +142,10 @@ class TestRead:
         opened = [os.fsdecode(e.args[0]) for e in rec.of("open") if isinstance(e.args[0], (str, bytes))]
         names = {os.path.basename(name.rstrip("/")) for name in opened}
         assert opened and names <= {path.name, "META-INF", "container.xml", "OEBPS", "content.opf"}, names
-        assert not rec.under(path, "os.scandir", "os.listdir")
+        # Folders are listed (the bundle walk, as get_book_content's), each
+        # after its own lstat; no file inside is opened but the two.
+        assert {os.path.basename(e.path) for e in rec.under(path, "os.scandir", "os.listdir")} <= {
+            path.name, "META-INF", "OEBPS"}
         # is_downloaded's du is the one process (owner decision Q3 (b)).
         assert all("du" in (e.path or "du") for e in rec.of(*_fs_audit.PROCESS_EVENTS))
 
@@ -226,6 +229,33 @@ class TestStates:
         monkeypatch.setattr(_icloud, "lstat", lstat)
         assert lib.api.get_book_metadata(book).file_state is S.NOT_DOWNLOADED
         assert "container.xml" not in seen
+
+    @pytest.mark.parametrize("evicted", ["OEBPS", "OEBPS/c1.xhtml"])
+    def test_partly_evicted_bundle_is_refused_before_du(self, lib, tmp_path, monkeypatch, evicted):
+        """As get_book_content: anything in the bundle being an iCloud
+        placeholder is not_downloaded, decided before du lists the
+        bundle, and a placeholder folder is never listed."""
+        path = epub(tmp_path)
+        book = add(lib, path)
+        target = str(path / evicted)
+        real = os.lstat
+        monkeypatch.setattr(_icloud, "lstat", lambda p, *, dir_fd=None: (
+            _fake(real(p, dir_fd=dir_fd), st_flags=_icloud.SF_DATALESS)
+            if dir_fd is None and os.fspath(p) == target else real(p, dir_fd=dir_fd)))
+        with _fs_audit.record() as rec:
+            assert lib.api.get_book_metadata(book).file_state is S.NOT_DOWNLOADED
+        assert not rec.of(*_fs_audit.PROCESS_EVENTS)
+        assert not rec.under(path / "OEBPS", "open")
+        if evicted == "OEBPS":
+            assert not rec.under(path / "OEBPS", "os.scandir", "os.listdir")
+            assert rec.under(path, "os.scandir")  # the walk did run
+
+    def test_stub_inside_the_bundle(self, lib, tmp_path):
+        path = epub(tmp_path)
+        (path / "OEBPS" / ".c1.xhtml.icloud").write_bytes(b"stub")
+        with _fs_audit.record() as rec:
+            assert lib.api.get_book_metadata(add(lib, path)).file_state is S.NOT_DOWNLOADED
+        assert not rec.of(*_fs_audit.PROCESS_EVENTS)
 
     def test_dataless_package_document(self, lib, tmp_path, monkeypatch):
         book = add(lib, epub(tmp_path))
