@@ -309,6 +309,10 @@ class WriteSession:
     read-only); a commit that fails raises :class:`LibraryBusyError`
     (blocked past :data:`BUSY_TIMEOUT`) or :class:`WriteError`. In each
     case nothing was changed.
+
+    ``conn`` reads text as sqlite3 does by default, except that a value
+    that isn't valid UTF-8 raises :class:`WriteError` (quoting nothing),
+    which rolls the transaction back.
     """
 
     def __init__(
