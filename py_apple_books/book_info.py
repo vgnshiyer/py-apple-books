@@ -85,6 +85,9 @@ _MAX_FILES = 32
 _MEMO_IDS = 1024
 # Ids bound per statement.
 _CHUNK = 500
+# A cached value longer than this (in bytes) reads as None: a damaged or
+# crafted cell is neither returned nor remembered whole.
+_MAX_VALUE_BYTES = 4096
 # Seconds: per call, per file, and waiting for a lock Books holds.
 _CALL_BUDGET = 2.0
 _FILE_BUDGET = 1.0
@@ -364,10 +367,17 @@ def _execute(con: sqlite3.Connection, sql: str, params: Sequence = ()) -> list:
     return con.execute(sql, params).fetchall()
 
 
+def _capped(column: str) -> str:
+    # length() of a blob counts every byte (of text, only those before a
+    # NUL), so the cast makes the cap hold for any value.
+    return f"CASE WHEN length(CAST({column} AS BLOB)) <= {_MAX_VALUE_BYTES} THEN {column} END"
+
+
 def _select(con: sqlite3.Connection, have: set, ids: Sequence[str]) -> Dict[str, _Row]:
     """The best row per id: the newest row with a title, else the newest
-    with an author (newest by ``Z_PK``)."""
-    columns = ", ".join(c if c in have else "NULL" for c in _COLUMNS)
+    with an author (newest by ``Z_PK``). A value over
+    :data:`_MAX_VALUE_BYTES` reads as NULL."""
+    columns = ", ".join(_capped(c) if c in have else "NULL" for c in _COLUMNS)
     order = " ORDER BY Z_PK DESC" if "Z_PK" in have else ""
     wanted = set(ids)
     found: Dict[str, _Row] = {}
@@ -402,6 +412,9 @@ def _read_cache(path: str, ids: Sequence[str], deadline: float) -> Dict[str, Opt
     try:
         con.text_factory = _decode_lenient
         con.set_progress_handler(lambda: time.monotonic() > deadline, _PROGRESS_OPCODES)
+        # The file is not ours: functions its schema uses (in a view or a
+        # trigger) must be harmless ones. A no-op before SQLite 3.31.
+        con.execute("PRAGMA trusted_schema=OFF")
         con.execute("PRAGMA query_only=1")
         con.execute("BEGIN")  # one consistent snapshot for every statement
         have = {str(r[1]).upper() for r in _execute(con, f"PRAGMA table_info({_TABLE})")}

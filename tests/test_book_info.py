@@ -221,6 +221,40 @@ def test_values_are_text_or_none(home, reader):
     assert got["S"].title == " Spaced "  # kept as cached
 
 
+def test_oversized_values_read_as_none(home, reader):
+    big = 4097
+    home.add_book_info_cache([
+        {"asset_id": "L", "title": "x" * big, "author": "Kept author", "publisher": "\x00" + "p" * big},
+        {"asset_id": "M", "title": "y" * 4096},  # at the cap: kept
+        {"asset_id": "N", "title": "\x00" + "z" * big},  # a NUL doesn't hide the length
+        {"asset_id": "O", "title": "é" * 2049, "author": "a"},  # bytes, not characters
+    ])
+    got = reader.get_cached_book_info(["L", "M", "N", "O"])
+    assert got["L"] == CachedBookInfo("L", None, "Kept author", source=cache_name(V7))
+    assert got["M"].title == "y" * 4096
+    assert "N" not in got
+    assert got["O"].title is None
+    memo = next(iter(index_of(reader)._memos.values()))
+    assert all(len(value or "") <= 4096 for row in memo.rows.values() if row for value in row)
+
+
+@pytest.mark.skipif(sqlite3.sqlite_version_info < (3, 31), reason="trusted_schema needs SQLite 3.31")
+def test_the_cache_schema_is_not_trusted(home, reader):
+    # A cache whose ZAEBOOKINFO is a view over a virtual table SQLite
+    # doesn't deem harmless (here one that would put the cache's own path
+    # in the title) is skipped, not run.
+    folder = home.book_info_dir
+    folder.mkdir(parents=True)
+    con = sqlite3.connect(folder / cache_name("v1"))
+    try:
+        con.execute("CREATE VIEW ZAEBOOKINFO AS SELECT 'A' AS ZDATABASEKEY, file AS ZBOOKTITLE, "
+                    "NULL AS ZBOOKAUTHOR FROM pragma_database_list")
+    finally:
+        con.close()
+    home.add_book_info_cache([{"asset_id": "A", "title": "older"}], version="v0")
+    assert reader.get_cached_book_info("A")["A"].title == "older"
+
+
 def test_year_written_as_an_integer_reads_as_text(home, reader):
     home.add_book_info_cache([{"asset_id": "Y", "title": "Y", "year": 2001}])
     assert reader.get_cached_book_info("Y")["Y"].year == "2001"
