@@ -112,6 +112,8 @@ _SCRIPT = textwrap.dedent(r'''
         "get_highlight_activity": lambda api: [api.get_highlight_activity().highlights,
                                                len(api.get_highlight_activity(book_id=book["id"]).per_book)],
         "get_highlight_streaks": lambda api: api.get_highlight_streaks(on=day).longest,
+        "get_reading_goals": lambda api: [api.get_reading_goals().books_per_year,
+                                          len(api.get_reading_goals().finished_assets)],
     }
     extra = {name: getattr(PyAppleBooks, name) for name in sys.argv[3:]}
     for name in extra:
@@ -176,8 +178,9 @@ def test_engagement_methods_touch_no_book_file(tmp_path):
     assert results["get_finished_books"] == 1 and results["get_library_stats"] == 1
     assert results["get_vocabulary"] == [["Ephemeral", 1, None], ["laconic", 1, None]]
     assert results["get_highlight_activity"] == [7, 1] and results["get_highlight_streaks"] == 1
+    assert results["get_reading_goals"] == [3, 1]
     # No stat-family lookup in the bundle or iCloud Drive (the methods
-    # do stat other paths, such as the store folders).
+    # do stat other paths: the preferences file and the store folders).
     assert out["stat_calls"] > 0
     assert out["stat_inside"] == []
     # The control: reading the book is refused, and it stats the bundle.

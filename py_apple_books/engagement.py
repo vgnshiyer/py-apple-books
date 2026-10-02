@@ -42,7 +42,8 @@ from py_apple_books.utils import APPLE_EPOCH_OFFSET
 if TYPE_CHECKING:
     from py_apple_books.models.annotation import Annotation
 
-__all__ = ["SAMPLE_ALGORITHM", "VocabularyEntry", "ActivityPeriod", "HighlightActivity", "HighlightStreaks"]
+__all__ = ["SAMPLE_ALGORITHM", "VocabularyEntry", "ActivityPeriod", "HighlightActivity", "HighlightStreaks",
+           "ReadingGoals"]
 
 #: The ranking algorithm of :meth:`PyAppleBooks.sample_highlights`.
 #: Each candidate gets a key from a keyed BLAKE2b hash of the day, the
@@ -563,3 +564,54 @@ def _streaks(days: Iterable[date], on: date) -> HighlightStreaks:
         last_active=ordered[-1] if ordered else None,
         active_days=len(ordered),
     )
+
+
+# -- reading goals ------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReadingGoals:
+    """Books' reading goals, from its preferences file, as Books last
+    saved them (:meth:`PyAppleBooks.get_reading_goals`; ``modified`` is
+    when). Each field is None (or empty) when the file doesn't hold it
+    in the expected form. Dates are naive local time, like the model
+    dates.
+
+    Not available from Books' files: minutes read per day, pages read,
+    Books' streak history or longest streak, and whether today's goal was
+    met.
+    """
+
+    #: The yearly goal: books to finish.
+    books_per_year: Optional[int] = None
+    #: When that goal was set.
+    books_goal_set: Optional[datetime] = None
+    #: The daily reading goal, in seconds.
+    daily_goal_seconds: Optional[float] = None
+    #: When that goal was set.
+    daily_goal_set: Optional[datetime] = None
+    #: Books' own current streak of days meeting the daily goal, as it
+    #: last saved it (not computed here).
+    apple_current_streak: Optional[int] = None
+    #: ``(asset id, finish date)`` for the books Books counts as finished
+    #: towards the yearly goal: oldest first, entries without a readable
+    #: date last. Books' own list, which can differ from
+    #: :meth:`PyAppleBooks.get_finished_books`.
+    finished_assets: Tuple[Tuple[str, Optional[datetime]], ...] = ()
+    #: When the preferences file was last written.
+    modified: Optional[datetime] = None
+
+    @property
+    def daily_goal_minutes(self) -> Optional[float]:
+        """The daily reading goal in minutes."""
+        return None if self.daily_goal_seconds is None else self.daily_goal_seconds / 60
+
+    def books_finished_in(self, year: int) -> int:
+        """How many of :attr:`finished_assets` have a finish date in
+        ``year`` (local time).
+
+        :raises InvalidArgumentError: ``year`` isn't an int.
+        """
+        if isinstance(year, bool) or not isinstance(year, int):
+            raise InvalidArgumentError(f"year must be an int, not {type(year).__name__}.")
+        return sum(1 for _, when in self.finished_assets if when is not None and when.year == year)

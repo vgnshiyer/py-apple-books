@@ -1,9 +1,11 @@
 """The :class:`~py_apple_books.PyAppleBooks` mixin for engagement: underlines, highlight
 sampling, highlights made on this day in earlier years, highlighted
-words, and highlight activity and streaks (1.11).
+words, highlight activity and streaks, and reading goals (1.11).
 
 Every method here reads the library and annotation databases only (no
-book file, no iCloud folder, no subprocess). Dates follow the rules in
+book file, no iCloud folder, no subprocess), except
+``get_reading_goals``, which reads Books' preferences file instead
+(``py_apple_books._prefs``). Dates follow the rules in
 :mod:`py_apple_books.engagement`; ``limit`` and ``offset`` the 1.11
 rules (``_common.strict_limit``/``strict_offset``).
 
@@ -11,8 +13,10 @@ See ``py_apple_books._api`` for the rules mixin code follows.
 """
 
 import operator
+import os
 from typing import FrozenSet, Iterable, List, Optional
 
+from py_apple_books import _prefs
 from py_apple_books import engagement as _eng
 from py_apple_books._api._common import (
     _annotation_scope,
@@ -412,6 +416,34 @@ class _EngagementAPI:
             if created is not None:
                 days.add(created.date())
         return _eng._streaks(days, day)
+
+    def get_reading_goals(self, *, prefs_path=None) -> Optional[_eng.ReadingGoals]:
+        """Books' reading goals, as Books last saved them to disk (1.11):
+        the yearly books goal, the daily reading goal, Books' current
+        streak and its list of books finished towards the goal, as a
+        :class:`~py_apple_books.engagement.ReadingGoals`.
+
+        Read from Books' preferences file, next to the library's
+        ``Documents`` folder (``prefs_path`` names another file). Never
+        writes, starts no process, opens no database and keeps nothing.
+        Books may hold newer values in memory while it runs
+        (``ReadingGoals.modified`` says when the file was written).
+
+        Returns None when there is no such file or it can't be read
+        safely: the library isn't in an Apple Books container, the file
+        is missing, in iCloud Drive or not downloaded, not a regular
+        file, over 8 MiB, or not a readable property list. A single key
+        missing or in an unexpected form leaves just that field None.
+
+        :raises InvalidArgumentError: ``prefs_path`` isn't a path.
+        """
+        if prefs_path is None:
+            path = _prefs.library_prefs_path(current_library())
+        elif isinstance(prefs_path, (str, bytes, os.PathLike)):
+            path = prefs_path
+        else:
+            raise InvalidArgumentError(f"prefs_path must be a path or None, not {type(prefs_path).__name__}.")
+        return _prefs._read_goals(path)[0]
 
 
 def _full_rows(ids: List[int], filters: dict, where) -> list:

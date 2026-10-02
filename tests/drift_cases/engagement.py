@@ -13,12 +13,22 @@ def annotations(result) -> list:
     return [(a.id, a.selected_text, a.note, getattr(a.book, "id", None)) for a in result]
 
 
+def goals(result) -> tuple:
+    """Reading goals without ``modified`` (each library has its own file)."""
+    if result is None:
+        return None
+    return (result.books_per_year, result.daily_goal_seconds, result.apple_current_streak,
+            result.finished_assets, result.books_goal_set)
+
+
 def seed(lib, rows: dict) -> dict:
     """An underline, a noted word and a noted passage on the finished
-    book, and its finish date."""
+    book, its finish date, and a preferences file with reading goals."""
     asset = lib.execute("library", "SELECT ZASSETID FROM ZBKLIBRARYASSET WHERE Z_PK = ?", (rows["done"],))[0][0]
     lib.execute("library", "UPDATE ZBKLIBRARYASSET SET ZDATEFINISHED = ? WHERE Z_PK = ?",
                 (dt.datetime(2026, 3, 1, 12, tzinfo=UTC).timestamp() - 978307200, rows["done"]))
+    # Books' preferences file, for get_reading_goals (not a database: no drift).
+    lib.write_prefs(books_goal=4, finished={asset: dt.datetime(2026, 3, 1, 12)})
     return {
         "eng_underline": lib.add_annotation(asset, "Laconic,", kind="underline",
                                             created=dt.datetime(2025, 10, 1, 12, tzinfo=UTC)),
@@ -51,4 +61,5 @@ CASES = {
     "get_highlight_activity(book)": lambda api, rows: api.get_highlight_activity(
         book_id=rows["done"], after=dt.date(2024, 1, 1), before=dt.date(2026, 9, 30), granularity="week"),
     "get_highlight_streaks": lambda api, rows: api.get_highlight_streaks(on=DAY),
+    "get_reading_goals": lambda api, rows: goals(api.get_reading_goals()),
 }
