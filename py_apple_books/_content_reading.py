@@ -38,11 +38,26 @@ from py_apple_books.positions import (
     TextPosition,
 )
 from py_apple_books.positions import _spine_index as _location_spine_index
-from py_apple_books.text import _fold_query, _iter_folded
+from py_apple_books._messages import ELLIPSIS
+from py_apple_books.text import _coerce_text, _fold_query, _iter_folded
 
 #: Longest query :meth:`_ReadingMixin.search` accepts, in characters after
 #: folding.
 MAX_FOLDED_QUERY = 1000
+
+#: Longest query accepted before folding, so that folding never costs more
+#: than a bounded amount: generous, as runs of whitespace and of
+#: characters that fold to nothing (soft hyphens, zero-width spaces,
+#: combining marks) make a long query fold short.
+_MAX_RAW_QUERY = 64 * MAX_FOLDED_QUERY
+
+_QUERY_TOO_LONG = (f"The search query is too long: at most {MAX_FOLDED_QUERY} characters after "
+                   f"folding and {_MAX_RAW_QUERY} before.")
+
+#: Most characters a snippet keeps from each end of a long match (one
+#: lengthened by characters that fold to nothing); the middle becomes an
+#: ellipsis.
+_MATCH_KEEP = 2000
 
 #: The precisions ``resolve_boundary`` accepts today; ``'exact'`` comes
 #: with exact in-chapter positions.
@@ -85,16 +100,21 @@ def _page_size(limit: Any) -> int:
 
 def _folded_query(query: Any) -> str:
     """The folded query :meth:`_ReadingMixin.search` matches: converted
-    like :func:`~py_apple_books.text.fold_for_match`'s input (``str()``
-    for other objects), folded, without leading or trailing whitespace.
+    like :func:`~py_apple_books.text.fold_for_match`'s input (None finds
+    nothing, bytes are decoded as UTF-8, ``str()`` for other objects),
+    folded, without leading or trailing whitespace.
 
-    :raises InvalidArgumentError: longer than :data:`MAX_FOLDED_QUERY`
-        after folding (the message never repeats the query).
+    :raises InvalidArgumentError: longer than :data:`_MAX_RAW_QUERY`
+        characters once converted (checked before folding, which costs
+        time and memory in proportion), or than :data:`MAX_FOLDED_QUERY`
+        after folding. The message never repeats the query.
     """
-    folded = _fold_query(query)
+    text = _coerce_text(query)
+    if text is not None and len(text) > _MAX_RAW_QUERY:
+        raise InvalidArgumentError(_QUERY_TOO_LONG)
+    folded = _fold_query(text)
     if len(folded) > MAX_FOLDED_QUERY:
-        raise InvalidArgumentError(
-            f"The search query is too long: at most {MAX_FOLDED_QUERY} characters after folding.")
+        raise InvalidArgumentError(_QUERY_TOO_LONG)
     return folded
 
 
@@ -102,9 +122,19 @@ def _snippet(text: str, start: int, end: int, before: int, after: int) -> str:
     """The match ``text[start:end]`` with up to ``before``/``after``
     characters around it, on one line (every whitespace run one space,
     none at the ends). ``text`` is already cut at the boundary, so the
-    snippet never reaches past it."""
-    window = text[max(0, start - before):min(len(text), end + after)]
-    return " ".join(window.split())
+    snippet never reaches past it.
+
+    A match longer than ``2 * _MATCH_KEEP`` characters (only characters
+    that fold to nothing make one that long) keeps ``_MATCH_KEEP`` from
+    each end, joined by an ellipsis, so a snippet holds at most about
+    ``before + after + 2 * _MATCH_KEEP`` characters.
+    """
+    lo, hi = max(0, start - before), min(len(text), end + after)
+    if end - start <= 2 * _MATCH_KEEP:
+        return " ".join(text[lo:hi].split())
+    head = " ".join(text[lo:start + _MATCH_KEEP].split())
+    tail = " ".join(text[end - _MATCH_KEEP:hi].split())
+    return f"{head} {ELLIPSIS} {tail}"
 
 
 def _percent_value(percent: Any) -> float:
@@ -206,10 +236,10 @@ class _ReadingMixin:
         page.
 
         :param query: The text to find. Converted like
-            :func:`~py_apple_books.text.fold_for_match`'s input
-            (``str()`` for numbers and other objects); leading and
-            trailing whitespace is ignored. A query that folds to nothing
-            finds nothing.
+            :func:`~py_apple_books.text.fold_for_match`'s input (None
+            finds nothing, bytes are decoded as UTF-8, ``str()`` for
+            numbers and other objects); leading and trailing whitespace
+            is ignored. A query that folds to nothing finds nothing.
         :param start: Where to start (default: the start of the book). A
             match is on the page if it starts at or after ``start``.
         :param until: Where the readable text ends: a
@@ -220,7 +250,10 @@ class _ReadingMixin:
         :param limit: Most hits on this page (default 20); None gives
             ``MAX_SEARCH_HITS``, which is also the most any page holds.
         :param chars_before: Characters of context before each match in
-            its snippet, 0 to ``MAX_SNIPPET_CONTEXT`` (default 80).
+            its snippet, 0 to ``MAX_SNIPPET_CONTEXT`` (default 80). A
+            match made very long by characters that fold to nothing (over
+            4,000 characters) keeps 2,000 from each end in the snippet,
+            joined by an ellipsis.
         :param chars_after: The same, after the match.
         :param count_total: Also count every match in scope (from
             ``start`` to ``until``), in :attr:`TextSearchResult.total`:
@@ -235,10 +268,10 @@ class _ReadingMixin:
         :param include_toc_pages: Also search table-of-contents pages.
         :returns: A :class:`~py_apple_books.content.TextSearchResult`.
         :raises InvalidArgumentError: a query over 1,000 characters
-            after folding (the message doesn't repeat it), a bad
-            ``limit``, ``chars_before`` or ``chars_after``, a bad
-            ``start`` or ``until``, or a boundary resolved for another
-            book. Checked before the book is read.
+            after folding or 64,000 before (the message doesn't repeat
+            it), a bad ``limit``, ``chars_before`` or ``chars_after``, a
+            bad ``start`` or ``until``, or a boundary resolved for
+            another book. Checked before the book is read.
         :raises NotEpubError, BookNotDownloadedError,
             DRMProtectedError, AppleBooksError: as for
             :meth:`list_spine_items`.
@@ -403,7 +436,11 @@ class _ReadingMixin:
           an auxiliary item, never later than that item's start.
         * ``RECENT_HIGHLIGHT``: the start of the highlight's item (one
           not found, ``HIGHLIGHT_UNRESOLVED``, or on an auxiliary item
-          falls back to the progress, then the start of the book).
+          falls back to the progress, then the start of the book; after
+          an auxiliary item, never later than that item's start). A
+          highlight on an auxiliary item adds no warning in this release,
+          so a result placed there looks like a placement at a linear
+          highlight.
         * ``PROGRESS``: :meth:`position_at_percent` of the progress.
         * ``FURTHEST``: the later of the reading position (placed as
           above) and :meth:`position_at_percent` of the furthest point

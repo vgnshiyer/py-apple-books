@@ -94,6 +94,24 @@ class TestExamples:
         assert hit.snippet == "ed the culprit."
         assert "\n" not in story.search("town", chars_after=40).hits[0].snippet
 
+    def test_a_long_match_is_shortened_in_its_snippet(self, tmp_path):
+        """Characters that fold to nothing can make a match any length:
+        its snippet keeps 2,000 characters from each end, joined by an
+        ellipsis."""
+        shy = "\u00ad"
+        content = BookContent(bundle(tmp_path, [
+            ("c1", f"<p>pre x{shy * 3998}y post</p>"),
+            ("c2", f"<p>pre x{shy * 3999}y post</p>"),
+            ("c3", f"<p>pre x{shy * 200_000}y post</p>"),
+        ], [("One", "c1.xhtml"), ("Two", "c2.xhtml"), ("Three", "c3.xhtml")]))
+        whole, cut, huge = content.search("xy", chars_before=4, chars_after=5).hits
+        assert whole.snippet == f"pre x{shy * 3998}y post"
+        assert cut.snippet == f"pre x{shy * 1999} … {shy * 1999}y post"
+        assert huge.snippet == cut.snippet
+        assert huge.end.offset - huge.start.offset == 200_002
+        assert [h.snippet for h in content.search("xy", chars_before=0, chars_after=0).hits] == [
+            f"x{shy * 3998}y", f"x{shy * 1999} … {shy * 1999}y", f"x{shy * 1999} … {shy * 1999}y"]
+
     def test_snippets_stay_in_their_item(self, story):
         [hit] = story.search("the end", chars_before=MAX_SNIPPET_CONTEXT, chars_after=MAX_SNIPPET_CONTEXT).hits
         assert hit.snippet == "The end."
@@ -215,6 +233,22 @@ class TestQueries:
             with pytest.raises(InvalidArgumentError) as exc:
                 story.search(query)
             assert "1000" in str(exc.value) and query[:5] not in str(exc.value)
+
+    def test_raw_length_is_bounded_before_folding(self, story, monkeypatch):
+        """Folding costs time and memory with the input's length: a query
+        over 64,000 characters is refused before it is folded, even one
+        that would fold short."""
+        from py_apple_books import _content_reading
+
+        assert story.search("\u00ad" * 63996 + "town").hits != ()
+        folded = []
+        real = _content_reading._fold_query
+        monkeypatch.setattr(_content_reading, "_fold_query", lambda q: folded.append(len(q)) or real(q))
+        for query in ("x" * 64001, " " * 64000 + "x", "\u00ad" * 64001, "\ufb01" * 2_000_000, b"x" * 64001):
+            with pytest.raises(InvalidArgumentError) as exc:
+                story.search(query)
+            assert "64000" in str(exc.value) and "xxxxx" not in str(exc.value)
+        assert folded == []
 
     def test_arguments_are_checked_before_reading(self, tmp_path):
         missing = BookContent(tmp_path / "Missing.epub")
