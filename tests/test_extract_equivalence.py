@@ -36,6 +36,7 @@ from tests import _legacy_110_extract as legacy
 
 
 CASES_PER_SEED = 3000
+SEEDS = (0, 1, 2)
 
 # Documents that start with an XML declaration, or look like a file
 # name, make bs4 warn; both implementations parse the same bytes the
@@ -44,7 +45,6 @@ pytestmark = [
     pytest.mark.filterwarnings("ignore::bs4.XMLParsedAsHTMLWarning"),
     pytest.mark.filterwarnings("ignore::bs4.MarkupResemblesLocatorWarning"),
 ]
-SEEDS = (0, 1, 2)
 
 
 # ---------------------------------------------------------------------------
