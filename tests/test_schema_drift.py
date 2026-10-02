@@ -163,7 +163,20 @@ class TestOptionalColumn:
     @pytest.mark.parametrize("table, column, model, field", [
         ("ZBKLIBRARYASSET", "ZRATING", Book, "rating"),
         ("ZBKLIBRARYASSET", "ZLASTENGAGEDDATE", Book, "last_engaged_date"),
+        # 1.11
+        ("ZBKLIBRARYASSET", "ZLANGUAGE", Book, "language"),
+        ("ZBKLIBRARYASSET", "ZYEAR", Book, "year"),
+        ("ZBKLIBRARYASSET", "ZRELEASEDATE", Book, "release_date"),
+        ("ZBKLIBRARYASSET", "ZSERIESID", Book, "series_id"),
+        ("ZBKLIBRARYASSET", "ZSERIESCONTAINER", Book, "series_container_id"),
+        ("ZBKLIBRARYASSET", "ZSEQUENCENUMBER", Book, "series_sequence"),
+        ("ZBKLIBRARYASSET", "ZSEQUENCEDISPLAYNAME", Book, "series_label"),
+        ("ZBKLIBRARYASSET", "ZSERIESISORDERED", Book, "series_is_ordered"),
+        ("ZBKLIBRARYASSET", "ZBOOKHIGHWATERMARKPROGRESS", Book, "high_water_progress"),
         ("ZAEANNOTATION", "ZFUTUREPROOFING5", Annotation, "chapter"),
+        ("ZAEANNOTATION", "ZPLUSERDATA", Annotation, "location_data"),
+        ("ZAEANNOTATION", "ZFUTUREPROOFING10", Annotation, "position_fraction"),
+        ("ZAEANNOTATION", "ZFUTUREPROOFING8", Annotation, "furthest_fraction"),
         ("ZBKCOLLECTION", "ZDETAILS", Collection, "details"),
     ])
     def test_reads_as_none_and_rejects_filters(self, drifted, table, column, model, field):
