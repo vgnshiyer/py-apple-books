@@ -33,7 +33,7 @@ import math
 import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import TYPE_CHECKING, Dict, Hashable, Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, Hashable, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from py_apple_books.exceptions import InvalidArgumentError, InvalidChoiceError
 from py_apple_books.text import _coerce_text, fold_for_match, selection_core
@@ -42,7 +42,7 @@ from py_apple_books.utils import APPLE_EPOCH_OFFSET
 if TYPE_CHECKING:
     from py_apple_books.models.annotation import Annotation
 
-__all__ = ["SAMPLE_ALGORITHM", "VocabularyEntry"]
+__all__ = ["SAMPLE_ALGORITHM", "VocabularyEntry", "ActivityPeriod", "HighlightActivity", "HighlightStreaks"]
 
 #: The ranking algorithm of :meth:`PyAppleBooks.sample_highlights`.
 #: Each candidate gets a key from a keyed BLAKE2b hash of the day, the
@@ -373,3 +373,193 @@ def _sort_vocabulary(entries: List[VocabularyEntry], field: str, descending: boo
     absent = [e for e in entries if value(e) is None]
     present.sort(key=value, reverse=descending)  # stable: ties keep key order
     return present + absent
+
+
+# -- highlight activity -------------------------------------------------------
+
+_GRANULARITIES = ("day", "week", "month", "year")
+
+
+@dataclass(frozen=True)
+class ActivityPeriod:
+    """One day, ISO week, month or year of
+    :attr:`HighlightActivity.periods` (only periods with highlights are
+    listed)."""
+
+    #: The first day of the period (a Monday for a week).
+    start: date
+    #: The day after the period (exclusive).
+    end: date
+    #: Highlights and notes made in it.
+    highlights: int
+    #: Of those, the ones with a note.
+    notes: int
+    #: Distinct books (asset ids) highlighted in it, removed books included.
+    books: int
+    #: Days of it with at least one highlight.
+    active_days: int
+
+
+@dataclass(frozen=True)
+class HighlightActivity:
+    """How much you highlighted over a window, from
+    :meth:`PyAppleBooks.get_highlight_activity`.
+
+    It measures highlighting, not reading: days you read without
+    highlighting don't show, and reading time isn't available.
+
+    ``books`` counts distinct asset ids, removed books included:
+    ``len(per_book) + orphan_books == books``, the ``per_book`` counts
+    plus ``orphan_highlights`` add up to ``highlights``, and so do the
+    ``periods``' (when a granularity is set).
+    """
+
+    #: The window, as passed.
+    after: Optional[Union[date, datetime]]
+    before: Optional[Union[date, datetime]]
+    #: ``'day'``, ``'week'`` (ISO, from Monday), ``'month'``, ``'year'`` or None.
+    granularity: Optional[str]
+    #: Highlights and notes made in the window.
+    highlights: int
+    #: Of those, the ones with a note.
+    notes: int
+    #: Days with at least one highlight.
+    active_days: int
+    #: Distinct books highlighted (asset ids), removed books included.
+    books: int
+    #: Of those, books no longer in the library.
+    orphan_books: int
+    #: Highlights of books no longer in the library.
+    orphan_highlights: int
+    #: The first and last highlight's creation date (None without any).
+    first: Optional[datetime]
+    last: Optional[datetime]
+    #: The periods with highlights, oldest first (empty without a granularity).
+    periods: Tuple[ActivityPeriod, ...] = ()
+    #: ``(book id, title, highlights)`` for each book in the library,
+    #: most highlighted first, ties by id.
+    per_book: Tuple[Tuple[int, Optional[str], int], ...] = ()
+
+
+@dataclass(frozen=True)
+class HighlightStreaks:
+    """Runs of consecutive days on which you highlighted, from
+    :meth:`PyAppleBooks.get_highlight_streaks` (local days, up to and
+    including ``on``). Highlighting, not reading: a day read without a
+    highlight breaks a streak."""
+
+    #: The day the streaks are counted up to.
+    on: date
+    #: The run that ends on ``on``, or yesterday if nothing is highlighted
+    #: on ``on`` yet; 0 otherwise.
+    current: int
+    current_start: Optional[date]
+    #: The longest run (the earliest of equally long ones).
+    longest: int
+    longest_start: Optional[date]
+    longest_end: Optional[date]
+    #: The last day with a highlight.
+    last_active: Optional[date]
+    #: Days with at least one highlight.
+    active_days: int
+
+
+def _granularity(value) -> Optional[str]:
+    """A ``get_highlight_activity`` granularity, checked.
+
+    :raises InvalidChoiceError: not one of the granularities or None.
+    """
+    if value is None or (isinstance(value, str) and value in _GRANULARITIES):
+        return value
+    shown = value if isinstance(value, str) and len(value) <= 40 else type(value).__name__
+    raise InvalidChoiceError(f"Unknown granularity {shown!r}. Valid: {', '.join(_GRANULARITIES)}, or None.",
+                             value=value, valid=_GRANULARITIES)
+
+
+def _period(day: date, granularity: str) -> Tuple[date, date]:
+    """``(start, end)`` of the period holding ``day`` (end exclusive;
+    ``date.max`` past the last representable day)."""
+    if granularity == "day":
+        start = day
+    elif granularity == "week":
+        start = day - timedelta(days=day.weekday())
+    elif granularity == "month":
+        start = day.replace(day=1)
+    else:
+        start = date(day.year, 1, 1)
+    try:
+        if granularity == "day":
+            end = start + timedelta(days=1)
+        elif granularity == "week":
+            end = start + timedelta(days=7)
+        elif granularity == "month":
+            end = date(start.year + start.month // 12, start.month % 12 + 1, 1)
+        else:
+            end = date(start.year + 1, 1, 1)
+    except (OverflowError, ValueError):
+        end = date.max
+    return start, end
+
+
+def _activity(rows: Iterable[Tuple[Hashable, datetime, bool]], books: Dict, *, after, before,
+              granularity: Optional[str]) -> HighlightActivity:
+    """A :class:`HighlightActivity` from ``(asset id, creation date,
+    has a note)`` rows; ``books`` maps asset ids to the library's books
+    (``_common._books_by_asset``)."""
+    rows = list(rows)
+    per_asset: Dict[Hashable, int] = {}
+    days: Set[date] = set()
+    buckets: Dict[date, list] = {}
+    for asset, created, noted in rows:
+        per_asset[asset] = per_asset.get(asset, 0) + 1
+        day = created.date()
+        days.add(day)
+        if granularity is not None:
+            start, end = _period(day, granularity)
+            bucket = buckets.setdefault(start, [end, 0, 0, set(), set()])
+            bucket[1] += 1
+            bucket[2] += noted
+            bucket[3].add(asset)
+            bucket[4].add(day)
+    in_library = [(books[asset].id, books[asset].title, n) for asset, n in per_asset.items() if asset in books]
+    orphans = [n for asset, n in per_asset.items() if asset not in books]
+    created = [c for _, c, _ in rows]
+    return HighlightActivity(
+        after=after, before=before, granularity=granularity,
+        highlights=len(rows),
+        notes=sum(1 for _, _, noted in rows if noted),
+        active_days=len(days),
+        books=len(per_asset),
+        orphan_books=len(orphans),
+        orphan_highlights=sum(orphans),
+        first=min(created) if created else None,
+        last=max(created) if created else None,
+        periods=tuple(ActivityPeriod(start=start, end=b[0], highlights=b[1], notes=b[2], books=len(b[3]),
+                                     active_days=len(b[4]))
+                      for start, b in sorted(buckets.items())),
+        per_book=tuple(sorted(in_library, key=lambda entry: (-entry[2], entry[0]))),
+    )
+
+
+def _streaks(days: Iterable[date], on: date) -> HighlightStreaks:
+    """:class:`HighlightStreaks` over the active ``days`` up to ``on``."""
+    ordered = sorted(d for d in set(days) if d <= on)
+    longest, longest_start, longest_end = 0, None, None
+    run, run_start, previous = 0, None, None
+    for day in ordered:
+        if previous is not None and (day - previous).days == 1:
+            run += 1
+        else:
+            run, run_start = 1, day
+        if run > longest:  # strictly longer: ties keep the earliest run
+            longest, longest_start, longest_end = run, run_start, day
+        previous = day
+    alive = bool(ordered) and (on - ordered[-1]).days <= 1
+    return HighlightStreaks(
+        on=on,
+        current=run if alive else 0,
+        current_start=run_start if alive else None,
+        longest=longest, longest_start=longest_start, longest_end=longest_end,
+        last_active=ordered[-1] if ordered else None,
+        active_days=len(ordered),
+    )

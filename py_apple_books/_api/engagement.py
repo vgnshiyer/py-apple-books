@@ -1,6 +1,6 @@
 """The :class:`~py_apple_books.PyAppleBooks` mixin for engagement: underlines, highlight
-sampling, highlights made on this day in earlier years, and highlighted
-words (1.11).
+sampling, highlights made on this day in earlier years, highlighted
+words, and highlight activity and streaks (1.11).
 
 Every method here reads the library and annotation databases only (no
 book file, no iCloud folder, no subprocess). Dates follow the rules in
@@ -14,7 +14,13 @@ import operator
 from typing import FrozenSet, Iterable, List, Optional
 
 from py_apple_books import engagement as _eng
-from py_apple_books._api._common import _annotation_scope, _book_arg, strict_limit, strict_offset
+from py_apple_books._api._common import (
+    _annotation_scope,
+    _book_arg,
+    _books_by_asset,
+    strict_limit,
+    strict_offset,
+)
 from py_apple_books.db.clause import Q, Subquery, Where
 from py_apple_books.db.client import ANNOTATIONS_NOT_FOUND, current_library
 from py_apple_books.exceptions import AnnotationStoreNotFoundError, InvalidArgumentError
@@ -22,7 +28,7 @@ from py_apple_books.models.annotation import Annotation, AnnotationType
 from py_apple_books.models.book import Book
 from py_apple_books.models.manager import ModelIterable
 from py_apple_books.text import _SHORT_MAX_RAW, _coerce_text, is_short_selection
-from py_apple_books.utils import APPLE_EPOCH_OFFSET
+from py_apple_books.utils import APPLE_EPOCH_OFFSET, _apple_datetime_or_none
 
 _HIGHLIGHT = int(AnnotationType.HIGHLIGHT)
 
@@ -328,6 +334,76 @@ class _EngagementAPI:
         entries = _eng._sort_vocabulary(entries, field, descending)
         start = offset or 0
         return entries[start:] if limit is None else entries[start:start + limit]
+
+    def get_highlight_activity(self, *, after=None, before=None, book_id=None,
+                               granularity: Optional[str] = "month") -> _eng.HighlightActivity:
+        """How much you highlighted, in total and per period (1.11).
+
+        Counts highlights and notes (type 2, not deleted) with a creation
+        date in the ``after``/``before`` window (all time by default;
+        :mod:`py_apple_books.engagement` has the date rules), books no
+        longer in the library included. ``book_id`` (an id or a
+        :class:`Book`) keeps one book's. ``granularity`` groups them by
+        local ``'day'``, ``'week'`` (ISO, from Monday), ``'month'`` or
+        ``'year'`` (None: no periods). See
+        :class:`~py_apple_books.engagement.HighlightActivity` for the
+        fields and how they add up.
+
+        This measures highlighting, not reading time, which Books
+        doesn't record in a form the library can read. For a window with
+        a bound, ``highlights`` equals the number of type-2 rows
+        :meth:`get_annotations_by_date_range` returns for it.
+
+        :raises InvalidArgumentError: a bad ``after`` or ``before``.
+        :raises InvalidChoiceError: an unknown ``granularity``.
+        :raises BookNotFoundError: no book has id ``book_id``.
+        """
+        granularity = _eng._granularity(granularity)
+        window = _eng._window_filters("creation_date", after, before)
+        asset = None if book_id is None else _asset_of(self, book_id)
+        _require_annotation_store()
+        rows = []
+        if asset != "":
+            filters = {"type": _HIGHLIGHT, "is_deleted__isnot": 1, "creation_date__isnull": False, **window}
+            if asset is not None:
+                filters["asset_id"] = asset
+            keys = list(Annotation._get_mappings("Annotation"))
+            i_asset, i_note, i_created = (keys.index(k) for k in ("asset_id", "note", "creation_date"))
+            for row in Annotation.manager.filter(**filters, only=["id", "asset_id", "note", "creation_date"]
+                                                 ).run_query():
+                created = _apple_datetime_or_none(row[i_created])
+                if created is None:
+                    continue
+                note = _coerce_text(row[i_note])
+                rows.append((row[i_asset], created, bool(note and note.strip())))
+        return _eng._activity(rows, _books_by_asset(), after=after, before=before, granularity=granularity)
+
+    def get_highlight_streaks(self, *, on=None) -> _eng.HighlightStreaks:
+        """Runs of consecutive local days on which you highlighted, up to
+        ``on`` (default today) (1.11).
+
+        Any highlight or note (type 2, not deleted) counts, books no
+        longer in the library included. The current streak is the run
+        ending on ``on``, or ending the day before if you haven't
+        highlighted yet on ``on``. See
+        :class:`~py_apple_books.engagement.HighlightStreaks`.
+
+        This measures highlighting, not reading: a day read without a
+        highlight breaks a streak.
+
+        :raises InvalidArgumentError: a bad ``on``.
+        """
+        day = _eng._local_day(on)
+        _require_annotation_store()
+        i_created = list(Annotation._get_mappings("Annotation")).index("creation_date")
+        days = set()
+        for row in Annotation.manager.filter(type=_HIGHLIGHT, is_deleted__isnot=1,
+                                             creation_date__lt=_eng._day_end(day),
+                                             only=["id", "creation_date"]).run_query():
+            created = _apple_datetime_or_none(row[i_created])
+            if created is not None:
+                days.add(created.date())
+        return _eng._streaks(days, day)
 
 
 def _full_rows(ids: List[int], filters: dict, where) -> list:

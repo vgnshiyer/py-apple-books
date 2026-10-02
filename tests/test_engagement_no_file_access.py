@@ -109,6 +109,9 @@ _SCRIPT = textwrap.dedent(r'''
             dt.date(2025, 1, 1), dt.date(2026, 12, 31))),
         "get_library_stats": lambda api: len(api.get_library_stats().orphan_assets),
         "get_vocabulary": lambda api: [[e.term, e.count, e.context] for e in api.get_vocabulary(order_by="term")],
+        "get_highlight_activity": lambda api: [api.get_highlight_activity().highlights,
+                                               len(api.get_highlight_activity(book_id=book["id"]).per_book)],
+        "get_highlight_streaks": lambda api: api.get_highlight_streaks(on=day).longest,
     }
     extra = {name: getattr(PyAppleBooks, name) for name in sys.argv[3:]}
     for name in extra:
@@ -172,6 +175,7 @@ def test_engagement_methods_touch_no_book_file(tmp_path):
     assert results["sample_highlights"][0] == 4 and set(results["sample_highlights"][1]) == {"Cloud Book"}
     assert results["get_finished_books"] == 1 and results["get_library_stats"] == 1
     assert results["get_vocabulary"] == [["Ephemeral", 1, None], ["laconic", 1, None]]
+    assert results["get_highlight_activity"] == [7, 1] and results["get_highlight_streaks"] == 1
     # No stat-family lookup in the bundle or iCloud Drive (the methods
     # do stat other paths, such as the store folders).
     assert out["stat_calls"] > 0

@@ -47,4 +47,8 @@ CASES = {
                                          for e in api.get_vocabulary()],
     "get_vocabulary(underlines)": lambda api, rows: [(e.term, e.count) for e in api.get_vocabulary(
         underline_only=True, order_by="term")],
+    "get_highlight_activity": lambda api, rows: api.get_highlight_activity(),
+    "get_highlight_activity(book)": lambda api, rows: api.get_highlight_activity(
+        book_id=rows["done"], after=dt.date(2024, 1, 1), before=dt.date(2026, 9, 30), granularity="week"),
+    "get_highlight_streaks": lambda api, rows: api.get_highlight_streaks(on=DAY),
 }
