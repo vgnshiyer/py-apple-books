@@ -13,6 +13,10 @@ Books 8.5): primary keys come from ``Z_PRIMARYKEY.Z_MAX``, flag columns
 that are 0 on every real row default to 0 rather than NULL, and
 identifiers are derived deterministically from the row's primary key so
 two identically seeded libraries are identical.
+
+Beside the stores, in the same container, a FixtureLibrary can also
+write Books' preferences plist (:meth:`FixtureLibrary.write_prefs`) and
+its per-book info caches (:meth:`FixtureLibrary.add_book_info_cache`).
 """
 
 from __future__ import annotations
@@ -22,15 +26,31 @@ import json
 import pathlib
 import re
 import sqlite3
+import struct
 import uuid
-from typing import Any, Dict, List, Mapping, Optional, Union
+from collections import abc
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Union
 
 SCHEMAS_DIR = pathlib.Path(__file__).parent / "schemas"
 DOCUMENTS = pathlib.PurePosixPath("Library/Containers/com.apple.iBooksX/Data/Documents")
+# Files next to Documents, in the same container (``<container>/Data``).
+PREFS_PLIST = pathlib.PurePosixPath("Library/Preferences/com.apple.iBooksX.plist")
+BOOK_INFO_DIR = pathlib.PurePosixPath("Library/Caches/AEEpubInfoSource")
 
 # Seconds between the Unix epoch and the Core Data epoch (2001-01-01 UTC).
 _APPLE_EPOCH_OFFSET = 978307200
 _ID_NAMESPACE = uuid.UUID("5f0c7c4e-2d0b-4c7e-9a52-6a1f3b0e8d11")
+
+#: Core Data seconds of ``NSDate.distantPast`` (0000-12-30 00:00 UTC), the
+#: year-0 date Books writes into its preferences plist. Python's
+#: ``datetime`` can't hold it, so plain ``plistlib.loads`` fails on such a
+#: file. Pass it (or ``float('nan')``) as a date to :meth:`FixtureLibrary.write_prefs`.
+YEAR_ZERO = -63114076800.0
+_YEAR_ZERO_XML = "0000-12-30T00:00:00Z"
+
+# Store ids (Apple's numeric adam ids) given to series rows that don't
+# name one: a fixed base plus the row's primary key.
+_STORE_ID_BASE = 1900000000
 
 # ZDATASOURCEIDENTIFIER values seen on real rows.
 UBIQUITY = "com.apple.ibooks.datasource.ubiquity"
@@ -128,6 +148,42 @@ def core_data_time(value: Union[_dt.datetime, float, int, None]) -> Optional[flo
     return value.timestamp() - _APPLE_EPOCH_OFFSET
 
 
+def page_location_blob(page_offset: int, ordinal: int = 0) -> bytes:
+    """A ``ZPLUSERDATA`` value as Books writes it on a bookmark row.
+
+    A binary property list of Books' ``BKPageLocation``: ``pageOffset``
+    (the 0-based page of a PDF) and ``super.ordinal`` (the spine item of
+    an EPUB bookmark without a CFI). Pass it to
+    :meth:`FixtureLibrary.add_annotation` as ``user_data``. Values are
+    written as given, so out-of-range ones can be tested.
+    """
+    import plistlib  # on first use, not at import
+
+    return plistlib.dumps({"class": "BKPageLocation", "pageOffset": page_offset,
+                           "super": {"class": "BKLocation", "ordinal": ordinal}},
+                          fmt=plistlib.FMT_BINARY)
+
+
+def _plist_values(value) -> Iterable[Any]:
+    """Every value in a plist-shaped object, containers included."""
+    yield value
+    if isinstance(value, abc.Mapping):
+        for item in value.values():
+            yield from _plist_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _plist_values(item)
+
+
+def _fraction_text(value, name: str) -> Optional[str]:
+    """A position fraction as the text Books stores it (a str verbatim)."""
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a float, a str or None, not {type(value).__name__}")
+    return repr(float(value))
+
+
 def build_store(sql_file, dest, journal_mode: str = "DELETE") -> None:
     """Create a SQLite store at ``dest`` from a schema ``.sql`` file.
 
@@ -168,6 +224,20 @@ class FixtureLibrary:
 
     def __repr__(self) -> str:
         return f"FixtureLibrary(root={str(self.root)!r}, schema={self.schema!r})"
+
+    @property
+    def prefs_path(self) -> pathlib.Path:
+        """Where Books keeps its preferences plist, beside ``Documents``:
+        ``<root>/Library/Containers/com.apple.iBooksX/Data/Library/Preferences/com.apple.iBooksX.plist``.
+        Written by :meth:`write_prefs`."""
+        return self.data_dir.parent / PREFS_PLIST
+
+    @property
+    def book_info_dir(self) -> pathlib.Path:
+        """Where Books keeps its per-book info caches, beside ``Documents``:
+        ``<root>/Library/Containers/com.apple.iBooksX/Data/Library/Caches/AEEpubInfoSource``.
+        Written by :meth:`add_book_info_cache`."""
+        return self.data_dir.parent / BOOK_INFO_DIR
 
     @classmethod
     def create(cls, root, schema: str = DEFAULT_SCHEMA, journal_mode: str = "DELETE",
@@ -270,10 +340,19 @@ class FixtureLibrary:
 
     def _book_row(self, pk: int, title, author, *, asset_id=None, path=None, genre=None,
                   progress=0.0, finished=False, last_opened=None, created=0.0, content_type=1,
-                  data_source=UBIQUITY, can_redownload=None, state=1, raw=None) -> dict:
+                  data_source=UBIQUITY, can_redownload=None, state=1, finished_date=None,
+                  last_engaged=None, columns=None, raw=None) -> dict:
         if can_redownload is None:
             # Unowned Store-series rows carry 0; every owned row carries 1.
             can_redownload = 0 if data_source == STORE_SERIES else 1
+        # Columns added in 1.11 are only named when set, so a row built
+        # with the defaults is exactly a 1.10 row (and inserts into a store
+        # whose schema lacks them).
+        optional = {}
+        if finished_date is not None:
+            optional["ZDATEFINISHED"] = core_data_time(finished_date)
+        if last_engaged is not None:
+            optional["ZLASTENGAGEDDATE"] = core_data_time(last_engaged)
         return {
             "ZASSETID": asset_id or self._identifier("BKLibraryAsset", pk, "asset").hex.upper(),
             "ZASSETGUID": str(self._identifier("BKLibraryAsset", pk, "guid")).upper(),
@@ -292,6 +371,8 @@ class FixtureLibrary:
             "ZFILESIZE": 0, "ZGENERATION": 1, "ZDESKTOPSUPPORTLEVEL": 0,
             "ZDIDWARNABOUTDESKTOPSUPPORT": 0, "ZHASRACSUPPORT": 0, "ZTASTE": 0,
             "ZTASTESYNCEDTOSTORE": 0, "ZMAPPEDASSETCONTENTTYPE": 0, "ZVERSIONNUMBER": 0.0,
+            **optional,
+            **(columns or {}),
             **(raw or {}),
         }
 
@@ -299,12 +380,16 @@ class FixtureLibrary:
                  asset_id: Optional[str] = None, path=None, genre: Optional[str] = None,
                  progress: Optional[float] = 0.0, finished: bool = False, last_opened=None,
                  created=0.0, content_type: int = 1, data_source: Optional[str] = UBIQUITY,
-                 can_redownload: Optional[int] = None, state: int = 1,
-                 raw: Optional[Mapping[str, Any]] = None) -> dict:
+                 can_redownload: Optional[int] = None, state: int = 1, finished_date=None,
+                 last_engaged=None, raw: Optional[Mapping[str, Any]] = None) -> dict:
         """Insert a ``ZBKLIBRARYASSET`` row and return ``{'id', 'asset_id'}``.
 
         ``progress`` is a 0..1 fraction, as Books stores it. Dates accept
         a datetime (naive means UTC) or Core Data seconds.
+        ``finished_date`` and ``last_engaged`` set ``ZDATEFINISHED`` and
+        ``ZLASTENGAGEDDATE`` (``Book.finished_date``,
+        ``Book.last_engaged_date``); a finish date doesn't mark the book
+        finished (``finished=True`` does), so stray dates can be tested.
         ``can_redownload`` defaults to 1, or to 0 for Store-series rows
         (``data_source=STORE_SERIES``), matching real data. ``raw``
         overrides or adds columns verbatim.
@@ -312,15 +397,97 @@ class FixtureLibrary:
         fields = dict(asset_id=asset_id, path=path, genre=genre, progress=progress,
                       finished=finished, last_opened=last_opened, created=created,
                       content_type=content_type, data_source=data_source,
-                      can_redownload=can_redownload, state=state, raw=raw)
+                      can_redownload=can_redownload, state=state, finished_date=finished_date,
+                      last_engaged=last_engaged, raw=raw)
+        row = self._insert_book(title, author, fields)
+        return {"id": row["Z_PK"], "asset_id": row["ZASSETID"]}
+
+    def _insert_book(self, title, author, fields: Mapping[str, Any],
+                     columns: Optional[Callable[[int], Mapping[str, Any]]] = None) -> dict:
+        """Insert one book row and return it (with ``Z_PK``); ``columns(pk)``
+        adds columns, applied before ``raw``."""
         rows = {}
 
         def make_row(pk):
-            rows[pk] = self._book_row(pk, title, author, **fields)
+            extra = columns(pk) if columns is not None else None
+            rows[pk] = self._book_row(pk, title, author, columns=extra, **fields)
             return rows[pk]
 
         pk = self._insert("library", "ZBKLIBRARYASSET", "BKLibraryAsset", make_row)
-        return {"id": pk, "asset_id": rows[pk]["ZASSETID"]}
+        return {"Z_PK": pk, **rows[pk]}
+
+    # -- series -----------------------------------------------------------
+
+    _VOLUME_KEYS = frozenset({"title", "sequence", "label", "store_id"})
+    _BOOK_KEYS = frozenset({"author", "asset_id", "path", "genre", "progress", "finished",
+                            "last_opened", "created", "content_type", "data_source",
+                            "can_redownload", "state", "finished_date", "last_engaged", "raw"})
+
+    def add_series(self, title: str, volumes: Sequence[Mapping[str, Any]], *, ordered: bool = True,
+                   store_id: Optional[str] = None) -> dict:
+        """Insert a Store series: a container row and its volumes.
+
+        Books lists a Store series as a container (``ZCONTENTTYPE`` 5,
+        Series data source, ``ZSERIESID`` equal to its own ``ZSTOREID``,
+        ``ZSERIESISORDERED`` from ``ordered``) and one Series-source row
+        per volume, linked to it by both ``ZSERIESCONTAINER`` (the
+        container's row id) and ``ZSERIESID``. ``store_id`` is the
+        container's (and so the series') Store id; by default a numeric
+        id is derived from the row id.
+
+        Each volume is a mapping with optional ``title`` (default
+        ``'<title> <n>'``), ``sequence`` (``ZSEQUENCENUMBER``, a number,
+        or a str written verbatim), ``label`` (``ZSEQUENCEDISPLAYNAME``,
+        e.g. ``'Book 2'``) and ``store_id`` (default derived from the row
+        id), plus any :meth:`add_book` keyword. Volumes default to
+        unowned (``can_redownload`` 0), like the Store volumes Books lists
+        for a series you've started; ``can_redownload=1`` makes one the
+        library lists as owned. ``state`` defaults to 5 for unowned rows
+        and the container, 1 for owned ones. A volume's ``raw`` is applied
+        last, so it can unlink or garble any series column.
+
+        Returns ``{'container': {'id', 'asset_id', 'store_id'}, 'volumes':
+        [{'id', 'asset_id', 'store_id'}, ...]}`` (each ``store_id`` as
+        stored, after ``raw``).
+        """
+        specs = []
+        for i, volume in enumerate(volumes):
+            unknown = sorted(set(volume) - self._VOLUME_KEYS - self._BOOK_KEYS)
+            if unknown:
+                raise ValueError(f"volumes[{i}]: unknown keys {unknown}")
+            specs.append(dict(volume))
+
+        def ids(row) -> dict:
+            return {"id": row["Z_PK"], "asset_id": row["ZASSETID"], "store_id": row.get("ZSTOREID")}
+
+        def own_store_id(pk: int, given: Optional[str]) -> str:
+            return given if given is not None else str(_STORE_ID_BASE + pk)
+
+        def container_columns(pk):
+            sid = own_store_id(pk, store_id)
+            return {"ZSTOREID": sid, "ZSERIESID": sid, "ZSERIESISORDERED": int(bool(ordered))}
+
+        container_row = self._insert_book(title, "Test Author", dict(
+            content_type=5, data_source=STORE_SERIES, state=5), container_columns)
+        container = ids(container_row)
+        series_id = container_row["ZSERIESID"]
+
+        made = []
+        for n, spec in enumerate(specs, start=1):
+            fields = {k: v for k, v in spec.items() if k in self._BOOK_KEYS and k != "author"}
+            fields.setdefault("data_source", STORE_SERIES)
+            if fields.get("can_redownload") is None:
+                fields["can_redownload"] = 0 if fields["data_source"] == STORE_SERIES else 1
+            fields.setdefault("state", 1 if fields["can_redownload"] else 5)
+
+            def volume_columns(pk, spec=spec):
+                return {"ZSTOREID": own_store_id(pk, spec.get("store_id")), "ZSERIESID": series_id,
+                        "ZSERIESCONTAINER": container["id"], "ZSEQUENCENUMBER": spec.get("sequence"),
+                        "ZSEQUENCEDISPLAYNAME": spec.get("label")}
+
+            made.append(ids(self._insert_book(spec.get("title", f"{title} {n}"),
+                                              spec.get("author", "Test Author"), fields, volume_columns)))
+        return {"container": container, "volumes": made}
 
     # -- collections ------------------------------------------------------
 
@@ -368,7 +535,8 @@ class FixtureLibrary:
 
     def _annotation_row(self, pk: int, book, text, *, kind="highlight", note=None, color="yellow",
                         deleted=False, created=0.0, modified=None, location=None, chapter=None,
-                        range_start=0, raw=None) -> dict:
+                        range_start=0, user_data=None, position_fraction=None,
+                        furthest_fraction=None, raw=None) -> dict:
         if kind not in ANNOTATION_KINDS:
             raise ValueError(f"kind must be one of {sorted(ANNOTATION_KINDS)}, not {kind!r}")
         if color not in COLORS:
@@ -399,13 +567,31 @@ class FixtureLibrary:
             "ZANNOTATIONCREATORIDENTIFIER": _CREATOR,
             "ZPLLOCATIONRANGESTART": range_start, "ZPLLOCATIONRANGEEND": 0,
             "ZPLABSOLUTEPHYSICALLOCATION": 0,
-            **overrides, **(raw or {}),
+            **overrides, **self._position_columns(user_data, position_fraction, furthest_fraction),
+            **(raw or {}),
         }
+
+    @staticmethod
+    def _position_columns(user_data, position_fraction, furthest_fraction) -> dict:
+        # Only named when set, so a default row is exactly a 1.10 row.
+        columns = {}
+        if user_data is not None:
+            if not isinstance(user_data, (bytes, bytearray, memoryview)):
+                raise TypeError(f"user_data must be bytes or None, not {type(user_data).__name__}")
+            columns["ZPLUSERDATA"] = bytes(user_data)
+        for column, name, value in (("ZFUTUREPROOFING10", "position_fraction", position_fraction),
+                                    ("ZFUTUREPROOFING8", "furthest_fraction", furthest_fraction)):
+            if value is not None:
+                columns[column] = _fraction_text(value, name)
+        return columns
 
     def add_annotation(self, book: Union[Mapping, str, None], text: Optional[str] = "a synthetic highlight", *,
                        kind: str = "highlight", note: Optional[str] = None, color: str = "yellow",
                        deleted: bool = False, created=0.0, modified=None, location: Optional[str] = None,
                        chapter: Optional[str] = None, range_start: Optional[int] = 0,
+                       user_data: Optional[bytes] = None,
+                       position_fraction: Union[float, str, None] = None,
+                       furthest_fraction: Union[float, str, None] = None,
                        raw: Optional[Mapping[str, Any]] = None) -> int:
         """Insert a ``ZAEANNOTATION`` row and return its Z_PK.
 
@@ -416,14 +602,241 @@ class FixtureLibrary:
         underline flag, bookmark type 1, reading_position type 3, and
         tombstone type 0 with no asset, dates or location. ``text`` only
         applies to type-2 kinds. ``location`` is the EPUB CFI.
+
+        For every kind, ``user_data`` sets ``ZPLUSERDATA`` (Books' own
+        position record, e.g. :func:`page_location_blob`), and
+        ``position_fraction`` / ``furthest_fraction`` set
+        ``ZFUTUREPROOFING10`` / ``ZFUTUREPROOFING8`` (where the reader is
+        and the furthest point read, 0..1). Books stores the fractions as
+        text: a number is written as its shortest ``repr`` (``0.5`` as
+        ``'0.5'``), a str verbatim (so garbage can be tested).
         """
         fields = dict(kind=kind, note=note, color=color, deleted=deleted, created=created,
                       modified=modified, location=location, chapter=chapter,
-                      range_start=range_start, raw=raw)
+                      range_start=range_start, user_data=user_data,
+                      position_fraction=position_fraction, furthest_fraction=furthest_fraction,
+                      raw=raw)
         # Validate before opening a write transaction.
         self._annotation_row(0, book, text, **fields)
         return self._insert("annotations", "ZAEANNOTATION", "AEAnnotation",
                             lambda pk: self._annotation_row(pk, book, text, **fields))
+
+    # -- Books' preferences plist -------------------------------------------
+
+    def write_prefs(self, *, books_goal: Any = 8, books_goal_set=None, daily_goal_seconds: Any = 5400.0,
+                    daily_goal_set=None, current_streak: Any = 0,
+                    finished: Optional[Mapping[str, Any]] = None,
+                    extra: Optional[Mapping[str, Any]] = None, year_zero_date: bool = True,
+                    fmt: str = "binary") -> pathlib.Path:
+        """Write a synthetic Books preferences plist to :attr:`prefs_path`
+        and return the path.
+
+        The keys Books uses for reading goals:
+
+        - ``ReadingGoals.BooksFinished``: ``{'goal': books_goal, 'date':
+          books_goal_set}``, the yearly books goal and when it was set;
+        - ``ReadingGoals.StreakDay``: ``{'goal': daily_goal_seconds,
+          'date': daily_goal_set}``, the daily reading goal in seconds;
+        - ``ReadingHistory.CurrentStreak``: ``current_streak``;
+        - ``BKFinishedAssetsCache``: ``finished``, asset id -> finish date;
+        - ``BKMostRecentPurchaseDateKey``: a year-0 date
+          (:data:`YEAR_ZERO`) when ``year_zero_date``. Books writes one,
+          and it makes plain ``plistlib.loads`` reject the whole file.
+
+        A None ``books_goal``, ``daily_goal_seconds``, ``current_streak``
+        or ``finished`` leaves its key out. Values are written as given,
+        so wrong types can be tested (``books_goal='8'``). ``extra`` adds
+        or replaces top-level keys, last; its values are plain plist
+        values.
+
+        Dates (``books_goal_set``, ``daily_goal_set``, the values of
+        ``finished``) are datetimes (naive means UTC) or Core Data seconds
+        (int or float), which are written as dates exactly, so
+        :data:`YEAR_ZERO`, ``float('nan')`` and other values ``datetime``
+        can't hold give the unreadable dates found in real files. A
+        ``*_set`` of None is a fixed date in January 2026.
+
+        ``fmt`` is ``'binary'`` (what Books writes) or ``'xml'``; an XML
+        plist can hold no unreadable date but :data:`YEAR_ZERO`.
+        """
+        import plistlib  # on first use, not at import
+
+        if fmt not in ("binary", "xml"):
+            raise ValueError(f"fmt must be 'binary' or 'xml', not {fmt!r}")
+        epoch = _dt.datetime(2001, 1, 1)
+        patches = []  # (placeholder datetime, Core Data seconds to write instead)
+
+        def date(value):
+            if isinstance(value, _dt.datetime):
+                return value.astimezone(_dt.timezone.utc).replace(tzinfo=None) if value.tzinfo else value
+            if isinstance(value, _dt.date):
+                return _dt.datetime(value.year, value.month, value.day)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"a date must be a datetime or Core Data seconds, not {type(value).__name__}")
+            seconds = float(value)
+            if fmt == "xml" and seconds != YEAR_ZERO:
+                try:
+                    return epoch + _dt.timedelta(seconds=seconds)
+                except (OverflowError, ValueError):
+                    raise ValueError(f"an XML plist can't hold the date {seconds!r}; "
+                                     f"use fmt='binary'") from None
+            # A unique placeholder (sub-second, so never a real fixture
+            # date), swapped for the raw value once encoded.
+            n = len(patches) + 1
+            placeholder = (epoch + _dt.timedelta(microseconds=n) if fmt == "binary"
+                           else _dt.datetime(1, 1, 1) + _dt.timedelta(seconds=n))
+            patches.append((placeholder, seconds))
+            return placeholder
+
+        doc: Dict[str, Any] = {}
+        if books_goal is not None:
+            doc["ReadingGoals.BooksFinished"] = {
+                "goal": books_goal,
+                "date": date(_dt.datetime(2026, 1, 2, 9, 0) if books_goal_set is None else books_goal_set)}
+        if daily_goal_seconds is not None:
+            doc["ReadingGoals.StreakDay"] = {
+                "goal": daily_goal_seconds,
+                "date": date(_dt.datetime(2026, 1, 3, 9, 0) if daily_goal_set is None else daily_goal_set)}
+        if current_streak is not None:
+            doc["ReadingHistory.CurrentStreak"] = current_streak
+        if finished is not None:
+            doc["BKFinishedAssetsCache"] = {asset: date(when) for asset, when in finished.items()}
+        if year_zero_date:
+            doc["BKMostRecentPurchaseDateKey"] = date(YEAR_ZERO)
+        doc.update(extra or {})
+
+        dates = [v for v in _plist_values(doc) if isinstance(v, _dt.datetime)]
+        if any(dates.count(placeholder) != 1 for placeholder, _ in patches):
+            raise ValueError("a date in the plist collides with write_prefs' placeholders; use another date")
+        if fmt == "binary":
+            data = plistlib.dumps(doc, fmt=plistlib.FMT_BINARY)
+            for placeholder, seconds in patches:
+                encoded = b"\x33" + struct.pack(">d", (placeholder - epoch).total_seconds())
+                if data.count(encoded) != 1:  # pragma: no cover - guarded above
+                    raise ValueError("could not place a raw date in the plist")
+                data = data.replace(encoded, b"\x33" + struct.pack(">d", seconds))
+        else:
+            data = plistlib.dumps(doc, fmt=plistlib.FMT_XML)
+            for placeholder, _ in patches:
+                p = placeholder  # plistlib's own format (strftime's %Y varies below 1000)
+                encoded = (f"<date>{p.year:04d}-{p.month:02d}-{p.day:02d}T"
+                           f"{p.hour:02d}:{p.minute:02d}:{p.second:02d}Z</date>").encode()
+                if data.count(encoded) != 1:  # pragma: no cover - guarded above
+                    raise ValueError("could not place a raw date in the plist")
+                data = data.replace(encoded, f"<date>{_YEAR_ZERO_XML}</date>".encode())
+        path = self.prefs_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    # -- Books' per-book info caches ------------------------------------------
+
+    # add_book_info_cache row keys -> ZAEBOOKINFO columns.
+    BOOK_INFO_COLUMNS = {"asset_id": "ZDATABASEKEY", "title": "ZBOOKTITLE", "author": "ZBOOKAUTHOR",
+                         "language": "ZBOOKLANGUAGE", "publisher": "ZPUBLISHERNAME",
+                         "year": "ZPUBLISHERYEAR", "deleted": "ZDELETEDFLAG"}
+    _JOURNAL_MODES = frozenset({"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"})
+
+    def _book_info_sql(self) -> pathlib.Path:
+        """This schema's ``AEBookInfo.sql``, else the newest fixture's."""
+        for name in [self.schema, *reversed(available_schemas())]:
+            path = SCHEMAS_DIR / name / "AEBookInfo.sql"
+            if path.is_file():
+                return path
+        raise FileNotFoundError(f"no schema fixture under {SCHEMAS_DIR} has AEBookInfo.sql")
+
+    def add_book_info_cache(self, rows: Iterable[Mapping[str, Any]], *, version: str = "v20250715-26.7",
+                            columns: Optional[Sequence[str]] = None,
+                            journal_mode: str = "WAL") -> pathlib.Path:
+        """Write a Books per-book info cache and return its path,
+        ``book_info_dir / f'AEBookInfo-{version}.sqlite'``.
+
+        Books keeps what it parsed from each book (title, author,
+        language, publisher...) in these caches, keyed by the book's asset
+        id, and keeps rows for books since removed from the library. The
+        ``ZAEBOOKINFO`` table and its indexes come from the schema
+        fixture's ``AEBookInfo.sql`` (the newest fixture that has one if
+        this library's doesn't).
+
+        Each row is a mapping with optional keys ``asset_id``
+        (``ZDATABASEKEY``), ``title``, ``author``, ``language``,
+        ``publisher``, ``year`` (``ZPUBLISHERYEAR``, a text column) and
+        ``deleted`` (``ZDELETEDFLAG``, default 0), plus ``raw`` (column ->
+        value, verbatim, applied last). Values are written as given. Rows
+        get ``Z_PK`` 1, 2, ... in order, so later rows are newer.
+
+        ``columns`` keeps only the named columns (and ``Z_PK``) and the
+        indexes on them, to simulate drift; values for dropped columns
+        are ignored. ``journal_mode='WAL'`` (what Books uses) leaves the
+        file closed cleanly, with no ``-wal`` or ``-shm``, like a cache
+        Books isn't using; any other SQLite journal mode works too.
+
+        Raises ValueError for an unknown row key, column name or journal
+        mode, and FileExistsError if the file exists (a test changes an
+        existing cache with ``sqlite3`` directly).
+        """
+        if not isinstance(version, str) or not version or "/" in version or "\x00" in version:
+            raise ValueError("version must be a non-empty file-name part")
+        mode = str(journal_mode).upper()
+        if mode not in self._JOURNAL_MODES:
+            raise ValueError(f"journal_mode must be one of {sorted(self._JOURNAL_MODES)}, not {journal_mode!r}")
+        ddl = self._book_info_sql().read_text(encoding="utf-8")
+        schema = sqlite3.connect(":memory:")
+        try:
+            schema.executescript(ddl)
+            table = [(r[1], r[2], r[5]) for r in schema.execute("PRAGMA table_info(ZAEBOOKINFO)")]
+            names = [name for name, _, _ in table]
+            indexes = [(name, sql, [r[2] for r in schema.execute(f'PRAGMA index_info("{name}")')])
+                       for name, sql in schema.execute(
+                           "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
+                           "AND tbl_name = 'ZAEBOOKINFO' AND sql IS NOT NULL ORDER BY rowid")]
+        finally:
+            schema.close()
+        if columns is not None:
+            if isinstance(columns, str):
+                raise ValueError("columns must be a sequence of column names, not a str")
+            unknown = sorted(set(columns) - set(names))
+            if unknown:
+                raise ValueError(f"no such ZAEBOOKINFO columns: {unknown}")
+            keep = {"Z_PK", *columns}
+            defs = ", ".join(f"{name} {kind}{' PRIMARY KEY' if pk else ''}".rstrip()
+                             for name, kind, pk in table if name in keep)
+            ddl = f"CREATE TABLE ZAEBOOKINFO ( {defs} );\n" + "".join(
+                f"{sql};\n" for _, sql, cols in indexes if set(cols) <= keep)
+            names = [name for name in names if name in keep]
+
+        prepared = []
+        for i, row in enumerate(rows):
+            unknown = sorted(set(row) - set(self.BOOK_INFO_COLUMNS) - {"raw"})
+            if unknown:
+                raise ValueError(f"rows[{i}]: unknown keys {unknown}")
+            raw = dict(row.get("raw") or {})
+            bad = sorted(set(raw) - {name for name, _, _ in table})
+            if bad:
+                raise ValueError(f"rows[{i}]: no such ZAEBOOKINFO columns: {bad}")
+            values = {"Z_PK": i + 1, "Z_ENT": 1, "Z_OPT": 1, "ZDELETEDFLAG": 0}
+            values.update({self.BOOK_INFO_COLUMNS[k]: v for k, v in row.items() if k != "raw"})
+            values.update(raw)
+            prepared.append({k: v for k, v in values.items() if k in names})
+
+        folder = self.book_info_dir
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"AEBookInfo-{version}.sqlite"
+        if path.exists():
+            raise FileExistsError(f"{path.name} already exists")
+        con = sqlite3.connect(path, isolation_level=None)
+        try:
+            con.execute(f"PRAGMA journal_mode={mode}")
+            con.executescript(ddl)
+            con.execute("BEGIN")
+            for values in prepared:
+                cols = list(values)
+                con.execute(f"INSERT INTO ZAEBOOKINFO ({', '.join(cols)}) "
+                            f"VALUES ({', '.join('?' for _ in cols)})", [values[c] for c in cols])
+            con.execute("COMMIT")
+        finally:
+            con.close()
+        return path
 
     # -- bulk -------------------------------------------------------------
 

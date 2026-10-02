@@ -10,6 +10,9 @@ bookkeeping, no library rows) and fills them with synthetic rows::
     book = lib.add_book("Synthetic Book", progress=0.4)
     lib.add_annotation(book, "a synthetic highlight")
 
+``FixtureLibrary`` also writes Books' preferences plist and per-book
+info caches beside the stores.
+
 ``python -m py_apple_books.testing.dump_schema`` produces a new schema
 fixture from a real library (see its ``--help``).
 
@@ -28,10 +31,12 @@ from .fixture import (
     STORE_SERIES,
     SYSTEM_COLLECTIONS,
     UBIQUITY,
+    YEAR_ZERO,
     FixtureLibrary,
     available_schemas,
     build_store,
     core_data_time,
+    page_location_blob,
 )
 
 __all__ = [
@@ -41,10 +46,12 @@ __all__ = [
     "STORE_SERIES",
     "SYSTEM_COLLECTIONS",
     "UBIQUITY",
+    "YEAR_ZERO",
     "FixtureLibrary",
     "available_schemas",
     "build_store",
     "core_data_time",
+    "page_location_blob",
     "seed_demo",
     "write_epub",
 ]
