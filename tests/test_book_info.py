@@ -522,6 +522,36 @@ def test_immutable_recheck_sees_a_sidecar_appear(home, reader, monkeypatch):
     assert reader.get_cached_book_info("K") == {}
 
 
+def test_books_closing_a_wal_cache_during_the_read(home, reader, monkeypatch, caplog):
+    # The open rule saw the -wal and -shm of a cache Books has open; Books
+    # closes it (removing both) before the read starts, so the read-only
+    # open creates them again. That read is dropped and logged, the files
+    # are left (by then they may be Books' own), and the next call reads
+    # the cache.
+    folder = home.book_info_dir
+    path = folder / cases.CACHE_NAME
+    books = cases.create(path, "WAL")
+    books.execute("PRAGMA wal_autocheckpoint=0")
+    key = f"{cases.SECRET}ZDATABASEKEY-1"
+    real_connect = book_info._connect
+
+    def connect(uri, busy):
+        if books is not None:
+            books.close()  # checkpoints and removes -wal and -shm
+            assert cases.sidecars(path) == []
+        return real_connect(uri, busy)
+
+    monkeypatch.setattr(book_info, "_connect", connect)
+    with caplog.at_level(logging.DEBUG, logger="py_apple_books"):
+        assert reader.get_cached_book_info(key) == {}
+    assert cases.sidecars(path) == [f"{cases.CACHE_NAME}-shm", f"{cases.CACHE_NAME}-wal"]
+    assert [r.getMessage() for r in caplog.records] == [
+        f"AEBookInfo cache {cases.CACHE_NAME} skipped: SidecarsChanged"]
+    assert cases.CACHE_NAME not in index_of(reader)._memos  # nothing remembered
+    books = None
+    assert reader.get_cached_book_info(key)[key].title == f"{cases.SECRET}ZBOOKTITLE-1"
+
+
 # -- per-id queries and the memo -------------------------------------------------
 
 

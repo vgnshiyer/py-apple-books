@@ -225,6 +225,12 @@ class _Changed(Exception):
     """An immutable read saw the file change (message-free, private)."""
 
 
+class _SidecarsChanged(_Changed):
+    """A read-only read saw the file's ``-wal`` or ``-shm`` removed,
+    replaced or created: Books closed or reopened the cache meanwhile,
+    and SQLite may have created them anew (message-free, private)."""
+
+
 def _lstat_or_none(path: str) -> Optional[os.stat_result]:
     """``lstat``, or None when nothing is there; other errors raise."""
     try:
@@ -256,6 +262,11 @@ def _files_signature(path: str) -> tuple:
     return tuple(_identity(_lstat_or_none(path + side)) for side in ("", "-wal", "-shm", "-journal"))
 
 
+def _sidecar_ids(files_signature: tuple) -> tuple:
+    """``(st_dev, st_ino)`` of ``-wal`` and ``-shm`` in a :func:`_files_signature`."""
+    return tuple(None if s is None else s[:2] for s in files_signature[1:3])
+
+
 def _check_journal(path: str) -> None:
     # A mode=ro open checks for a hot rollback journal in every journal
     # mode: it opens a -journal that is there and reads its first byte.
@@ -272,7 +283,12 @@ def _open_mode(path: str) -> str:
     (the cases in ``tests/_bookinfo_cases.py`` pin both), chosen from the
     file's 100-byte header (read with ``O_NOFOLLOW``) and its sidecars so
     that a read never writes the cache, its journal or its WAL, never
-    waits on Books beyond SQLite's own read locks, and creates no file:
+    waits on Books beyond SQLite's own read locks, and creates no file.
+    One race aside: if Books closes a WAL cache (removing its ``-wal`` and
+    ``-shm``) after this check and before the read, the read-only open
+    creates them again, an empty ``-wal`` and a ``-shm`` that SQLite
+    ignores or rebuilds; :func:`_read_cache` detects it and drops that
+    read, and leaves the files (they may be Books' own by then). The rule:
 
     - rollback journal: ``mode=ro``, which takes SQLite's shared lock and
       refuses a hot journal. A ``-journal`` must be a local regular file;
@@ -401,12 +417,39 @@ def _read_cache(path: str, ids: Sequence[str], deadline: float) -> Dict[str, Opt
     """``{id: row or None}`` for ``ids`` from the cache file ``path``.
 
     Raises :class:`_Refused` (open rule), :class:`_Drifted` (no usable
-    table), :class:`_Changed` (an immutable read saw the file change),
-    ``sqlite3.Error`` (locked, interrupted at ``deadline``, unreadable) or
-    ``OSError``.
+    table), :class:`_Changed` (an immutable read saw the file change;
+    :class:`_SidecarsChanged`, a read-only one saw its ``-wal`` or
+    ``-shm`` come or go), ``sqlite3.Error`` (locked, interrupted at
+    ``deadline``, unreadable) or ``OSError``.
     """
     mode = _open_mode(path)
-    before = _files_signature(path) if mode == _WAL_IMMUTABLE else None
+    before = _files_signature(path)
+    try:
+        found = _query(path, mode, ids, deadline)
+    except (sqlite3.Error, _Drifted):
+        _check_unchanged(path, mode, before)
+        raise
+    _check_unchanged(path, mode, before)
+    return {i: found.get(i) for i in ids}
+
+
+def _check_unchanged(path: str, mode: str, before: tuple) -> None:
+    """Raise if the files changed during a read (``before``: their
+    :func:`_files_signature` when it started)."""
+    after = _files_signature(path)
+    if mode == _WAL_IMMUTABLE:
+        # An immutable read is not protected by any lock: if Books wrote
+        # the file meanwhile, the rows may be torn.
+        if after != before:
+            raise _Changed
+    elif _sidecar_ids(after) != _sidecar_ids(before):
+        # A read-only read is one consistent snapshot, but this one may
+        # have created the -wal and -shm it found gone.
+        raise _SidecarsChanged
+
+
+def _query(path: str, mode: str, ids: Sequence[str], deadline: float) -> Dict[str, _Row]:
+    """The rows of ``ids`` from the cache file ``path`` opened in ``mode``."""
     uri = f"file:{quote(path)}?mode=ro" + ("&immutable=1" if mode == _WAL_IMMUTABLE else "")
     con = _connect(uri, max(0.0, min(_BUSY_WAIT, deadline - time.monotonic())))
     try:
@@ -424,12 +467,7 @@ def _read_cache(path: str, ids: Sequence[str], deadline: float) -> Dict[str, Opt
         con.execute("COMMIT")
     finally:
         con.close()
-    # A read-only (not immutable) read is one consistent snapshot. An
-    # immutable one is not protected by any lock: if Books wrote the file
-    # meanwhile, the rows may be torn.
-    if before is not None and _files_signature(path) != before:
-        raise _Changed
-    return {i: found.get(i) for i in ids}
+    return found
 
 
 # -- the per-library index ---------------------------------------------------------
