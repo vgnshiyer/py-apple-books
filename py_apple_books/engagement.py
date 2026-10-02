@@ -2,9 +2,10 @@
 highlighted words (1.11).
 
 The :class:`~py_apple_books.PyAppleBooks` methods built on this module
-read the library and annotation databases only: no book file is opened.
-This module holds what they share, starting with the date rules of the
-1.11 methods.
+(``get_underlines``, ``sample_highlights``,
+``get_highlights_on_this_day``) read the library and annotation
+databases only: no book file is opened. This module holds what they
+share: the date rules of the 1.11 methods and the sampling algorithm.
 
 Dates in new methods (1.11):
 
@@ -21,16 +22,33 @@ Dates in new methods (1.11):
   that instant. Its time of day is never used.
 
 "Local" is this Mac's time zone, as for every date the library returns.
+
+:data:`SAMPLE_ALGORITHM` names the algorithm
+:meth:`~py_apple_books.PyAppleBooks.sample_highlights` ranks with. The
+same candidates, day and seed give the same order on every platform and
+Python version; a new algorithm gets a new name.
 """
 
+import hashlib
 import math
 from datetime import date, datetime, timedelta
-from typing import Dict, Optional, Tuple
+from typing import Dict, Hashable, Iterable, List, Optional, Sequence, Tuple
 
 from py_apple_books.exceptions import InvalidArgumentError
 from py_apple_books.utils import APPLE_EPOCH_OFFSET
 
-__all__: list = []
+__all__ = ["SAMPLE_ALGORITHM"]
+
+#: The ranking algorithm of :meth:`PyAppleBooks.sample_highlights`.
+#: Each candidate gets a key from a keyed BLAKE2b hash of the day, the
+#: seed and the highlight's uuid (``pk:<id>`` without one), and a
+#: highlight with a note counts twice (weighted Efraimidis-Spirakis
+#: sampling, compared in exact integers). Without ``book_id`` the picks
+#: then go round-robin across books. Changing any of this needs a new
+#: name.
+SAMPLE_ALGORITHM = "pab-sample-v1"
+
+_SAMPLE_PERSON = SAMPLE_ALGORITHM.encode("ascii")
 
 
 # -- dates (R9) ---------------------------------------------------------------
@@ -131,3 +149,52 @@ def _window_filters(field: str, after, before, *,
     if hi is not None:
         filters[f"{field}__lte" if hi_inclusive else f"{field}__lt"] = hi
     return filters
+
+
+# -- sampling (pab-sample-v1) -------------------------------------------------
+
+
+def _sample_ident(uuid, pk) -> str:
+    """What a highlight is hashed by: its uuid in upper case, else
+    ``pk:<id>``."""
+    if isinstance(uuid, (bytes, bytearray)):
+        uuid = bytes(uuid).decode("utf-8", "replace")
+    if uuid is not None and not isinstance(uuid, str):
+        uuid = str(uuid)
+    return uuid.upper() if uuid else f"pk:{pk}"
+
+
+def _sample_key(day: date, seed: Optional[str], ident: str, noted: bool) -> int:
+    """The ``pab-sample-v1`` key of one highlight; larger ranks first.
+
+    ``H`` is the 64-bit BLAKE2b digest (personalised with the algorithm
+    name) of ``'<day ISO>\\x1f<seed>\\x1f<ident>'`` (``ident`` from
+    :func:`_sample_ident`) and
+    ``h = (H >> 11) | 1``, so ``u = h / 2**53`` lies strictly inside
+    (0, 1). The weighted key ``u ** (1 / w)`` (w = 2 for a highlight with
+    a note, else 1) is compared squared, in integers: ``h << 53`` for a
+    note, ``h * h`` otherwise.
+    """
+    data = f"{day.isoformat()}\x1f{seed or ''}\x1f{ident}".encode("utf-8", "surrogatepass")
+    digest = hashlib.blake2b(data, digest_size=8, person=_SAMPLE_PERSON).digest()
+    h = (int.from_bytes(digest, "big") >> 11) | 1
+    return h << 53 if noted else h * h
+
+
+def _rank(candidates: Iterable[Tuple[int, int, Hashable]]) -> List[Tuple[int, int, Hashable]]:
+    """``(key, id, asset)`` candidates by key, largest first, ties by id."""
+    return sorted(candidates, key=lambda c: (-c[0], c[1]))
+
+
+def _round_robin(ranked: Sequence[Tuple[int, int, Hashable]]) -> List[Tuple[int, int, Hashable]]:
+    """``ranked`` (from :func:`_rank`) in rounds: each round takes every
+    asset's next-best candidate, the round ordered by key (ties by id).
+    Each distinct asset value (None included) is one group."""
+    nth: Dict[Hashable, int] = {}
+    rounds = []
+    for key, pk, asset in ranked:
+        n = nth.get(asset, 0)
+        nth[asset] = n + 1
+        rounds.append((n, -key, pk, (key, pk, asset)))
+    rounds.sort(key=lambda r: r[:3])
+    return [r[3] for r in rounds]

@@ -1,5 +1,5 @@
-"""The :class:`~py_apple_books.PyAppleBooks` mixin for engagement: underlines and
-highlights made on this day in earlier years (1.11).
+"""The :class:`~py_apple_books.PyAppleBooks` mixin for engagement: underlines, highlight
+sampling and highlights made on this day in earlier years (1.11).
 
 Every method here reads the library and annotation databases only (no
 book file, no iCloud folder, no subprocess). Dates follow the rules in
@@ -9,15 +9,36 @@ rules (``_common.strict_limit``/``strict_offset``).
 See ``py_apple_books._api`` for the rules mixin code follows.
 """
 
+import operator
+from typing import FrozenSet, Iterable, List, Optional
+
 from py_apple_books import engagement as _eng
-from py_apple_books._api._common import _annotation_scope, strict_limit, strict_offset
-from py_apple_books.db.clause import Subquery, Where
+from py_apple_books._api._common import _annotation_scope, _book_arg, strict_limit, strict_offset
+from py_apple_books.db.clause import Q, Subquery, Where
+from py_apple_books.db.client import ANNOTATIONS_NOT_FOUND, current_library
+from py_apple_books.exceptions import AnnotationStoreNotFoundError, InvalidArgumentError
 from py_apple_books.models.annotation import Annotation, AnnotationType
 from py_apple_books.models.book import Book
 from py_apple_books.models.manager import ModelIterable
+from py_apple_books.text import _coerce_text, is_short_selection
 from py_apple_books.utils import APPLE_EPOCH_OFFSET
 
 _HIGHLIGHT = int(AnnotationType.HIGHLIGHT)
+
+# Picks fetched by id in one statement at most; more are found by reading
+# the candidate scope again (an IN list this long would near SQLite's
+# parameter limit on older versions).
+_FETCH_BY_ID_MAX = 500
+
+# The columns sample_highlights ranks from (one narrow query).
+_SAMPLE_FIELDS = ("id", "uuid", "asset_id", "type", "note", "selected_text", "creation_date")
+
+
+def _require_annotation_store() -> None:
+    """Raise :class:`AnnotationStoreNotFoundError`, as the annotation
+    lists do, when the library has no annotation store."""
+    if not current_library().has_annotations():
+        raise AnnotationStoreNotFoundError(ANNOTATIONS_NOT_FOUND)
 
 
 def _in_library() -> Subquery:
@@ -33,6 +54,55 @@ def _underline_filter() -> dict:
     if Annotation.manager.has_fields("is_underline"):
         return {"is_underline": 1}
     return {"style": 0}
+
+
+def _asset_of(api, book_id) -> Optional[str]:
+    """The asset id of the book ``book_id`` names (R7); '' for a book
+    without one, which has no annotations."""
+    book = _book_arg(book_id, needs=("asset_id",), get_book=api.get_book_by_id)
+    return book.asset_id or ""
+
+
+def _iterable(name: str, value) -> list:
+    """``value`` as a list of items, for an ``exclude_*`` argument: any
+    iterable but a string."""
+    if isinstance(value, (str, bytes, bytearray)):
+        raise InvalidArgumentError(f"{name} must be an iterable of items, not a single {type(value).__name__}.")
+    try:
+        return list(value)
+    except TypeError:
+        raise InvalidArgumentError(f"{name} must be an iterable, not {type(value).__name__}.") from None
+
+
+def _excluded_ids(values) -> FrozenSet[int]:
+    """``exclude_ids`` as ints: ints (not bools) and strings of one."""
+    ids = set()
+    for item in _iterable("exclude_ids", values):
+        if isinstance(item, bool):
+            raise InvalidArgumentError("exclude_ids items must be annotation ids, not bool.")
+        if isinstance(item, str):
+            try:
+                ids.add(int(item))
+                continue
+            except ValueError:
+                raise InvalidArgumentError("exclude_ids items must be annotation ids (ints or "
+                                           "strings of digits).") from None
+        try:
+            ids.add(operator.index(item))
+        except TypeError:
+            raise InvalidArgumentError(f"exclude_ids items must be annotation ids, "
+                                       f"not {type(item).__name__}.") from None
+    return frozenset(ids)
+
+
+def _excluded_uuids(values) -> FrozenSet[str]:
+    """``exclude_uuids`` in upper case (uuids compare case-insensitively)."""
+    uuids = set()
+    for item in _iterable("exclude_uuids", values):
+        if not isinstance(item, str):
+            raise InvalidArgumentError(f"exclude_uuids items must be strings, not {type(item).__name__}.")
+        uuids.add(item.upper())
+    return frozenset(uuids)
 
 
 class _EngagementAPI:
@@ -100,3 +170,108 @@ class _EngagementAPI:
                          f"{day.month:02d}-{day.day:02d}")
         return Annotation.manager.filter(**filters, where=same_day,
                                          limit=limit, order_by=order_by, offset=offset)
+
+    def sample_highlights(self, limit: Optional[int] = 5, *, offset: Optional[int] = None, on=None,
+                          seed: Optional[str] = None, book_id=None, after=None, before=None,
+                          exclude_ids: Iterable = (), exclude_uuids: Iterable[str] = (),
+                          exclude_short: bool = True, include_orphans: bool = False) -> ModelIterable:
+        """A varied, repeatable sample of your highlights for one day
+        (1.11): the same day and ``seed`` give the same picks, and a new
+        day gives new ones. Resurfacing, not spaced repetition: nothing
+        is stored, so pass what you've already shown in ``exclude_ids``
+        or ``exclude_uuids``.
+
+        Candidates are live highlights and notes (type 2) with text,
+        made before the end of ``on``'s day (default today; rows without
+        a creation date count), and inside ``after``/``before`` if given
+        (:mod:`py_apple_books.engagement` has the date rules). Left out:
+        highlights of books no longer in the library unless
+        ``include_orphans``; words and short phrases
+        (:attr:`Annotation.is_short_selection`) unless ``exclude_short``
+        is False; ``exclude_ids`` (ints or strings of digits) and
+        ``exclude_uuids`` (any case).
+
+        They are ranked by :data:`py_apple_books.engagement.SAMPLE_ALGORITHM`
+        (a highlight with a note counts twice) and, without ``book_id``,
+        taken round-robin across books, so the first picks come from
+        different books. ``offset`` and ``limit`` (default 5; None for
+        every candidate, which reads the whole library) slice that order.
+
+        Returns a :class:`ModelIterable` in sample order: ``count()``,
+        slices and ``count_by()`` work on the picks, and their books load
+        in one query.
+
+        :param book_id: only this book's highlights: an id or a
+            :class:`Book`.
+        :raises InvalidArgumentError: a bad ``limit``, ``offset``, ``on``,
+            ``after``, ``before`` or exclusion, or a ``seed`` that isn't a
+            string.
+        :raises BookNotFoundError: no book has id ``book_id``.
+        """
+        limit, offset = strict_limit(limit), strict_offset(offset)
+        day = _eng._local_day(on)
+        if seed is not None and not isinstance(seed, str):
+            raise InvalidArgumentError(f"seed must be a string or None, not {type(seed).__name__}.")
+        window = _eng._window_filters("creation_date", after, before)
+        skip_ids = _excluded_ids(exclude_ids)
+        skip_uuids = _excluded_uuids(exclude_uuids)
+        asset = None if book_id is None else _asset_of(self, book_id)
+
+        _require_annotation_store()
+        if asset == "" or not Annotation.manager.has_fields("selected_text"):
+            # No text to sample (documented): an empty result.
+            return ModelIterable(lambda: [], Annotation)
+
+        filters = {"type": _HIGHLIGHT, "is_deleted__isnot": 1, "selected_text__isnull": False, **window}
+        if asset is not None:
+            filters["asset_id"] = asset
+        if not include_orphans:
+            filters["asset_id__in"] = _in_library()
+        where = None
+        if Annotation.manager.has_fields("creation_date"):
+            # Made before the end of the day; rows without a date count.
+            where = Q(creation_date__lt=_eng._day_end(day)) | Q(creation_date__isnull=True)
+
+        keys = list(Annotation._get_mappings("Annotation"))
+        i_id, i_uuid, i_asset, i_note, i_text = (keys.index(k) for k in (
+            "id", "uuid", "asset_id", "note", "selected_text"))
+        candidates = []
+        for row in Annotation.manager.filter(**filters, where=where, only=list(_SAMPLE_FIELDS)).run_query():
+            text = _coerce_text(row[i_text])
+            if not text or not text.strip():
+                continue
+            pk = row[i_id]
+            if pk in skip_ids:
+                continue
+            ident = _eng._sample_ident(row[i_uuid], pk)
+            if skip_uuids and ident in skip_uuids:
+                continue
+            if exclude_short and is_short_selection(text):
+                continue
+            note = _coerce_text(row[i_note])
+            candidates.append((_eng._sample_key(day, seed, ident, bool(note and note.strip())),
+                               pk, row[i_asset]))
+
+        ranked = _eng._rank(candidates)
+        if asset is None:
+            ranked = _eng._round_robin(ranked)
+        start = offset or 0
+        picked = ranked[start:] if limit is None else ranked[start:start + limit]
+        rows = _full_rows([pk for _, pk, _ in picked], filters, where)
+        # Rows are read here, in the instance's library, which the
+        # iterable (and the picks' relations) then read too.
+        return ModelIterable(lambda: rows, Annotation)
+
+
+def _full_rows(ids: List[int], filters: dict, where) -> list:
+    """Every column of the annotations ``ids``, in that order. A row
+    gone since the candidates were read is left out."""
+    if not ids:
+        return []
+    if len(ids) <= _FETCH_BY_ID_MAX:
+        found = Annotation.manager.filter(id__in=ids).run_query()
+    else:
+        found = Annotation.manager.filter(**filters, where=where).run_query()
+    i_id = list(Annotation._get_mappings("Annotation")).index("id")
+    by_id = {row[i_id]: row for row in found}
+    return [by_id[pk] for pk in ids if pk in by_id]
