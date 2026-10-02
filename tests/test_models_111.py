@@ -166,8 +166,8 @@ class TestTolerantModelDates:
         assert books["Good Book"].last_opened_date == apple_timestamp_to_datetime(700000000.0)
         assert {b.title for b in api.get_books_in_progress()} == {"Good Book", "Bad Book"}
         if not isinstance(raw, str) or raw in ("NaN", "Infinity"):
-            # Text float() can't read fails get_recently_read_books' own
-            # sort (api.py, raw seconds), not the model; see changes/1.5.
+            # Text float() can't read still fails get_recently_read_books:
+            # api.py sorts the raw seconds itself, outside the models.
             assert {b.title for b in api.get_recently_read_books(limit=10)} >= {"Good Book"}
         annotations = {a.selected_text: a for a in api.list_annotations()}
         assert set(annotations) == {"a good highlight", "a bad highlight"}
@@ -437,3 +437,209 @@ class TestStoreInfo:
         finally:
             api.close()
 
+
+
+# ---------------------------------------------------------------------------
+# Annotation: page location and fractions (F17), short selections (F23)
+# ---------------------------------------------------------------------------
+
+ANNOTATION_FIELDS_111 = {
+    "location_data": "ZPLUSERDATA",
+    "position_fraction": "ZFUTUREPROOFING10",
+    "furthest_fraction": "ZFUTUREPROOFING8",
+}
+BOOKMARK, HIGHLIGHT, POSITION = 1, 2, 3
+
+
+def page_blob(page_offset: int, ordinal: int = 0) -> bytes:
+    """A ZPLUSERDATA blob in the shape Books writes."""
+    return plistlib.dumps({"class": "BKPageLocation", "pageOffset": page_offset,
+                           "super": {"class": "BKLocation", "ordinal": ordinal}},
+                          fmt=plistlib.FMT_BINARY)
+
+
+class TestAnnotationFieldConversions:
+    def test_mapping(self):
+        mapping = Annotation._get_mappings("Annotation")
+        keys = list(mapping)
+        assert keys[keys.index("position") + 1:] == list(ANNOTATION_FIELDS_111)
+        assert {f: mapping[f] for f in ANNOTATION_FIELDS_111} == ANNOTATION_FIELDS_111
+
+    def test_fields_are_last_and_defaulted(self):
+        fields = dataclasses.fields(Annotation)
+        assert [f.name for f in fields][-3:] == list(ANNOTATION_FIELDS_111)
+        assert all(f.default is None for f in fields[-3:])
+        assert [f.repr for f in fields][-3:] == [False, True, True]
+
+    @pytest.mark.parametrize("raw, expected", [
+        ("0.4375", 0.4375), ("0", 0.0), ("1", 1.0), ("1.0", 1.0), (".25", 0.25),
+        (0.25, 0.25), (1, 1.0), (0, 0.0), ("1.0000001", 1.0), (1 + 1e-6, 1.0), ("-0", 0.0),
+        (None, None), ("", None), (" ", None), ("abc", None), ("nan", None), ("inf", None),
+        ("-0.1", None), (-1e-9, None), ("1.000002", None), (2, None), (True, None), (b"0.5", None),
+    ], ids=repr)
+    @pytest.mark.parametrize("kind", [BOOKMARK, POSITION])
+    def test_fractions(self, kind, raw, expected):
+        annotation = Annotation.from_db(annotation_row(
+            type=kind, position_fraction=raw, furthest_fraction=raw))
+        for value in (annotation.position_fraction, annotation.furthest_fraction):
+            assert value == expected and type(value) is type(expected)
+
+    @pytest.mark.parametrize("kind", [0, HIGHLIGHT, None, 4])
+    def test_fractions_only_on_bookmark_rows(self, kind):
+        """Types 1 and 3 only: other rows don't use the columns, so a
+        value there is not a position."""
+        blob = page_blob(211)
+        annotation = Annotation.from_db(annotation_row(
+            type=kind, position_fraction="0.5", furthest_fraction="0.6", location_data=blob))
+        assert (annotation.position_fraction, annotation.furthest_fraction) == (None, None)
+        assert annotation.page_location is None
+        assert annotation.location_data == blob
+
+    def test_location_data_is_kept_raw(self):
+        for raw in (b"", b"garbage", page_blob(12), "text", None):
+            assert Annotation.from_db(annotation_row(type=POSITION, location_data=raw)).location_data == raw
+
+    def test_repr(self):
+        annotation = Annotation.from_db(annotation_row(
+            type=POSITION, location_data=page_blob(211), position_fraction="0.5", furthest_fraction="0.75"))
+        text = repr(annotation)
+        assert "location_data" not in text and "bplist" not in text
+        assert text.endswith("position_fraction=0.5, furthest_fraction=0.75)")
+
+    def test_round_trip(self):
+        annotation = Annotation.from_db(annotation_row(
+            type=POSITION, location_data=page_blob(211), position_fraction="0.5",
+            furthest_fraction="1.0000001", creation_date=1.0, modification_date=2.0))
+        fields = {f.name: getattr(annotation, f.name) for f in dataclasses.fields(Annotation)}
+        clone = Annotation(**fields)
+        assert clone == annotation and clone.page_location == annotation.page_location
+        assert (clone.position_fraction, clone.furthest_fraction) == (0.5, 1.0)
+
+
+class TestPageLocationProperty:
+    @pytest.mark.parametrize("kind", [BOOKMARK, POSITION])
+    def test_decoded(self, kind):
+        annotation = Annotation.from_db(annotation_row(type=kind, location_data=page_blob(211)))
+        assert annotation.page_location == PageLocation(ordinal=0, page_offset=211)
+        assert annotation.page_location.page == 212
+
+    def test_epub_bookmark_ordinal(self):
+        annotation = Annotation.from_db(annotation_row(type=POSITION, location_data=page_blob(0, 9)))
+        assert annotation.page_location == PageLocation(ordinal=9, page_offset=0)
+
+    @pytest.mark.parametrize("raw", [None, b"", b"garbage", "text", 5, page_blob(-1)], ids=repr)
+    def test_none(self, raw):
+        assert Annotation.from_db(annotation_row(type=POSITION, location_data=raw)).page_location is None
+
+    def test_lazy_and_cached(self, monkeypatch):
+        calls = []
+        original = PageLocation.from_plist.__func__
+
+        def counting(cls, data):
+            calls.append(data)
+            return original(cls, data)
+
+        monkeypatch.setattr(PageLocation, "from_plist", classmethod(counting))
+        annotation = Annotation.from_db(annotation_row(type=POSITION, location_data=page_blob(3)))
+        assert calls == []
+        first = annotation.page_location
+        assert annotation.page_location is first and len(calls) == 1
+        # Not a field: equality and the pickled state are unchanged.
+        assert annotation == Annotation.from_db(annotation_row(type=POSITION, location_data=page_blob(3)))
+        clone = pickle.loads(pickle.dumps(annotation))
+        assert clone == annotation and clone.page_location == first
+        assert not [key for key in annotation.__getstate__() if "page_location" in key]
+
+    def test_cache_follows_the_data(self):
+        annotation = Annotation.from_db(annotation_row(type=POSITION, location_data=page_blob(3)))
+        assert annotation.page_location.page_offset == 3
+        annotation.location_data = page_blob(9)
+        assert annotation.page_location.page_offset == 9
+        annotation.type = HIGHLIGHT
+        assert annotation.page_location is None
+
+    def test_not_a_field(self):
+        names = {f.name for f in dataclasses.fields(Annotation)}
+        assert not {"page_location", "is_short_selection"} & names
+
+
+class TestIsShortSelection:
+    @pytest.mark.parametrize("text, expected", [
+        ("Ephemeral,", True), ("in medias res", True), ("“ubiquitous.”", True),
+        ("A whole sentence that is clearly a passage rather than a word.", False),
+        ("1984", False), ("a", False), (None, False), ("", False),
+    ], ids=repr)
+    def test_highlights(self, text, expected):
+        annotation = Annotation.from_db(annotation_row(type=HIGHLIGHT, selected_text=text))
+        assert annotation.is_short_selection is expected
+        assert expected == text_module.is_short_selection(text)
+
+    @pytest.mark.parametrize("kind", [BOOKMARK, POSITION])
+    def test_bookmark_rows_are_never_short(self, kind):
+        annotation = Annotation.from_db(annotation_row(type=kind, selected_text="Ephemeral"))
+        assert annotation.is_short_selection is False
+
+    def test_tombstone(self):
+        assert Annotation.from_db(annotation_row(type=0, selected_text=None)).is_short_selection is False
+
+    def test_seed_demo(self, api, library, tmp_path):
+        from py_apple_books.testing import seed_demo
+
+        seed_demo(library, tmp_path)
+        rows = list(Annotation.manager.all())
+        assert {a.type for a in rows} >= {POSITION, HIGHLIGHT}
+        assert all(a.is_short_selection is False for a in rows if a.type in (BOOKMARK, POSITION))
+        assert all(isinstance(a.is_short_selection, bool) for a in rows)
+
+
+class TestAnnotationFieldsFromTheLibrary:
+    def test_a_pdf_reading_position(self, api, library):
+        book = library.add_book("Paper", content_type=3, path="/nonexistent/Paper.pdf")
+        pk = library.add_annotation(book, None, kind="reading_position", raw={
+            "ZPLUSERDATA": page_blob(211), "ZFUTUREPROOFING10": "0.4375",
+            "ZFUTUREPROOFING8": "0.46875"})
+        annotation = api.get_annotation_by_id(pk)
+        assert annotation.page_location == PageLocation(0, 211) and annotation.page_location.page == 212
+        assert (annotation.position_fraction, annotation.furthest_fraction) == (0.4375, 0.46875)
+        assert api.get_book_by_id(book["id"]).is_pdf
+
+    def test_highlights_ignore_the_columns(self, api, library):
+        book = library.add_book()
+        pk = library.add_annotation(book, "text", raw={
+            "ZPLUSERDATA": page_blob(1), "ZFUTUREPROOFING10": "0.5", "ZFUTUREPROOFING8": "0.5"})
+        annotation = api.get_annotation_by_id(pk)
+        assert (annotation.position_fraction, annotation.furthest_fraction, annotation.page_location) == (
+            None, None, None)
+        assert annotation.location_data == page_blob(1)
+
+    def test_fractions_are_text_in_sql(self, library):
+        """Books stores them as text: SQL compares and sorts them as text."""
+        book = library.add_book()
+        for value in ("0.9", "0.10", "1"):
+            library.add_annotation(book, None, kind="reading_position", raw={"ZFUTUREPROOFING8": value})
+        rows = Annotation.manager.filter(type=POSITION, order_by="furthest_fraction")
+        assert [a.furthest_fraction for a in rows] == [0.1, 0.9, 1.0]
+        assert [a.furthest_fraction for a in Annotation.manager.filter(furthest_fraction__gt="0.5")] == [
+            0.9, 1.0]
+
+    def test_garbage_never_fails_a_list(self, api, library):
+        book = library.add_book()
+        library.add_annotation(book, "a highlight")
+        library.add_annotation(book, None, kind="reading_position", raw={
+            "ZPLUSERDATA": b"\xff" * 300, "ZFUTUREPROOFING10": "x", "ZFUTUREPROOFING8": b"\x00"})
+        library.add_annotation(book, None, kind="bookmark", raw={
+            "ZPLUSERDATA": b"bplist00" + b"\xff" * 40, "ZFUTUREPROOFING10": "NaN"})
+        assert [a.selected_text for a in api.list_annotations()] == ["a highlight", None]
+        rows = list(Annotation.manager.all())
+        assert all(a.page_location is None and a.position_fraction is None for a in rows)
+        assert api.get_current_reading_location(book["id"]) is not None
+
+    def test_store_info_lists_missing_columns(self, make_library):
+        lib = make_library()
+        for column in ANNOTATION_FIELDS_111.values():
+            lib.execute("annotations", f"ALTER TABLE ZAEANNOTATION RENAME COLUMN {column} TO {column}_GONE")
+        api = PyAppleBooks(data_dir=lib.data_dir)
+        try:
+            assert api.store_info().missing_columns["Annotation"] == list(ANNOTATION_FIELDS_111)
+        finally:
+            api.close()

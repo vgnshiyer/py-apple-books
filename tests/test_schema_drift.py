@@ -174,6 +174,9 @@ class TestOptionalColumn:
         ("ZBKLIBRARYASSET", "ZSERIESISORDERED", Book, "series_is_ordered"),
         ("ZBKLIBRARYASSET", "ZBOOKHIGHWATERMARKPROGRESS", Book, "high_water_progress"),
         ("ZAEANNOTATION", "ZFUTUREPROOFING5", Annotation, "chapter"),
+        ("ZAEANNOTATION", "ZPLUSERDATA", Annotation, "location_data"),
+        ("ZAEANNOTATION", "ZFUTUREPROOFING10", Annotation, "position_fraction"),
+        ("ZAEANNOTATION", "ZFUTUREPROOFING8", Annotation, "furthest_fraction"),
         ("ZBKCOLLECTION", "ZDETAILS", Collection, "details"),
     ])
     def test_reads_as_none_and_rejects_filters(self, drifted, table, column, model, field):
