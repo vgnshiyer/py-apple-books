@@ -12,7 +12,9 @@ Feature-agnostic safety utilities shared by any write path (today:
   a live WAL database misses un-checkpointed data and can itself be
   corrupt; the backup API is the documented-safe route. The current
   user's library backs up into :data:`BACKUP_DIR`, any other store into
-  a folder of its own under it.
+  a folder of its own under it. Backups and restores lock the backup
+  folder (threads and processes alike), so a burst of concurrent writes
+  shares one backup and never prunes another's restore point.
 * :func:`verify_backup` / :func:`restore_library` — restore a backup
   over the live database *through SQLite* (the backup API in reverse,
   never a file copy), after checking that the backup is intact, is a
@@ -34,18 +36,28 @@ Feature-agnostic safety utilities shared by any write path (today:
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import hashlib
 import logging
+import math
 import os
 import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Mapping, Optional
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - not on macOS or Linux
+    fcntl = None
+
+from py_apple_books.db import client as _client
 from py_apple_books.db.client import _store, default_data_dir
 from py_apple_books.db.metadata import (  # noqa: F401  (re-exported)
     StoreMetadata,
@@ -57,6 +69,7 @@ from py_apple_books.exceptions import (
     AppleBooksError,
     BackupValidationError,
     BooksAppRunningError,
+    LibraryBusyError,
     SchemaValidationError,
     WriteError,
 )
@@ -86,6 +99,18 @@ BACKUP_PART_STALE_AFTER = 600.0
 #: overwriting the library. Such a snapshot is never reused as a
 #: pre-write backup: it holds the state from *before* the restore.
 SNAPSHOT_SUFFIX = "-pre-restore"
+
+#: How long, in seconds, a backup or restore waits for another one
+#: working in the same backup folder (in this process or another) before
+#: giving up with :class:`LibraryBusyError`. Read at call time; an
+#: enclosing :func:`py_apple_books.db.query_deadline` that ends sooner
+#: shortens the wait.
+BACKUP_LOCK_TIMEOUT = 15.0
+
+_LOCK_BUSY_MESSAGE = (
+    "Another write is backing up or restoring this library; nothing was "
+    "changed. Try again in a moment."
+)
 
 # A backup of the store ``<stem>.sqlite`` is named
 # ``<stem>-<stamp>[<SNAPSHOT_SUFFIX>].sqlite``. Its series is matched on
@@ -162,6 +187,268 @@ def ensure_books_not_running() -> None:
             "in memory, so edits made while it runs may be overwritten or "
             "not appear until relaunch."
         )
+
+
+# ---------------------------------------------------------------------------
+# Backup folder lock
+# ---------------------------------------------------------------------------
+#
+# One lock per backup folder (by real path) for threads and processes
+# alike: a thread lock from the registry below, then an exclusive
+# flock(2) on the folder itself (a descriptor opened on the directory,
+# so no lock file is ever created). A flock belongs to the open file
+# description, which a forked child shares: if the child kept its copy,
+# the lock would outlive this process's release. So the fork hooks close
+# the child's copies (never LOCK_UN, which would release this process's
+# lock as well) and give the child a fresh registry. Where flock isn't
+# available (no fcntl, a folder that can't be opened, a file system
+# without flock) the thread lock alone serializes this process.
+#
+# The lock never takes an SQLite or LibraryDB lock.
+
+
+class _FolderLock:
+    """Registry entry for one backup folder: its thread lock and, while
+    a thread holds it, that thread and how deeply it nests the lock."""
+
+    __slots__ = ("lock", "owner", "depth")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.owner: Optional[int] = None
+        self.depth = 0
+
+
+# Guards the registry and the set of locked folder descriptors. Held
+# only for dict and set operations and around opening or closing a
+# folder's descriptor, so that "open, then record" is atomic for a fork
+# (the before-fork hook takes it).
+_registry_guard = threading.Lock()
+_registry: dict = {}
+_held_fds: set = set()
+# Bumped in a forked child: a hold taken before the fork releases
+# nothing there (its descriptor is already closed, its lock replaced).
+_generation = 0
+
+
+def _before_fork() -> None:
+    _registry_guard.acquire()
+
+
+def _after_fork_in_parent() -> None:
+    _registry_guard.release()
+
+
+def _after_fork_in_child() -> None:
+    global _registry_guard, _registry, _held_fds, _generation
+    held = _held_fds
+    _registry_guard = threading.Lock()
+    _registry = {}
+    _held_fds = set()
+    _generation += 1
+    for fd in held:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+# Registered once per module object: a reload re-runs this code in the
+# same namespace, and a second before-fork hook would wait on the lock
+# the first one took.
+if hasattr(os, "register_at_fork") and not globals().get("_fork_hooks_registered"):
+    os.register_at_fork(
+        before=_before_fork,
+        after_in_parent=_after_fork_in_parent,
+        after_in_child=_after_fork_in_child,
+    )
+    _fork_hooks_registered = True
+
+# Polling interval while another process holds a folder's flock: from
+# 20 ms, growing to 50 ms.
+_POLL_FIRST = 0.02
+_POLL_STEP = 0.01
+_POLL_MAX = 0.05
+
+
+def _errno_name(e: OSError) -> str:
+    return errno.errorcode.get(e.errno, str(e.errno))
+
+
+def _lock_deadline(timeout: Optional[float]) -> float:
+    """The ``time.monotonic()`` value a lock wait ends at: ``timeout``
+    seconds from now (None: :data:`BACKUP_LOCK_TIMEOUT`, read now; None
+    there too: no limit), or the end of the enclosing
+    :func:`~py_apple_books.db.query_deadline` if that is sooner."""
+    limit = BACKUP_LOCK_TIMEOUT if timeout is None else timeout
+    now = time.monotonic()
+    if limit is None:
+        at = math.inf
+    else:
+        limit = float(limit)
+        at = now + limit if limit > 0 else now  # negative or NaN: no wait
+    context = _client._deadline.get()
+    if context is not None and context[0] < at:
+        at = context[0]
+    return at
+
+
+def _acquire_thread_lock(lock: threading.Lock, deadline: float) -> bool:
+    """Take ``lock`` by ``deadline``; past it, one attempt without
+    waiting."""
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        return lock.acquire(timeout=min(remaining, threading.TIMEOUT_MAX))
+    return lock.acquire(blocking=False)
+
+
+def _close_folder_fd(fd: int, generation: int) -> None:
+    """Close (and so unlock) a folder descriptor this process recorded,
+    unless a fork has happened since (the child closed it already, and
+    the number may name another file by now)."""
+    with _registry_guard:
+        if generation != _generation or fd not in _held_fds:
+            return
+        _held_fds.discard(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _flock_folder(path: str, deadline: float, generation: int) -> Optional[int]:
+    """An exclusive flock on the folder ``path`` (a real path), polled
+    until ``deadline`` after at least one attempt: the locked
+    descriptor, or None where flock isn't available (the caller's
+    thread lock is then the only lock; the reason is logged at DEBUG).
+
+    :raises LibraryBusyError: another process held it past the deadline.
+    """
+    if fcntl is None:
+        logger.debug("Backup folder lock: no fcntl here; using a thread lock only.")
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    with _registry_guard:
+        try:
+            fd = os.open(path, flags)
+        except OSError as e:
+            logger.debug(
+                "Backup folder lock: can't open the folder (%s); using a thread lock only.",
+                _errno_name(e),
+            )
+            return None
+        _held_fds.add(fd)
+    pause = _POLL_FIRST
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except OSError as e:
+                if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                    # ENOTSUP, EOPNOTSUPP, ENOLCK (network file systems)
+                    # and the like: no flock on this folder.
+                    logger.debug(
+                        "Backup folder lock: flock is unavailable (%s); using a "
+                        "thread lock only.",
+                        _errno_name(e),
+                    )
+                    _close_folder_fd(fd, generation)
+                    return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LibraryBusyError(_LOCK_BUSY_MESSAGE)
+            time.sleep(min(pause, remaining))
+            pause = min(pause + _POLL_STEP, _POLL_MAX)
+    except BaseException:
+        _close_folder_fd(fd, generation)
+        raise
+
+
+@contextlib.contextmanager
+def _hold_folder(path: str, deadline: float):
+    """Hold the backup lock of the folder ``path`` (a real path) for the
+    block; see :func:`_backup_folder_lock`. Nested holds by one thread
+    share the outer one."""
+    me = threading.get_ident()
+    with _registry_guard:
+        state = _registry.get(path)
+        if state is None:
+            state = _registry[path] = _FolderLock()
+        generation = _generation
+    if state.owner == me:
+        state.depth += 1
+        try:
+            yield
+        finally:
+            state.depth -= 1
+        return
+    if not _acquire_thread_lock(state.lock, deadline):
+        raise LibraryBusyError(_LOCK_BUSY_MESSAGE)
+    try:
+        fd = _flock_folder(path, deadline, generation)
+    except BaseException:
+        state.lock.release()
+        raise
+    state.owner, state.depth = me, 1
+    try:
+        yield
+    finally:
+        state.owner, state.depth = None, 0
+        if fd is not None:
+            _close_folder_fd(fd, generation)
+        if generation == _generation:
+            state.lock.release()
+
+
+@contextlib.contextmanager
+def _backup_folder_lock(*dirs, timeout: Optional[float] = None):
+    """Hold the backup lock of every folder in ``dirs`` for the block,
+    against other threads and processes (each folder once, by real path,
+    taken in sorted order so two callers can't deadlock).
+
+    Waits for all of them together up to ``timeout`` seconds (None:
+    :data:`BACKUP_LOCK_TIMEOUT`, read now), or until the enclosing
+    :func:`~py_apple_books.db.query_deadline` ends if that is sooner,
+    but always tries each lock once: with the time already up, an
+    uncontended lock is still taken. A folder that doesn't exist (or
+    can't be opened, or doesn't support flock) gets the thread lock
+    only.
+
+    :raises LibraryBusyError: the wait ran out; nothing is held then.
+    """
+    deadline = _lock_deadline(timeout)
+    paths = sorted({os.path.realpath(os.fspath(d)) for d in dirs})
+    with contextlib.ExitStack() as stack:
+        for path in paths:
+            stack.enter_context(_hold_folder(path, deadline))
+        yield
+
+
+def _make_dirs(path) -> None:
+    """Create the folder ``path`` and any missing parents, like
+    ``mkdir -p``, each new folder with mode 0700 (as the umask allows):
+    backups hold the whole library. Existing folders keep their mode.
+
+    :raises OSError: as :meth:`pathlib.Path.mkdir` does, e.g.
+        :class:`FileExistsError` for a file in the way.
+    """
+    path = os.path.abspath(os.fspath(path))
+    try:
+        os.mkdir(path, 0o700)
+    except FileNotFoundError:
+        parent = os.path.dirname(path)
+        if parent == path:
+            raise
+        _make_dirs(parent)
+        try:
+            os.mkdir(path, 0o700)
+        except OSError:
+            if not os.path.isdir(path):
+                raise
+    except OSError:
+        if not os.path.isdir(path):
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -257,38 +544,74 @@ def _backups_for(db_path: Path, backup_dir: Path) -> list[Path]:
     return _series(db_path, backup_dir)
 
 
+#: How many backup names :func:`_take_backup` tries (the timestamp moved
+#: on by a microsecond each time) before giving up.
+_NAME_TRIES = 100
+
+_PART_FLAGS = (
+    os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+def _claim_part(backup_dir: Path, stem: str, suffix: str) -> tuple:
+    """``(dest, part)`` for a new backup of the store ``<stem>.sqlite``:
+    ``part`` (``dest`` plus ``.part``) created empty, exclusively (never
+    an existing file, never through a symlink), mode 0600; ``dest`` free.
+    On a name in use, the next microsecond's timestamp is tried.
+
+    :raises OSError: creating ``part`` failed for another reason.
+    :raises WriteError: no free name in :data:`_NAME_TRIES` tries.
+    """
+    when = datetime.now()
+    for _ in range(_NAME_TRIES):
+        dest = backup_dir / f"{stem}-{when.strftime(_STAMP_FORMAT)}{suffix}.sqlite"
+        part = dest.with_name(dest.name + ".part")
+        if not os.path.lexists(dest):
+            try:
+                fd = os.open(part, _PART_FLAGS, 0o600)
+            except FileExistsError:
+                pass
+            else:
+                os.close(fd)
+                return dest, part
+        when = max(datetime.now(), when + timedelta(microseconds=1))
+    raise WriteError("Backup failed, aborting write: no free backup file name.")
+
+
 def _take_backup(db_path: Path, backup_dir: Path, *, suffix: str = "") -> Path:
     """Write one fresh backup of ``db_path``; no reuse, no pruning.
 
-    The copy lands under a ``.part`` name and is renamed only on
-    success, so a failed backup can never masquerade as a valid one.
-    ``suffix`` is ``''`` or :data:`SNAPSHOT_SUFFIX`, the names a
-    store's backup series is matched by.
+    The source is opened first, so a store that can't be read leaves
+    nothing behind. The copy lands under a ``.part`` name, created
+    exclusively with mode 0600 (another timestamp if the name is taken),
+    and is renamed only on success, so a failed backup can never
+    masquerade as a valid one. A missing ``backup_dir`` is created
+    (new folders 0700). ``suffix`` is ``''`` or :data:`SNAPSHOT_SUFFIX`,
+    the names a store's backup series is matched by.
     """
     db_path = Path(db_path)
     backup_dir = Path(backup_dir)
-    try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        raise WriteError(f"Backup failed, aborting write: {e}") from e
-    stamp = datetime.now().strftime(_STAMP_FORMAT)
-    dest = backup_dir / f"{db_path.stem}-{stamp}{suffix}.sqlite"
-    part = dest.with_name(dest.name + ".part")
-
     try:
         src = sqlite3.connect(read_only_uri(db_path), uri=True)
     except sqlite3.Error as e:
         raise WriteError(f"Backup failed, aborting write: {e}") from e
     try:
-        dst = sqlite3.connect(part)
         try:
-            src.backup(dst)
-        finally:
-            dst.close()
-        part.replace(dest)
-    except (sqlite3.Error, OSError) as e:
-        part.unlink(missing_ok=True)
-        raise WriteError(f"Backup failed, aborting write: {e}") from e
+            _make_dirs(backup_dir)
+            dest, part = _claim_part(backup_dir, db_path.stem, suffix)
+        except OSError as e:
+            raise WriteError(f"Backup failed, aborting write: {e}") from e
+        try:
+            dst = sqlite3.connect(part)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+            part.replace(dest)
+        except (sqlite3.Error, OSError) as e:
+            part.unlink(missing_ok=True)
+            raise WriteError(f"Backup failed, aborting write: {e}") from e
     finally:
         src.close()
     return dest
@@ -335,7 +658,16 @@ def backup_library(
     committed data even when the source is in WAL mode with a pending
     checkpoint. The copy lands under a ``.part`` name and is renamed
     only on success, so a failed backup can never masquerade as a
-    valid one. Returns the backup file's path.
+    valid one. Returns the backup file's path. New backups are created
+    with mode 0600, new folders with 0700.
+
+    The reuse check, the backup and the pruning run under a lock on the
+    backup folder, shared with every other backup and restore there, in
+    any thread or process using this version: a burst of concurrent
+    writes takes one backup, and no backup prunes another's restore
+    point. The lock is a ``flock`` on the folder itself (no lock file);
+    where the file system doesn't support it, only this process's
+    threads are serialized.
 
     :param backup_dir: Where the backup goes. By default
         :data:`BACKUP_DIR` for the current user's library (the store in
@@ -345,23 +677,35 @@ def backup_library(
         this many seconds, reuse it instead of taking another. Zero
         (the default) always takes a fresh backup. A pre-restore
         snapshot is never reused.
+    :raises LibraryBusyError: another backup or restore held the folder
+        for :data:`BACKUP_LOCK_TIMEOUT` seconds (or until the enclosing
+        :func:`~py_apple_books.db.query_deadline`); nothing was changed.
+    :raises WriteError: the backup failed; nothing was changed.
     """
     db_path = Path(db_path)
     backup_dir = _backup_dir(backup_dir, db_path)
-    backup_dir.mkdir(parents=True, exist_ok=True)
+    _make_dirs(backup_dir)
 
-    existing = _backups_for(db_path, backup_dir)
-    if min_interval > 0 and existing:
-        newest = existing[-1]
-        if (
-            not newest.stem.endswith(SNAPSHOT_SUFFIX)
-            and time.time() - newest.stat().st_mtime < min_interval
-        ):
-            return newest
+    with _backup_folder_lock(backup_dir):
+        existing = _backups_for(db_path, backup_dir)
+        if min_interval > 0 and existing:
+            newest = existing[-1]
+            if not newest.stem.endswith(SNAPSHOT_SUFFIX) and _younger_than(newest, min_interval):
+                return newest
 
-    dest = _take_backup(db_path, backup_dir)
-    _prune_backups(db_path, backup_dir, keep)
+        dest = _take_backup(db_path, backup_dir)
+        _prune_backups(db_path, backup_dir, keep)
     return dest
+
+
+def _younger_than(path: Path, seconds: float) -> bool:
+    """Whether the file ``path`` was modified less than ``seconds`` ago
+    (False if it is gone: an older version's writer, which doesn't take
+    the folder lock, may have pruned it)."""
+    try:
+        return time.time() - path.stat().st_mtime < seconds
+    except FileNotFoundError:
+        return False
 
 
 def list_backups(
@@ -532,6 +876,13 @@ def restore_library(
     library, so the restore itself can be undone by restoring the
     returned snapshot.
 
+    From the check onwards it holds the backup folder lock (see
+    :func:`backup_library`) of the folder the snapshot goes to and of
+    the backup's own folder, so no concurrent write can prune the
+    backup being restored, or take its pre-write backup halfway through
+    the restore. A missing snapshot folder is created only with
+    ``snapshot``.
+
     :param db_path: The library database to overwrite; defaults to the
         Books library (the store the location variables name, else the
         current user's), found as for a write. With ``force`` or without
@@ -547,6 +898,10 @@ def restore_library(
     :raises BackupValidationError: a pre-restore check failed; nothing
         was changed.
     :raises BooksAppRunningError: Books is running; nothing was changed.
+    :raises LibraryBusyError: another backup or restore held a backup
+        folder for :data:`BACKUP_LOCK_TIMEOUT` seconds (or until the
+        enclosing :func:`~py_apple_books.db.query_deadline`); nothing
+        was changed.
     :raises AmbiguousStoreError: no ``db_path``, and the Books library
         can't be told for sure (several candidate stores) or, with
         ``snapshot`` and without ``force``, can't be read; nothing was
@@ -566,10 +921,29 @@ def restore_library(
 
     ensure_books_not_running()
 
+    backup_dir = _backup_dir(backup_dir, db_path)
+    if snapshot:
+        # The folder is locked by its descriptor, so it must exist first.
+        try:
+            _make_dirs(backup_dir)
+        except OSError as e:
+            raise WriteError(f"Pre-restore snapshot failed, nothing restored: {e}") from e
+    with _backup_folder_lock(backup_dir, backup_path.parent):
+        return _restore_locked(backup_path, db_path, backup_dir, force, snapshot)
+
+
+def _restore_locked(
+    backup_path: Path, db_path: Path, backup_dir: Path, force: bool, snapshot: bool
+) -> Optional[Path]:
+    """:func:`restore_library` from the backup check on, under the lock
+    of ``backup_dir`` and of the backup's folder."""
+    # A write that didn't wait for the lock (an older version) may have
+    # pruned it since it was looked at.
+    if not backup_path.exists():
+        raise WriteError(f"Backup file not found: {backup_path}")
     if not force:
         verify_backup(backup_path, db_path)
 
-    backup_dir = _backup_dir(backup_dir, db_path)
     snap = None
     if snapshot:
         try:
