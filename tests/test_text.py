@@ -24,7 +24,7 @@ NFD_GODEL = unicodedata.normalize("NFD", "Gödel")
 EQUAL = [
     ("don't", "don’t"),
     ("a\nb", "a b"),
-    ("a b", "a b"),  # NBSP
+    ("a\u00a0b", "a b"),  # NBSP
     ("a–b", "a-b"),
     ("wait…", "wait..."),
     ("Straße", "strasse"),
@@ -35,9 +35,9 @@ EQUAL = [
     ("“quoted”", '"quoted"'),
     ("em—dash", "em-dash"),
     ("minus −1", "minus -1"),
-    ("soft­hyphen", "softhyphen"),
-    ("zero​width", "zerowidth"),
-    ("﻿bom", "bom"),
+    ("soft\u00adhyphen", "softhyphen"),
+    ("zero\u200bwidth", "zerowidth"),
+    ("\ufeffbom", "bom"),
     ("naïve café", "NAIVE CAFE"),
     ("line\r\n\tbreaks", "line breaks"),
     ("37℃", "37°c"),
@@ -67,7 +67,7 @@ def test_non_latin_marks_are_kept():
 
 def test_whitespace_is_collapsed_not_stripped():
     assert fold_for_match("  a \n\n b  ") == " a b "
-    assert fold_for_match(" é ") == " e "
+    assert fold_for_match("\u2003é\u2003") == " e "
 
 
 def test_ascii_fast_path():
@@ -159,8 +159,8 @@ README_EXAMPLES = [
     ("-", "—"),
     ("find", "ﬁnd"),
     ("...", "…"),
-    ("softhyphen", "soft­hyphen"),
-    ("zerowidth", "zero​width"),
+    ("softhyphen", "soft\u00adhyphen"),
+    ("zerowidth", "zero\u200bwidth"),
     ("a highlight", "a\n  highlight"),
 ]
 
@@ -203,10 +203,10 @@ def test_coerce_failed_str_is_none():
 
 
 @pytest.mark.parametrize("raw, want", [
-    ("Donau­dampf​schiff﻿", "Donaudampfschiff"),
-    ("e­́", "é"),  # deleted first, so the accent composes
+    ("Donau\u00addampf\u200bschiff\ufeff", "Donaudampfschiff"),
+    ("e\u00ad\u0301", "é"),  # deleted first, so the accent composes
     (unicodedata.normalize("NFD", "Tiếng Việt"), "Tiếng Việt"),
-    ("﻿BOM first", "BOM first"),
+    ("\ufeffBOM first", "BOM first"),
     ("plain ascii  text\n", "plain ascii  text\n"),
     ("", ""),
 ])
@@ -216,8 +216,8 @@ def test_normalize_unicode_table(raw, want):
 
 
 def test_normalize_unicode_keeps_joiners_controls_and_spaces():
-    family = "\U0001F468‍\U0001F469‍\U0001F467"
-    kept = family + " ‌ ‏ ‎     　 ⁠"
+    family = "\U0001F468\u200d\U0001F469\u200d\U0001F467"
+    kept = family + " \u200c \u200f \u200e \u00a0 \u202f \u3000 \u2060"
     assert normalize_unicode(kept) == kept
     # NFC, not NFKC: compatibility characters are left alone.
     assert normalize_unicode("ﬁ ① Ａ") == "ﬁ ① Ａ"
@@ -232,13 +232,13 @@ def test_normalize_unicode_none_ascii_and_types():
 
 
 @pytest.mark.parametrize("raw", [
-    "Donau­dampf", "e­́­", unicodedata.normalize("NFD", "한국어 Việt"),
-    "​​", "a﻿̈b", "ᄀ­ᅡ",
+    "Donau\u00addampf", "e\u00ad\u0301\u00ad", unicodedata.normalize("NFD", "한국어 Việt"),
+    "\u200b\u200b", "a\ufeff\u0308b", "ᄀ\u00adᅡ",
 ])
 def test_normalize_unicode_idempotent(raw):
     once = normalize_unicode(raw)
     assert normalize_unicode(once) == once
-    assert not set(once) & {"­", "​", "﻿"}
+    assert not set(once) & {"\u00ad", "\u200b", "\ufeff"}
 
 
 # --- _find_passage ---------------------------------------------------------------
@@ -252,21 +252,21 @@ def legacy_first_match(text, anchor):
 
 
 def test_find_passage_whitespace_and_invisibles():
-    t = "a Donau­dampf\nschiff b x​ y Donaudampf schiff"
+    t = "a Donau\u00addampf\nschiff b x\u200b y Donaudampf schiff"
     assert _find_passage(t, "Donaudampf schiff") == [(2, 20), (28, 45)]
-    assert t[2:20] == "Donau­dampf\nschiff"
+    assert t[2:20] == "Donau\u00addampf\nschiff"
     assert _find_passage(t, "x y") == [(23, 27)]
-    assert t[23:27] == "x​ y"
+    assert t[23:27] == "x\u200b y"
 
 
 def test_find_passage_invisible_only_in_the_passage():
-    assert _find_passage("Donaudampf", "Donau­dampf") == [(0, 10)]
-    assert _find_passage("one two", "one﻿ two") == [(0, 7)]
+    assert _find_passage("Donaudampf", "Donau\u00addampf") == [(0, 10)]
+    assert _find_passage("one two", "one\ufeff two") == [(0, 7)]
 
 
 def test_find_passage_invisible_at_the_start_of_the_text():
-    assert _find_passage("​ab", "ab") == [(1, 3)]
-    assert _find_passage("­­ab­", "ab") == [(2, 4)]
+    assert _find_passage("\u200bab", "ab") == [(1, 3)]
+    assert _find_passage("\u00ad\u00adab\u00ad", "ab") == [(2, 4)]
 
 
 def test_find_passage_line_breaks_and_spaces():
@@ -287,7 +287,7 @@ def test_find_passage_non_overlapping_repeats():
     assert _find_passage("aaaa", "aa") == [(0, 2), (2, 4)]
 
 
-@pytest.mark.parametrize("passage", ["", "   ", "​ ­", "﻿"])
+@pytest.mark.parametrize("passage", ["", "   ", "\u200b \u00ad", "\ufeff"])
 def test_find_passage_nothing_visible(passage):
     assert _find_passage("some text", passage) == []
 
@@ -298,7 +298,7 @@ def test_find_passage_bad_input_is_empty(text, passage):
 
 
 def test_find_passage_offsets_slice_the_original():
-    t = "x­y  z﻿ w​​q x­y"
+    t = "x\u00ady  z\ufeff w\u200b\u200bq x\u00ady"
     for start, end in _find_passage(t, "xy"):
         assert normalize_unicode(t[start:end]) == "xy"
     assert _find_passage(t, "xy") == [(0, 3), (13, 16)]
@@ -323,7 +323,7 @@ def test_passage_pattern_is_1_10_pattern():
 
 
 def test_find_passage_nbsp_runs_stay_fast():
-    t = ("x" + " " * 3000) * 200 + "­"
+    t = ("x" + "\u00a0" * 3000) * 200 + "\u00ad"
     start = time.perf_counter()
     assert _find_passage(t, "x y") == []
     assert time.perf_counter() - start < 0.5
@@ -331,7 +331,7 @@ def test_find_passage_nbsp_runs_stay_fast():
 
 def test_find_passage_long_passage_in_long_text_stays_fast():
     words = " ".join(f"w{i}" for i in range(2500))  # ~14k characters
-    text = "filler " * 20000 + words.replace(" w5", " ­w5") + " tail"
+    text = "filler " * 20000 + words.replace(" w5", " \u00adw5") + " tail"
     start = time.perf_counter()
     assert len(_find_passage(text, words)) == 1
     assert time.perf_counter() - start < 0.5

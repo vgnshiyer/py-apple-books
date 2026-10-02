@@ -388,7 +388,7 @@ def find_folded(text: str, query, start: int = 0,
 
 # Characters that break exact matching and carry no text: soft hyphen,
 # zero-width space, BOM (zero-width no-break space).
-_INVISIBLE = "­​﻿"
+_INVISIBLE = "\u00ad\u200b\ufeff"
 _DELETE_INVISIBLE = dict.fromkeys(map(ord, _INVISIBLE))
 _INVISIBLE_RE = re.compile("[" + _INVISIBLE + "]")
 
@@ -463,7 +463,7 @@ def _find_passage(text: str, passage: str) -> List[Tuple[int, int]]:
 # cluster boundaries (Unicode Standard Annex #29).
 
 # Whitespace that does not allow a line break there.
-_NO_BREAK_SPACES = "   "
+_NO_BREAK_SPACES = "\u00a0\u2007\u202f"
 # A breaking whitespace character, or the end of a CJK (or ! ?) sentence.
 _BREAK_AFTER = re.compile("[^\\S" + _NO_BREAK_SPACES + "]|[。！？．!?]")
 
@@ -670,13 +670,13 @@ _SHORT_MAX_NO_SPACE = 8   # code points of a core in a script without spaces
 
 # Trimmed from the edges of a selection besides whitespace and the
 # punctuation, symbol and separator categories.
-_EDGE_INVISIBLE = frozenset("­​‌‍⁠﻿")
+_EDGE_INVISIBLE = frozenset("\u00ad\u200b\u200c\u200d\u2060\ufeff")
 _SENTENCE_MARK = re.compile("[.!?;:…。！？；：]")
 # Scripts written without spaces between words: kana, CJK ideographs
 # (unified, compatibility, extensions B-H), Thai, Lao, Myanmar, Khmer.
 _NO_SPACE_SCRIPT = re.compile(
-    "[぀-ヿ㐀-䶿一-鿿豈-﫿฀-໿"
-    "က-႟ក-៿\U00020000-\U000323af]")
+    "[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0e00-\u0eff"
+    "\u1000-\u109f\u1780-\u17ff\U00020000-\U000323af]")
 
 
 def _is_edge(ch: str) -> bool:

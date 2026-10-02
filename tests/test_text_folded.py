@@ -34,11 +34,11 @@ EXAMPLES = [
     ("Die Straße", "strasse", ["Straße"]),
     ("the oﬃce…", "office...", ["oﬃce…"]),
     ("Second — para", "second - para", ["Second — para"]),
-    ("Donau­dampf", "Donaudampf", ["Donau­dampf"]),
-    ("É or é", "e", ["É", "é"]),
-    ("non breaking", "non breaking", ["non breaking"]),
+    ("Donau\u00addampf", "Donaudampf", ["Donau\u00addampf"]),
+    ("É or e\u0301", "e", ["É", "e\u0301"]),
+    ("non\u00a0breaking", "non breaking", ["non\u00a0breaking"]),
     ("line\nbreak and\r\n\ttabs", "line break and tabs", ["line\nbreak and\r\n\ttabs"]),
-    ("zero​width", "zerowidth", ["zero​width"]),
+    ("zero\u200bwidth", "zerowidth", ["zero\u200bwidth"]),
     ("“quoted”", '"quoted"', ["“quoted”"]),
     ("small﹣form", "small-form", ["small﹣form"]),
     ("𝐁𝐨𝐥𝐝 type", "bold", ["𝐁𝐨𝐥𝐝"]),
@@ -55,9 +55,9 @@ def test_examples(text, query, want):
 
 
 def test_spans_index_the_original_text():
-    text = "a  Straße­ und\n\nCAFÉ ok"
+    text = "a  Straße\u00ad und\n\nCAFE\u0301 ok"
     assert spans(text, "strasse und cafe") == [(3, 21)]
-    assert text[3:21] == "Straße­ und\n\nCAFÉ"
+    assert text[3:21] == "Straße\u00ad und\n\nCAFE\u0301"
 
 
 def test_partial_character_matches_widen_to_the_whole_character():
@@ -69,12 +69,12 @@ def test_partial_character_matches_widen_to_the_whole_character():
 
 
 def test_match_extends_over_following_accents_only():
-    text = "cafȩ́ au"
+    text = "cafe\u0301\u0327 au"
     assert spans(text, "cafe") == [(0, 6)]
     # A soft hyphen after the match is not part of it.
-    assert spans("Donau­", "donau") == [(0, 5)]
+    assert spans("Donau\u00ad", "donau") == [(0, 5)]
     # Marks that fold to themselves are text of their own.
-    assert spans("が", "か") == [(0, 1)]
+    assert spans("か\u3099", "か") == [(0, 1)]
 
 
 def test_matches_are_non_overlapping_and_in_order():
@@ -98,9 +98,9 @@ def test_lone_surrogates_match_like_fold_for_match():
     assert spans(text, "a\ud800b") == [(0, 3)]
 
 
-@pytest.mark.parametrize("query", ["", "   ", "\n\t", "­­", "​ ﻿", "́", None])
+@pytest.mark.parametrize("query", ["", "   ", "\n\t", "\u00ad\u00ad", "\u200b \ufeff", "\u0301", None])
 def test_query_that_folds_to_nothing_finds_nothing(query):
-    assert spans("anything at all ­́", query) == []
+    assert spans("anything at all \u00ad\u0301", query) == []
     assert find_folded("anything", query) is None
 
 
@@ -150,7 +150,7 @@ def test_find_folded_first_match_and_bounds():
 
 
 def test_find_folded_stays_inside_the_slice():
-    text = "café café"
+    text = "cafe\u0301 cafe\u0301"
     # The accent after the end bound is outside the slice.
     assert find_folded(text, "cafe", 0, 4) == (0, 4)
     assert find_folded(text, "cafe", 0, 5) == (0, 5)
@@ -161,7 +161,7 @@ def test_find_folded_stays_inside_the_slice():
 
 def test_find_folded_equals_first_of_finditer():
     rnd = random.Random(3)
-    pool = "ab ßé’'-—­́ﬁ…"
+    pool = "ab ßé’'-—\u00ad\u0301ﬁ…"
     for _ in range(300):
         text = "".join(rnd.choice(pool) for _ in range(rnd.randint(0, 25)))
         query = "".join(rnd.choice(pool) for _ in range(rnd.randint(1, 4)))
@@ -196,8 +196,8 @@ def test_whitespace_folds_to_one_space():
 
 # Character mix of the fuzz below: quotes, dashes, NBSP, soft hyphen,
 # ZWSP, ß/ẞ, ligatures, ellipsis, combining accents, İ/ı and Σ/σ/ς.
-POOL = list("abcdeEfsSit '’\"“-—–  ­​éÉèßẞﬁﬀ…́̈ñÑøØæŒœ\n\t.,İıΣσς")
-ZERO_MARKS = {"́", "̈"}
+POOL = list("abcdeEfsSit '’\"“-—– \u00a0\u00ad\u200béÉèßẞﬁﬀ…\u0301\u0308ñÑøØæŒœ\n\t.,İıΣσς")
+ZERO_MARKS = {"\u0301", "\u0308"}
 
 
 def test_per_character_fold_equals_fold_for_match_on_latin_text():
