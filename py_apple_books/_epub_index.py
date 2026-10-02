@@ -392,12 +392,15 @@ def _build_index(root: pathlib.Path, root_st: os.stat_result) -> _BookIndex:
     only) and build a :class:`_BookIndex`. Errors as a full load raises
     them: :class:`BookNotDownloadedError` for an iCloud placeholder,
     :class:`UnsafeEpubEntryError` for an unsafe entry,
-    :class:`AppleBooksError` otherwise."""
+    :class:`AppleBooksError` otherwise (also for any failure computing
+    the index from what was read, a ``RecursionError`` on a deeply
+    nested NCX for one)."""
     reader = _IndexReader(str(root))
     try:
         with _icloud.no_materialize():
             book = reader.load()
             reader.process()
+            return _index_from(root, root_st, reader, book)
     except AppleBooksError:
         raise
     except Exception as e:
@@ -407,6 +410,11 @@ def _build_index(root: pathlib.Path, root_st: os.stat_result) -> _BookIndex:
         raise AppleBooksError(
             f"Could not read EPUB {quote_title(root.name)}: {detail(e)}"
         ) from e
+
+
+def _index_from(root: pathlib.Path, root_st: os.stat_result, reader: _IndexReader,
+                book: Any) -> _BookIndex:
+    """The :class:`_BookIndex` of a book :class:`_IndexReader` loaded."""
     opf = reader.container
     container = reader.container_bytes
     opf_dir = (_content._opf_dir_from_container_bytes(container) if container is not None

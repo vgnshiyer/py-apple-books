@@ -461,3 +461,37 @@ def test_messages_are_path_free(tmp_path):
             call()
         message = str(exc.value)
         assert str(tmp_path) not in message and len(message) < 300 and pathlib.Path.home().name not in message
+
+
+def _deep_ncx(depth):
+    """An NCX whose navPoints nest ``depth`` deep (about 50 bytes a level)."""
+    point = ('<navPoint id="p{0}" playOrder="{0}"><navLabel><text>L</text></navLabel>'
+             '<content src="c1.xhtml"/>')
+    return ('<?xml version="1.0" encoding="UTF-8"?>'
+            '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">'
+            '<head/><docTitle><text>T</text></docTitle><navMap>'
+            + "".join(point.format(i) for i in range(1, depth + 1))
+            + "</navPoint>" * depth + "</navMap></ncx>")
+
+
+def test_failure_after_the_load_is_unreadable(tmp_path):
+    """A failure while the index is computed from the files read (here a
+    RecursionError: an NCX found by media type, nested deeper than the
+    recursion limit) is reported like any unreadable book: UNREADABLE from
+    the gate, AppleBooksError from the methods, never a bare exception."""
+    from py_apple_books.testing.epub import write_epub_bundle
+
+    bundle = write_epub_bundle(tmp_path / "Deep.epub", [("c1", "<p>one</p>")],
+                               toc=[("One", "c1.xhtml")], nav="ncx-undeclared")
+    (bundle / "OEBPS" / "toc.ncx").write_text(_deep_ncx(1200))
+    book = SimpleNamespace(path=bundle, state=1, is_store_series_item=False)
+    for _ in range(2):  # nothing is cached: the same answer every time
+        assert _epub_index._book_gate(book) == (UnavailableReason.UNREADABLE, None)
+        assert _gate(bundle).reason == UnavailableReason.UNREADABLE
+    content = BookContent(bundle)
+    for call in (content.list_spine_items, lambda: content.get_spine_item_text(0),
+                 lambda: list(content.iter_spine_text())):
+        with pytest.raises(AppleBooksError, match="Could not read EPUB 'Deep.epub'") as exc:
+            call()
+        assert type(exc.value) is AppleBooksError
+        assert isinstance(exc.value.__cause__, RecursionError)
