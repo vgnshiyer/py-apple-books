@@ -650,8 +650,8 @@ class FixtureLibrary:
         values.
 
         Dates (``books_goal_set``, ``daily_goal_set``, the values of
-        ``finished``) are datetimes (naive means UTC) or Core Data seconds
-        (int or float), which are written as dates exactly, so
+        ``finished``) are datetimes (naive means UTC), dates (midnight
+        UTC) or Core Data seconds (int or float), written as dates exactly, so
         :data:`YEAR_ZERO`, ``float('nan')`` and other values ``datetime``
         can't hold give the unreadable dates found in real files. A
         ``*_set`` of None is a fixed date in January 2026.
@@ -680,8 +680,8 @@ class FixtureLibrary:
                 except (OverflowError, ValueError):
                     raise ValueError(f"an XML plist can't hold the date {seconds!r}; "
                                      f"use fmt='binary'") from None
-            # A unique placeholder (sub-second, so never a real fixture
-            # date), swapped for the raw value once encoded.
+            # A unique placeholder date, swapped for the raw value once
+            # encoded (a collision with a date in the plist is refused).
             n = len(patches) + 1
             placeholder = (epoch + _dt.timedelta(microseconds=n) if fmt == "binary"
                            else _dt.datetime(1, 1, 1) + _dt.timedelta(seconds=n))
