@@ -83,9 +83,11 @@ class _SearchAPI:
         :raises BookNotFoundError: no book has ``book_id``.
         :raises AnnotationStoreNotFoundError: there is no annotation
             store.
-        :raises QueryTimeoutError: the search (or the index build it
-            waits for) ran past the query timeout. A build stopped this
-            way is continued by the next search.
+        :raises QueryTimeoutError: a statement of the search or of its
+            index build ran past the query timeout, or the wait for
+            another thread's build did (the timeout bounds each
+            statement: use ``query_deadline()`` to bound the whole call).
+            A build stopped this way is continued by the next search.
         :raises DBQueryError: the index failed ("Ranked annotation search
             failed."), or reading the store did.
         """
