@@ -1,0 +1,3 @@
+# Modules added by stream 2.6 (book info) whose import must do no I/O
+# (R19): the AEBookInfo caches are found and read on first call only.
+py_apple_books.book_info
