@@ -1,11 +1,21 @@
-"""Tests for search-matching text folding (py_apple_books.text)."""
+"""Tests for py_apple_books.text: search-matching folding, the shared
+input conversion, normalize_unicode and passage location.
 
+The folded search, snap_break and the short-selection classifier have
+their own files (test_text_folded.py, test_snap_break.py,
+test_short_selection.py).
+"""
+
+import pathlib
+import re
 import sqlite3
+import time
 import unicodedata
 
 import pytest
 
-from py_apple_books.text import fold_for_match
+from py_apple_books import text as text_module
+from py_apple_books.text import _find_passage, _passage_pattern, fold_for_match, normalize_unicode
 
 NFD_GODEL = unicodedata.normalize("NFD", "Gödel")
 
@@ -121,3 +131,207 @@ def test_never_raises_on_all_code_points():
     folded = fold_for_match(everything)
     folded.encode("utf-8")
     assert fold_for_match(folded) == folded
+
+
+# --- 1.11: the public text module ------------------------------------------
+
+def test_public_names():
+    assert text_module.__all__ == [
+        "fold_for_match", "finditer_folded", "find_folded", "normalize_unicode",
+        "snap_break", "selection_core", "is_short_selection",
+    ]
+    for name in text_module.__all__:
+        assert callable(getattr(text_module, name))
+
+
+def test_text_module_imports_nothing_from_the_package():
+    source = pathlib.Path(text_module.__file__).read_text(encoding="utf-8")
+    imports = re.findall(r"^\s*(?:from|import)\s+([\w.]+)", source, flags=re.M)
+    assert imports and not [m for m in imports if m.startswith(("py_apple_books", "."))]
+
+
+# The README's "Searching" section, example by example.
+README_EXAMPLES = [
+    ("ß", "ss"),
+    ("Godel", "Gödel"),
+    ("don't", "don’t"),
+    ("-", "–"),
+    ("-", "—"),
+    ("find", "ﬁnd"),
+    ("...", "…"),
+    ("softhyphen", "soft­hyphen"),
+    ("zerowidth", "zero​width"),
+    ("a highlight", "a\n  highlight"),
+]
+
+
+@pytest.mark.parametrize("query, stored", README_EXAMPLES)
+def test_readme_searching_examples(query, stored):
+    assert fold_for_match(query) in fold_for_match(stored)
+
+
+def test_readme_other_scripts_keep_their_marks():
+    assert fold_for_match("が") != fold_for_match("か")
+
+
+# Inputs of every kind: the shared conversion must give fold_for_match
+# exactly what it did on its own in 1.10.
+ODD_INPUTS = [None, "", "abc", "Gödel", b"G\xc3\xb6del", b"bad \xff", bytearray(b"x"), 0, -1.5,
+              chr(0xD800), "a" + chr(0xDFFF), ["list"], ("tuple",), object]
+
+
+@pytest.mark.parametrize("value", ODD_INPUTS, ids=repr)
+def test_coerce_matches_fold_input_rules(value):
+    coerced = text_module._coerce_text(value)
+    if value is None:
+        assert coerced is None
+        return
+    assert isinstance(coerced, str)
+    coerced.encode("utf-8")
+    assert fold_for_match(value) == fold_for_match(coerced)
+
+
+def test_coerce_failed_str_is_none():
+    class Unprintable:
+        def __str__(self):
+            raise RuntimeError("no text")
+
+    assert text_module._coerce_text(Unprintable()) is None
+
+
+# --- normalize_unicode ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw, want", [
+    ("Donau­dampf​schiff﻿", "Donaudampfschiff"),
+    ("e­́", "é"),  # deleted first, so the accent composes
+    (unicodedata.normalize("NFD", "Tiếng Việt"), "Tiếng Việt"),
+    ("﻿BOM first", "BOM first"),
+    ("plain ascii  text\n", "plain ascii  text\n"),
+    ("", ""),
+])
+def test_normalize_unicode_table(raw, want):
+    assert normalize_unicode(raw) == want
+    assert unicodedata.is_normalized("NFC", normalize_unicode(raw))
+
+
+def test_normalize_unicode_keeps_joiners_controls_and_spaces():
+    family = "\U0001F468‍\U0001F469‍\U0001F467"
+    kept = family + " ‌ ‏ ‎     　 ⁠"
+    assert normalize_unicode(kept) == kept
+    # NFC, not NFKC: compatibility characters are left alone.
+    assert normalize_unicode("ﬁ ① Ａ") == "ﬁ ① Ａ"
+
+
+def test_normalize_unicode_none_ascii_and_types():
+    assert normalize_unicode(None) is None
+    s = "already ascii"
+    assert normalize_unicode(s) is s
+    with pytest.raises(TypeError):
+        normalize_unicode(b"bytes")
+
+
+@pytest.mark.parametrize("raw", [
+    "Donau­dampf", "e­́­", unicodedata.normalize("NFD", "한국어 Việt"),
+    "​​", "a﻿̈b", "ᄀ­ᅡ",
+])
+def test_normalize_unicode_idempotent(raw):
+    once = normalize_unicode(raw)
+    assert normalize_unicode(once) == once
+    assert not set(once) & {"­", "​", "﻿"}
+
+
+# --- _find_passage ---------------------------------------------------------------
+
+
+def legacy_first_match(text, anchor):
+    """1.10's get_annotation_surrounding_text lookup, vendored."""
+    pattern = r"\s+".join(re.escape(word) for word in anchor.split())
+    m = re.search(pattern, text)
+    return None if m is None else m.span()
+
+
+def test_find_passage_whitespace_and_invisibles():
+    t = "a Donau­dampf\nschiff b x​ y Donaudampf schiff"
+    assert _find_passage(t, "Donaudampf schiff") == [(2, 20), (28, 45)]
+    assert t[2:20] == "Donau­dampf\nschiff"
+    assert _find_passage(t, "x y") == [(23, 27)]
+    assert t[23:27] == "x​ y"
+
+
+def test_find_passage_invisible_only_in_the_passage():
+    assert _find_passage("Donaudampf", "Donau­dampf") == [(0, 10)]
+    assert _find_passage("one two", "one﻿ two") == [(0, 7)]
+
+
+def test_find_passage_invisible_at_the_start_of_the_text():
+    assert _find_passage("​ab", "ab") == [(1, 3)]
+    assert _find_passage("­­ab­", "ab") == [(2, 4)]
+
+
+def test_find_passage_line_breaks_and_spaces():
+    assert _find_passage("one\n\ntwo", "one two") == [(0, 8)]
+    assert _find_passage("one two", "one\n two") == [(0, 7)]
+    assert _find_passage("onetwo", "one two") == []
+
+
+def test_find_passage_is_literal_and_exact():
+    assert _find_passage("a.b a+b", "a+b") == [(4, 7)]
+    assert _find_passage("(x)[y]", "(x)[y]") == [(0, 6)]
+    assert _find_passage("Café", "cafe") == []
+    assert _find_passage("don’t", "don't") == []
+
+
+def test_find_passage_non_overlapping_repeats():
+    assert _find_passage("yes yes yes", "yes") == [(0, 3), (4, 7), (8, 11)]
+    assert _find_passage("aaaa", "aa") == [(0, 2), (2, 4)]
+
+
+@pytest.mark.parametrize("passage", ["", "   ", "​ ­", "﻿"])
+def test_find_passage_nothing_visible(passage):
+    assert _find_passage("some text", passage) == []
+
+
+@pytest.mark.parametrize("text, passage", [(None, "a"), ("a", None), (b"a", "a"), ("", "a")])
+def test_find_passage_bad_input_is_empty(text, passage):
+    assert _find_passage(text, passage) == []
+
+
+def test_find_passage_offsets_slice_the_original():
+    t = "x­y  z﻿ w​​q x­y"
+    for start, end in _find_passage(t, "xy"):
+        assert normalize_unicode(t[start:end]) == "xy"
+    assert _find_passage(t, "xy") == [(0, 3), (13, 16)]
+
+
+@pytest.mark.parametrize("text, anchor", [
+    ("He said yes.\nLater she said yes.", "said yes."),
+    ("a  b c", "b c"),
+    ("tab\there", "tab here"),
+    ("nothing", "absent"),
+])
+def test_find_passage_first_span_is_1_10_match(text, anchor):
+    spans = _find_passage(text, anchor)
+    assert (spans[0] if spans else None) == legacy_first_match(text, anchor)
+
+
+def test_passage_pattern_is_1_10_pattern():
+    for passage in ("one  two\nthree", "a+b (c)", "x", "   ", "ünï ¢ødé"):
+        tokens = passage.split()
+        legacy = r"\s+".join(re.escape(word) for word in tokens) if tokens else None
+        assert _passage_pattern(passage) == legacy
+
+
+def test_find_passage_nbsp_runs_stay_fast():
+    t = ("x" + " " * 3000) * 200 + "­"
+    start = time.perf_counter()
+    assert _find_passage(t, "x y") == []
+    assert time.perf_counter() - start < 0.5
+
+
+def test_find_passage_long_passage_in_long_text_stays_fast():
+    words = " ".join(f"w{i}" for i in range(2500))  # ~14k characters
+    text = "filler " * 20000 + words.replace(" w5", " ­w5") + " tail"
+    start = time.perf_counter()
+    assert len(_find_passage(text, words)) == 1
+    assert time.perf_counter() - start < 0.5
