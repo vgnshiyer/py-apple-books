@@ -143,6 +143,16 @@ class TestActivity:
         library.add_annotation(first, "s", created=local(2027, 1, 1))
         assert api.get_highlight_activity().per_book == ((first["id"], "First", 1), (other["id"], "Other", 1))
 
+    def test_per_book_most_highlighted_first(self, api, library):
+        books = {name: library.add_book(name) for name in ("A", "B", "C", "D")}
+        for name, count in (("A", 1), ("B", 3), ("C", 2), ("D", 3)):
+            for i in range(count):
+                library.add_annotation(books[name], f"{name}{i}", created=local(2027, 1, 1, 9 + i))
+        result = api.get_highlight_activity()
+        check_invariants(result)
+        assert result.per_book == tuple((books[name]["id"], name, n) for name, n in
+                                        (("B", 3), ("D", 3), ("C", 2), ("A", 1)))
+
     def test_blank_notes_are_not_notes(self, api, library):
         book = library.add_book("B")
         for hour, note in ((9, None), (10, "   "), (11, " \n\t"), (12, "a note"), (13, "  padded  ")):
