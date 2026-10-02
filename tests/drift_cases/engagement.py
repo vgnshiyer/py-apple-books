@@ -42,4 +42,9 @@ CASES = {
         finished_after=dt.date(2026, 1, 1), finished_before=dt.datetime(2026, 12, 31, 23, 59))],
     "get_annotations_by_date_range(dates)": lambda api, rows: annotations(api.get_annotations_by_date_range(
         dt.date(2024, 1, 1), dt.date(2026, 9, 30), order_by="-creation_date")),
+    # Tier B
+    "get_vocabulary": lambda api, rows: [(e.term, e.key, e.count, e.notes, e.context, annotations(e.annotations))
+                                         for e in api.get_vocabulary()],
+    "get_vocabulary(underlines)": lambda api, rows: [(e.term, e.count) for e in api.get_vocabulary(
+        underline_only=True, order_by="term")],
 }

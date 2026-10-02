@@ -1,5 +1,6 @@
 """The :class:`~py_apple_books.PyAppleBooks` mixin for engagement: underlines, highlight
-sampling and highlights made on this day in earlier years (1.11).
+sampling, highlights made on this day in earlier years, and highlighted
+words (1.11).
 
 Every method here reads the library and annotation databases only (no
 book file, no iCloud folder, no subprocess). Dates follow the rules in
@@ -20,7 +21,7 @@ from py_apple_books.exceptions import AnnotationStoreNotFoundError, InvalidArgum
 from py_apple_books.models.annotation import Annotation, AnnotationType
 from py_apple_books.models.book import Book
 from py_apple_books.models.manager import ModelIterable
-from py_apple_books.text import _coerce_text, is_short_selection
+from py_apple_books.text import _SHORT_MAX_RAW, _coerce_text, is_short_selection
 from py_apple_books.utils import APPLE_EPOCH_OFFSET
 
 _HIGHLIGHT = int(AnnotationType.HIGHLIGHT)
@@ -266,6 +267,65 @@ class _EngagementAPI:
         # Rows are read here, in the instance's library, which the
         # iterable (and the picks' relations) then read too.
         return ModelIterable(lambda: rows, Annotation)
+
+    def get_vocabulary(self, limit: int = None, order_by: str = "-last_highlighted", *,
+                       offset: int = None, book_id=None, after=None, before=None,
+                       underline_only: bool = False) -> List[_eng.VocabularyEntry]:
+        """The words and short phrases you highlighted, one
+        :class:`~py_apple_books.engagement.VocabularyEntry` each (1.11).
+
+        Highlights and notes (type 2, not deleted) whose text is a short
+        selection (:attr:`Annotation.is_short_selection`) are grouped by
+        their folded word or phrase, so ``'Ephemeral,'`` and
+        ``'ephemeral'`` are one entry; there is no stemming. Highlights of
+        books no longer in the library are included. ``book_id`` (an id
+        or a :class:`Book`) keeps one book's, ``after``/``before`` a
+        creation-date window (:mod:`py_apple_books.engagement` has the
+        date rules), and ``underline_only`` underlines
+        (:meth:`get_underlines`).
+
+        ``order_by`` is ``'last_highlighted'``, ``'first_highlighted'``,
+        ``'term'`` (folded) or ``'count'``, each optionally prefixed with
+        ``'-'`` for descending; ties go by term, and entries without a
+        dated highlight come last. ``offset`` and ``limit`` page over the
+        entries. Returns a list built from one query, so for a total,
+        call with ``limit=None`` and page yourself. On a Books version
+        without the selected-text column, the list is empty.
+
+        :raises InvalidArgumentError: a bad ``limit``, ``offset``,
+            ``after`` or ``before``.
+        :raises InvalidChoiceError: an unknown ``order_by``.
+        :raises BookNotFoundError: no book has id ``book_id``.
+        """
+        limit, offset = strict_limit(limit), strict_offset(offset)
+        field, descending = _eng._vocabulary_order(order_by)
+        window = _eng._window_filters("creation_date", after, before)
+        asset = None if book_id is None else _asset_of(self, book_id)
+
+        _require_annotation_store()
+        if asset == "" or not Annotation.manager.has_fields("selected_text"):
+            return []
+        filters = {"type": _HIGHLIGHT, "is_deleted__isnot": 1, "selected_text__isnull": False, **window}
+        if asset is not None:
+            filters["asset_id"] = asset
+        if underline_only:
+            filters.update(_underline_filter())
+        column = Annotation.manager._get_db_field("selected_text")
+        # Exact: is_short_selection refuses anything longer than
+        # _SHORT_MAX_RAW code points, and SQLite's length() of the value
+        # as text never counts more characters than Python's len() of the
+        # decoded text (it stops at a NUL; invalid bytes count at most as
+        # Python's U+FFFD do; the cast reads a BLOB cell as text too).
+        short_enough = Where(f"length(CAST({column} AS TEXT))", _SHORT_MAX_RAW, operator="<=")
+        i_text = list(Annotation._get_mappings("Annotation")).index("selected_text")
+        members = [row for row in Annotation.manager.filter(**filters, where=short_enough).run_query()
+                   if is_short_selection(row[i_text])]
+        # One iterable over the members' rows, so their books load in one
+        # query (and read the instance's library).
+        entries = _eng._vocabulary(ModelIterable(lambda: members, Annotation))
+        entries = _eng._sort_vocabulary(entries, field, descending)
+        start = offset or 0
+        return entries[start:] if limit is None else entries[start:start + limit]
 
 
 def _full_rows(ids: List[int], filters: dict, where) -> list:

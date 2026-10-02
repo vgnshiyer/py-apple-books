@@ -1,11 +1,10 @@
 """Engagement: resurfacing highlights, the days they were made, and
 highlighted words (1.11).
 
-The :class:`~py_apple_books.PyAppleBooks` methods built on this module
-(``get_underlines``, ``sample_highlights``,
-``get_highlights_on_this_day``) read the library and annotation
-databases only: no book file is opened. This module holds what they
-share: the date rules of the 1.11 methods and the sampling algorithm.
+The engagement methods of :class:`~py_apple_books.PyAppleBooks` read the
+Apple Books databases, never a book file. This module holds their types
+and what they share: the date rules of the 1.11 methods and the
+sampling algorithm.
 
 Dates in new methods (1.11):
 
@@ -31,13 +30,18 @@ Python version; a new algorithm gets a new name.
 
 import hashlib
 import math
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Dict, Hashable, Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, Hashable, Iterable, List, Optional, Sequence, Tuple
 
-from py_apple_books.exceptions import InvalidArgumentError
+from py_apple_books.exceptions import InvalidArgumentError, InvalidChoiceError
+from py_apple_books.text import _coerce_text, fold_for_match, selection_core
 from py_apple_books.utils import APPLE_EPOCH_OFFSET
 
-__all__ = ["SAMPLE_ALGORITHM"]
+if TYPE_CHECKING:
+    from py_apple_books.models.annotation import Annotation
+
+__all__ = ["SAMPLE_ALGORITHM", "VocabularyEntry"]
 
 #: The ranking algorithm of :meth:`PyAppleBooks.sample_highlights`.
 #: Each candidate gets a key from a keyed BLAKE2b hash of the day, the
@@ -198,3 +202,137 @@ def _round_robin(ranked: Sequence[Tuple[int, int, Hashable]]) -> List[Tuple[int,
         rounds.append((n, -key, pk, (key, pk, asset)))
     rounds.sort(key=lambda r: r[:3])
     return [r[3] for r in rounds]
+
+
+# -- vocabulary ---------------------------------------------------------------
+
+
+def _newest_first(annotations: Iterable["Annotation"]) -> Tuple["Annotation", ...]:
+    """``annotations`` newest first (by creation date; undated last),
+    ties by higher id."""
+    return tuple(sorted(annotations, key=lambda a: (a.creation_date is not None,
+                                                    a.creation_date or datetime.min, a.id),
+                        reverse=True))
+
+
+@dataclass(frozen=True)
+class VocabularyEntry:
+    """A word or short phrase you highlighted, with every highlight of it
+    (from :meth:`PyAppleBooks.get_vocabulary`).
+
+    Highlights group by ``key``: their text trimmed to its word or phrase
+    (:func:`py_apple_books.text.selection_core`) and folded for matching
+    (:func:`py_apple_books.text.fold_for_match`: case, accents, quote
+    style and ligatures). There is no stemming, so inflected forms are
+    separate entries.
+
+    Not hashable: it holds models.
+    """
+
+    #: The word or phrase as shown: the trimmed text of the newest highlight.
+    term: str
+    #: What the highlights were grouped by (folded; for sorting and lookups).
+    key: str
+    #: The highlights, newest first.
+    annotations: Tuple["Annotation", ...]
+
+    __hash__ = None  # type: ignore[assignment]
+
+    @property
+    def count(self) -> int:
+        """How many times you highlighted it."""
+        return len(self.annotations)
+
+    @property
+    def notes(self) -> Tuple[str, ...]:
+        """The distinct notes on its highlights (trimmed, blank ones left
+        out), newest first."""
+        seen: Dict[str, None] = {}
+        for annotation in self.annotations:
+            note = _coerce_text(annotation.note)
+            if note and note.strip():
+                seen.setdefault(note.strip(), None)
+        return tuple(seen)
+
+    @property
+    def first_highlighted(self) -> Optional[datetime]:
+        """When you first highlighted it, or None if no highlight is dated."""
+        dates = [a.creation_date for a in self.annotations if a.creation_date is not None]
+        return min(dates) if dates else None
+
+    @property
+    def last_highlighted(self) -> Optional[datetime]:
+        """When you last highlighted it, or None if no highlight is dated."""
+        dates = [a.creation_date for a in self.annotations if a.creation_date is not None]
+        return max(dates) if dates else None
+
+    @property
+    def asset_ids(self) -> Tuple[str, ...]:
+        """The books it was highlighted in (asset ids, newest first)."""
+        seen: Dict[str, None] = {}
+        for annotation in self.annotations:
+            if annotation.asset_id is not None:
+                seen.setdefault(annotation.asset_id, None)
+        return tuple(seen)
+
+    @property
+    def context(self) -> Optional[str]:
+        """A sentence it was used in: the surrounding text Books keeps
+        (``representative_text``) of the newest highlight whose surrounding
+        text contains the term and says more than the term itself; None
+        if there is none."""
+        for annotation in self.annotations:
+            text = _coerce_text(annotation.representative_text)
+            if not text or not text.strip():
+                continue
+            folded = fold_for_match(selection_core(text))
+            if self.key in folded and folded != self.key:
+                return text.strip()
+        return None
+
+
+# get_vocabulary's orders: entry attribute, and whether None can occur.
+_VOCABULARY_ORDERS = ("last_highlighted", "first_highlighted", "term", "count")
+
+
+def _vocabulary_order(order_by) -> Tuple[str, bool]:
+    """``(field, descending)`` for a ``get_vocabulary`` ``order_by``.
+
+    :raises InvalidChoiceError: not one of the orders, with or without '-'.
+    """
+    valid = [*_VOCABULARY_ORDERS, *(f"-{name}" for name in _VOCABULARY_ORDERS)]
+    if isinstance(order_by, str):
+        name = order_by.strip()
+        field = name[1:] if name.startswith("-") else name
+        if field in _VOCABULARY_ORDERS:
+            return field, name.startswith("-")
+    shown = order_by if isinstance(order_by, str) and len(order_by) <= 40 else type(order_by).__name__
+    raise InvalidChoiceError(f"Unknown vocabulary order {shown!r}. Valid orders: {', '.join(valid)}.",
+                             value=order_by, valid=valid)
+
+
+def _vocabulary(annotations: Iterable["Annotation"]) -> List[VocabularyEntry]:
+    """Group short-selection highlights into entries (in key order)."""
+    groups: Dict[str, list] = {}
+    for annotation in annotations:
+        key = fold_for_match(selection_core(annotation.selected_text))
+        if key:
+            groups.setdefault(key, []).append(annotation)
+    entries = []
+    for key in sorted(groups):
+        members = _newest_first(groups[key])
+        entries.append(VocabularyEntry(term=selection_core(members[0].selected_text), key=key,
+                                       annotations=members))
+    return entries
+
+
+def _sort_vocabulary(entries: List[VocabularyEntry], field: str, descending: bool) -> List[VocabularyEntry]:
+    """``entries`` (in key order) by ``field``; ties by key, entries
+    without a value (no dated highlight) last in either direction."""
+    def value(entry):
+        return entry.key if field == "term" else getattr(entry, field)
+
+    present = [e for e in entries if value(e) is not None]
+    absent = [e for e in entries if value(e) is None]
+    present.sort(key=value, reverse=descending)  # stable: ties keep key order
+    return present + absent
