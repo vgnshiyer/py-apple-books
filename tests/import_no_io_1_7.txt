@@ -1,0 +1,3 @@
+# Modules added by stream 1.7 (position types) whose import must do no
+# I/O (R19); see tests/test_import_no_io.py.
+py_apple_books.positions

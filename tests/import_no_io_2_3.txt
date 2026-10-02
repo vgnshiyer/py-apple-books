@@ -1,0 +1,3 @@
+# Modules added by stream 2.3 (search) whose import must do no I/O
+# (R19): FTS5 is probed on first use, never at import.
+py_apple_books.search
