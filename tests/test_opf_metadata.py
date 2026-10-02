@@ -273,6 +273,10 @@ class TestIsbn:
         ([("0306406152", None, None)], None),  # a bare 10-digit number says nothing
         ([("0-306-40615-2", "ISBN", None)], "0306406152"),
         ([("isbn:080442957X", None, None)], "080442957X"),
+        ([("0-306-40615-3", "ISBN", None)], None),  # ISBN-10 checksum
+        ([("isbn:0804429578", None, None)], None),  # ISBN-10 checksum (X expected)
+        ([("0306406153", None, "02")], None),  # ISBN-10 checksum, ONIX-typed
+        ([("0-306-40615-3", "ISBN", None), ("0-306-40615-2", "ISBN", None)], "0306406152"),
         ([("0306406152", "ISBN", None), ("9780306406157", "ISBN", None)], "9780306406157"),
         ([("9780306406157", None, None)], "9780306406157"),  # a bare EAN-13 978/979
         ([("9770306406155", None, None)], None),  # a bare EAN-13 that isn't an ISBN
