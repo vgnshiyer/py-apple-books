@@ -109,28 +109,28 @@ class TestBookmark:
 class TestPages:
     def test_pdf_page_count_estimated(self, api, library, pdf):
         book = pdf()
-        row = library.add_annotation(book, None, kind="reading_position", user_data=page_location_blob(285),
-                                     position_fraction=286 / 485)
+        row = library.add_annotation(book, None, kind="reading_position", user_data=page_location_blob(40),
+                                     position_fraction=41 / 120)
         pos = api.get_reading_position(book["id"])
         assert (pos.source, pos.annotation_id, pos.location, pos.spine_index, pos.item_id) == (
             BOOKMARK, row, None, None, None)
-        assert (pos.page, pos.page_count, pos.page_count_estimated) == (286, 485, True)
+        assert (pos.page, pos.page_count, pos.page_count_estimated) == (41, 120, True)
         assert (pos.chapter, pos.match, pos.unavailable) == (None, None, R.NOT_EPUB)
 
     def test_pdf_page_count_recorded(self, api, library, pdf):
-        book = pdf(raw={"ZPAGECOUNT": 485})
-        library.add_annotation(book, None, kind="reading_position", user_data=page_location_blob(285),
+        book = pdf(raw={"ZPAGECOUNT": 120})
+        library.add_annotation(book, None, kind="reading_position", user_data=page_location_blob(40),
                                position_fraction=0.5)
         pos = api.get_reading_position(book["id"])
-        assert (pos.page, pos.page_count, pos.page_count_estimated) == (286, 485, False)
+        assert (pos.page, pos.page_count, pos.page_count_estimated) == (41, 120, False)
 
-    @pytest.mark.parametrize("fraction", [286 / 485.3, 286 / 484.6, None, 0.0])
+    @pytest.mark.parametrize("fraction", [41 / 120.3, 41 / 119.6, None, 0.0])
     def test_no_estimate_off_a_whole_number(self, api, library, pdf, fraction):
         book = pdf()
-        library.add_annotation(book, None, kind="reading_position", user_data=page_location_blob(285),
+        library.add_annotation(book, None, kind="reading_position", user_data=page_location_blob(40),
                                position_fraction=fraction)
         pos = api.get_reading_position(book["id"])
-        assert (pos.page, pos.page_count, pos.page_count_estimated) == (286, None, False)
+        assert (pos.page, pos.page_count, pos.page_count_estimated) == (41, None, False)
 
     def test_estimate_is_never_below_the_page(self, api, library, pdf):
         book = pdf()
@@ -161,6 +161,36 @@ class TestPages:
         pos = api.get_reading_position(seven["id"])
         assert (pos.spine_index, pos.chapter, pos.unavailable, pos.total_chapters) == (
             40, None, R.NO_LOCATION, 7)
+
+    def test_epub_page_data_without_an_ordinal_is_not_the_book_start(self, api, library, seven):
+        # A missing super.ordinal reads as 0, which isn't data: the page
+        # tier is skipped and the position inferred (or not given).
+        import plistlib
+
+        blob = plistlib.dumps({"class": "BKPageLocation", "pageOffset": 7}, fmt=plistlib.FMT_BINARY)
+        highlight = library.add_annotation(seven, "text 2.", location=cfi(2, "c2", "/4/2,/1:0,/1:4"))
+        library.add_annotation(seven, None, kind="reading_position", user_data=blob)
+        pos = api.get_reading_position(seven["id"])
+        assert (pos.source, pos.annotation_id, pos.spine_index, pos.chapter.title) == (
+            RECENT, highlight, 2, "Chapter 2")
+        assert api.get_reading_position(seven["id"], infer=False) is None
+
+    def test_epub_ordinal_zero_when_recorded(self, api, library, seven):
+        library.add_annotation(seven, None, kind="reading_position", user_data=page_location_blob(7, ordinal=0))
+        pos = api.get_reading_position(seven["id"])
+        assert (pos.source, pos.spine_index, pos.chapter.title, pos.page) == (BOOKMARK, 0, "Chapter 0", None)
+
+    def test_decode_reports_whether_the_ordinal_was_recorded(self):
+        import plistlib
+
+        from py_apple_books.models.location import PageLocation, _decode_page_location
+
+        bare = plistlib.dumps({"pageOffset": 7}, fmt=plistlib.FMT_BINARY)
+        assert _decode_page_location(bare) == (PageLocation(ordinal=0, page_offset=7), False)
+        assert _decode_page_location(page_location_blob(7, ordinal=3)) == (
+            PageLocation(ordinal=3, page_offset=7), True)
+        assert _decode_page_location(b"junk") is None
+        assert PageLocation.from_plist(bare) == PageLocation(ordinal=0, page_offset=7)
 
     def test_cfi_wins_over_page_data(self, api, library, seven):
         library.add_annotation(seven, None, kind="reading_position", location=cfi(2, "c2"),

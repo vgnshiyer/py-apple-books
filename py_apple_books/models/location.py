@@ -379,31 +379,44 @@ class PageLocation:
         isn't a dictionary (or has neither key), and for a page offset or
         ordinal that isn't an int in ``0..MAX_PAGE_INDEX``.
         """
-        if not isinstance(data, (bytes, bytearray, memoryview)):
+        found = _decode_page_location(data)
+        if found is None:
             return None
-        try:
-            size = memoryview(data).nbytes
-        except (TypeError, ValueError):
-            return None
-        if not size or size > MAX_PAGE_LOCATION_BYTES:
-            return None
-        import plistlib  # imported on first use, not when the package is imported
+        location = found[0]
+        return location if cls is PageLocation else cls(ordinal=location.ordinal,
+                                                         page_offset=location.page_offset)
 
-        try:
-            obj = plistlib.loads(bytes(data))
-        except Exception:  # noqa: BLE001 - any malformed input means "no page location"
-            return None
-        if not isinstance(obj, dict) or "$archiver" in obj or "$objects" in obj:
-            return None
-        parent = obj.get("super")
-        if parent is not None and not isinstance(parent, dict):
-            return None
-        has_offset = "pageOffset" in obj
-        has_ordinal = parent is not None and "ordinal" in parent
-        if not (has_offset or has_ordinal):
-            return None
-        page_offset = obj["pageOffset"] if has_offset else None
-        ordinal = parent["ordinal"] if has_ordinal else 0
-        if (has_offset and not _page_index(page_offset)) or not _page_index(ordinal):
-            return None
-        return cls(ordinal=ordinal, page_offset=page_offset)
+
+def _decode_page_location(data) -> Optional[Tuple["PageLocation", bool]]:
+    """``(PageLocation.from_plist(data), whether the data records
+    super.ordinal)``, or None (1.11, private): a missing ordinal reads as
+    0, which for an EPUB is not data (the facade's reading position takes
+    the spine item from it only when it was recorded)."""
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        return None
+    try:
+        size = memoryview(data).nbytes
+    except (TypeError, ValueError):
+        return None
+    if not size or size > MAX_PAGE_LOCATION_BYTES:
+        return None
+    import plistlib  # imported on first use, not when the package is imported
+
+    try:
+        obj = plistlib.loads(bytes(data))
+    except Exception:  # noqa: BLE001 - any malformed input means "no page location"
+        return None
+    if not isinstance(obj, dict) or "$archiver" in obj or "$objects" in obj:
+        return None
+    parent = obj.get("super")
+    if parent is not None and not isinstance(parent, dict):
+        return None
+    has_offset = "pageOffset" in obj
+    has_ordinal = parent is not None and "ordinal" in parent
+    if not (has_offset or has_ordinal):
+        return None
+    page_offset = obj["pageOffset"] if has_offset else None
+    ordinal = parent["ordinal"] if has_ordinal else 0
+    if (has_offset and not _page_index(page_offset)) or not _page_index(ordinal):
+        return None
+    return PageLocation(ordinal=ordinal, page_offset=page_offset), has_ordinal

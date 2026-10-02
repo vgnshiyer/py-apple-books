@@ -277,8 +277,8 @@ class _PositionsAPI:
         1. its CFI, when it has one into the book's spine
            (``source=BOOKMARK``, with :attr:`~ReadingPosition.location`);
         2. else its page data: for a PDF the page (``page``), for an EPUB
-           the spine item (``spine_index``; the position is the start of
-           that item);
+           the spine item it records (``spine_index``; the position is the
+           start of that item);
         3. else, with ``infer`` and for a book that isn't a PDF, the
            location of the newest highlight or bookmark with a CFI into
            the spine (``source=RECENT_ANNOTATION``, an inference: the
@@ -336,6 +336,15 @@ class _PositionsAPI:
             if row.furthest_fraction is not None and (fraction is None or row.furthest_fraction >= fraction):
                 furthest = row.furthest_fraction
             page_location = row.page_location
+            if page_location is not None and not is_pdf:
+                # An EPUB's spine item is taken from the page data only
+                # when it records one: a missing super.ordinal reads as 0,
+                # which isn't the start of the book.
+                from py_apple_books.models.location import _decode_page_location
+
+                decoded = _decode_page_location(row.location_data)
+                if decoded is None or not decoded[1]:
+                    page_location = None
         page = page_location.page if (is_pdf and page_location is not None) else None
 
         from py_apple_books._content_resolve import _Target, _target_of, _usable
