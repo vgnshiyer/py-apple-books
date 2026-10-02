@@ -32,7 +32,12 @@ Nothing here raises or logs: every outcome is a state
 Two bounded caches, registered with ``_icloud.register_file_cache`` (so
 ``content.clear_content_cache()`` empties them): the metadata of up to
 512 books (16 MiB) and a compact subject index of up to 20,000 books
-(8 MiB). Both are keyed by the bundle's absolute path and checked
+(8 MiB). The byte bounds are on an estimate of each entry's whole
+size (key, paths, identities and fixed overhead included; at least what
+tracemalloc measures), so they hold. A subject-index entry is estimated
+at 1.1 to 1.5 KiB, so its 8 MiB bound is reached first, at roughly
+6,000 to 7,000 books (fewer with long paths or many subjects). Both
+are keyed by the bundle's absolute path and checked
 against the identity (device, inode, mtime, size) of ``container.xml``
 and the package document, read through the same gated walk, on every
 use. Only results the files' content decides are stored: never one from
@@ -45,6 +50,7 @@ import math
 import os
 import posixpath
 import re
+import sys
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -890,15 +896,40 @@ _metadata_cache = _BoundedCache(512, 16 * 1024 * 1024)
 _subject_index = _BoundedCache(20_000, 8 * 1024 * 1024)
 
 
+# What a cache entry costs besides its strings and fields, with some
+# room (measured with tracemalloc on 3.10 and 3.14: about 700 bytes for
+# a subject-index entry, 150 more for a metadata one): the LRU's dict
+# node and (value, weight) pair, the entry objects, two identity tuples
+# of four ints.
+_SUBJECT_OVERHEAD = 896
+_METADATA_OVERHEAD = 1152
+
+
+def _text_weight(value: Optional[str]) -> int:
+    """A str's size (its object and the allocator's rounding)."""
+    return sys.getsizeof(value) + 16 if value else 0
+
+
 def _weight(fields: Optional[OpfFields]) -> int:
     if fields is None:
         return 256
     total = 256
     for value in (fields.language, fields.publisher, fields.published, fields.isbn, fields.description,
                   fields.cover_href, fields.series_title, *fields.subjects):
-        if value:
-            total += 64 + 4 * len(value)
+        total += _text_weight(value)
     return total
+
+
+def _metadata_weight(key: str, entry: "_Read") -> int:
+    """A metadata-cache entry's estimated size: key, paths, identities
+    and fields."""
+    return _METADATA_OVERHEAD + _text_weight(key) + _text_weight(entry.opf_rel) + _weight(entry.result.fields)
+
+
+def _subject_weight(key: str, item: "_Subjects") -> int:
+    """A subject-index entry's estimated size."""
+    return (_SUBJECT_OVERHEAD + _text_weight(key) + _text_weight(item.opf_rel)
+            + sum(8 + _text_weight(s) for s in item.folded or ()))
 
 
 def _clear_caches() -> None:
@@ -932,7 +963,7 @@ def read_metadata(bundle) -> OpfResult:
         return entry.result
     entry = _read(bundle, "full")
     if entry.result.cacheable:
-        _metadata_cache.put(key, entry, _weight(entry.result.fields))
+        _metadata_cache.put(key, entry, _metadata_weight(key, entry))
     else:
         _metadata_cache.discard(key)
     return entry.result
@@ -972,7 +1003,7 @@ def read_subjects(bundle) -> Optional[Tuple[str, ...]]:
     folded = _fold_all(result.fields.subjects) if result.state == READ and result.fields else None
     if result.cacheable:
         item = _Subjects(folded, entry.container_id, entry.opf_rel, entry.opf_id)
-        _subject_index.put(key, item, 128 + sum(64 + 4 * len(s) for s in folded or ()))
+        _subject_index.put(key, item, _subject_weight(key, item))
     else:
         _subject_index.discard(key)
     return folded

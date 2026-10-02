@@ -7,6 +7,7 @@ the guard's patch points.
 """
 
 import errno
+import gc
 import logging
 import os
 import pathlib
@@ -833,6 +834,34 @@ class TestCache:
             read(bundle(tmp_path, opf("<dc:description>" + "w " * 7000 + "</dc:description>"),
                         name=f"b{i}.epub"))
         assert 0 < _opf._metadata_cache.weight <= 100_000 and len(_opf._metadata_cache) < 10
+
+    @pytest.mark.parametrize("which", ["metadata", "subjects"])
+    def test_weight_estimate_covers_what_entries_use(self, tmp_path, which):
+        """The byte bounds hold: an entry's estimated weight (key, paths,
+        identities and fixed overhead included) is at least what it
+        uses, measured with tracemalloc, and not wildly more."""
+        # str paths: a pathlib.Path caches its parsed form on first use,
+        # which would count here.
+        paths = [str(bundle(tmp_path, opf("<dc:language>en</dc:language><dc:publisher>P</dc:publisher>"
+                                      + "".join(f"<dc:subject>Subject {i} {k}</dc:subject>" for k in range(i % 4))
+                                      + ("<dc:description>A short description.</dc:description>" if i % 2 else "")),
+                            name=f"book-{i:04d}.epub")) for i in range(300)]
+        cache, call = ((_opf._metadata_cache, read) if which == "metadata"
+                       else (_opf._subject_index, _opf.read_subjects))
+        call(paths[0])  # first-use allocations (caches of re, fold) out of the way
+        clear_content_cache()
+        gc.collect()
+        tracemalloc.start()
+        try:
+            before = tracemalloc.get_traced_memory()[0]
+            for path in paths:
+                call(path)
+            gc.collect()
+            used = tracemalloc.get_traced_memory()[0] - before
+        finally:
+            tracemalloc.stop()
+        assert len(cache) == len(paths)
+        assert used <= cache.weight <= 2 * used
 
     def test_oversized_entry_is_returned_not_stored(self, tmp_path, monkeypatch):
         monkeypatch.setattr(_opf._metadata_cache, "max_weight", 10)
