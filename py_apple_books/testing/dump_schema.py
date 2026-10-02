@@ -255,7 +255,9 @@ def dump_store(path: pathlib.Path) -> Tuple[str, dict]:
 def _one_statement(text: str) -> bool:
     """``text`` followed by ``;`` is exactly one complete SQL statement:
     no earlier ``;`` ends one (a ``;`` inside a trigger body or a string
-    does not)."""
+    does not), and no NUL hides text from SQLite's parser."""
+    if "\x00" in text:  # sqlite3.complete_statement raises ValueError on it
+        return False
     script = text + ";"
     ends = [i for i, ch in enumerate(script) if ch == ";"]
     return sqlite3.complete_statement(script) and not any(
@@ -287,8 +289,8 @@ def _schema_db(sql: str, what: str, *, inserts=(), views_and_triggers: bool = Fa
     ``views_and_triggers``), SQLite's own bookkeeping for them, and
     inserts into the tables named in ``inserts``: no ATTACH (and so no
     file is created), DETACH, PRAGMA, TEMP object, SELECT or function
-    call. Raises :class:`DumpError` when the script does not run or left
-    a TEMP object or another database behind.
+    call. Raises :class:`DumpError` when the script holds a NUL, does not
+    run, or left a TEMP object or another database behind.
     """
     creates = {sqlite3.SQLITE_CREATE_TABLE, sqlite3.SQLITE_CREATE_INDEX}
     if views_and_triggers:
@@ -312,6 +314,10 @@ def _schema_db(sql: str, what: str, *, inserts=(), views_and_triggers: bool = Fa
     mem = sqlite3.connect(":memory:")
     try:
         mem.set_authorizer(authorize)
+        if "\x00" in sql:
+            # Python 3.10 runs the script up to the NUL and ignores the rest;
+            # newer versions raise ValueError.
+            raise DumpError(f"self-check: {what} holds a NUL character")
         try:
             mem.executescript(sql)
         except sqlite3.Error as e:
@@ -392,6 +398,19 @@ def _local_regular(st) -> bool:
 
 def _os_error(e: OSError) -> str:
     return f"[Errno {e.errno}] {e.strerror}"  # never the path
+
+
+# SQLite's own fixed sentences ("database is locked", "disk I/O error").
+_SQLITE_SENTENCE = re.compile(r"[A-Za-z][A-Za-z /]{0,79}")
+
+
+def _sqlite_reason(e: sqlite3.Error) -> str:
+    """SQLite's message if it is one of its fixed sentences, else the
+    error name: a schema parse error quotes the cache's schema text."""
+    text = str(e)
+    if _SQLITE_SENTENCE.fullmatch(text):
+        return text
+    return getattr(e, "sqlite_errorname", None) or "SQLite error"  # the name needs Python 3.11
 
 
 def book_info_dir(data_dir) -> Optional[pathlib.Path]:
@@ -567,15 +586,18 @@ def dump_book_info(path) -> Tuple[str, dict]:
     try:
         con = sqlite3.connect(f"file:{quote(str(path))}?mode=ro{extra}", uri=True,
                               isolation_level=None, timeout=_BUSY_TIMEOUT)
+        # Decoded below, strictly: Python's own decode error would quote
+        # the schema text.
+        con.text_factory = bytes
         con.execute("BEGIN")  # one consistent snapshot, released right after
-        objects = con.execute(
+        rows = con.execute(
             "SELECT type, name, sql FROM sqlite_master WHERE type IN ('table', 'index') "
             "AND tbl_name = ? COLLATE NOCASE AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%'",
             (BOOK_INFO_TABLE,)).fetchall()
         columns = len(con.execute(f"PRAGMA table_info({_ident(BOOK_INFO_TABLE)})").fetchall())
         con.execute("COMMIT")
     except sqlite3.Error as e:
-        failure = f"{path.name} can't be read: {e}"
+        failure = f"{path.name} can't be read: {_sqlite_reason(e)}"
     finally:
         if con is not None:
             con.close()
@@ -588,6 +610,10 @@ def dump_book_info(path) -> Tuple[str, dict]:
                         f"read (Books closed, reopened or converted the cache); try again")
     if failure is not None:
         raise DumpError(failure)
+    try:
+        objects = [tuple(value.decode("utf-8") for value in row) for row in rows]
+    except UnicodeDecodeError:
+        raise DumpError(f"{path.name}: a {BOOK_INFO_TABLE} schema entry is not valid UTF-8") from None
     if not any(kind == "table" for kind, _, _ in objects):
         raise DumpError(f"{path.name} has no {BOOK_INFO_TABLE} table")
     if not all(_is_plain_ddl(sql) for _, _, sql in objects):

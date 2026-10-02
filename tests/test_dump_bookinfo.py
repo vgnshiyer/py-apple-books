@@ -312,6 +312,8 @@ def test_self_check_book_info(tmp_path):
         "a comment": ddl + f"-- {SECRET}title by {SECRET}author\n",
         "an inline comment": ddl.replace("ZORTHOGRAPHY BLOB", f"ZORTHOGRAPHY BLOB /* {SECRET} */"),
         "an end-of-line comment": ddl.replace(" );", f" ); -- {SECRET}", 1),
+        "a backtick-quoted name": ddl + f"CREATE INDEX I ON {TABLE} (`ZGENRE`);",
+        "a NUL": ddl.replace(" );", f" ) \x00{SECRET};", 1),
     }
     for label, sql in rejected.items():
         with pytest.raises(dump_schema.DumpError):
@@ -417,6 +419,62 @@ def test_cache_ddl_with_a_literal_is_refused(folder, extra):
     assert SECRET not in str(info.value)
 
 
+def _inject_raw(path: pathlib.Path, name: str, text: bytes) -> None:
+    """Like :func:`_inject`, with bytes stored as text (invalid UTF-8)."""
+    con = sqlite3.connect(path, isolation_level=None)
+    try:
+        con.execute("PRAGMA writable_schema = ON")
+        con.execute("UPDATE sqlite_master SET sql = CAST(? AS TEXT) WHERE name = ?", (text, name))
+        con.execute("PRAGMA writable_schema = OFF")
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize("variant, message", [
+    ("nul", "is not a plain CREATE TABLE or CREATE INDEX statement"),
+    ("invalid_utf8", "schema entry is not valid UTF-8"),
+    ("parse_error", "can't be read: "),
+])
+def test_crafted_schema_text_is_a_note_without_it(lib, folder, tmp_path, capsys, variant, message):
+    """Schema text that would stop Python's statement check (a NUL), or
+    that SQLite or Python would quote in an error: a fixed message
+    without the text, and the stores are still dumped."""
+    path = folder / CACHE_NAME
+    cases.create(path).close()
+    table_sql = next(sql for kind, _, _, sql in cache_objects(path) if kind == "table")
+    if variant == "nul":
+        _inject(path, TABLE, table_sql + " \x00SECRETVALUE")
+    elif variant == "invalid_utf8":  # an identifier byte, so SQLite still parses it
+        _inject_raw(path, TABLE, table_sql.encode().replace(
+            b"ZORTHOGRAPHY BLOB", b"ZORTHOGRAPHY BLOB, Z\xffSECRETVALUE INTEGER"))
+    else:  # SQLite's message would be: near "SECRETVALUE": syntax error
+        _inject(path, TABLE, table_sql + " SECRETVALUE")
+    with pytest.raises(dump_schema.DumpError, match=re.escape(message)) as info:
+        dump_schema.dump_book_info(path)
+    assert "SECRETVALUE" not in str(info.value) and str(folder) not in str(info.value)
+    assert dump(lib, tmp_path / "out") == 0
+    assert sorted(p.name for p in fixture_dir(tmp_path / "out").iterdir()) == STORE_FILES
+    captured = capsys.readouterr()
+    assert f"note: AEBookInfo.sql not written: {CACHE_NAME}" in captured.err
+    assert "SECRETVALUE" not in captured.out + captured.err
+
+
+def test_sqlite_reason_keeps_only_fixed_sentences():
+    for text in ("database is locked", "disk I/O error", "unable to open database file"):
+        assert dump_schema._sqlite_reason(sqlite3.OperationalError(text)) == text
+    quoted = sqlite3.OperationalError('malformed database schema (ZAEBOOKINFO) - near "SECRETVALUE": syntax error')
+    assert "SECRETVALUE" not in dump_schema._sqlite_reason(quoted)
+    assert "SECRETVALUE" not in dump_schema._sqlite_reason(sqlite3.OperationalError("no such table: SECRETVALUE"))
+
+
+def test_schema_script_with_a_nul_is_a_dump_error():
+    # Python 3.10 would run the script up to the NUL and skip the rest
+    # unseen; later versions raise ValueError. Either way: refused.
+    for run in (dump_schema.self_check, dump_schema.table_columns):
+        with pytest.raises(dump_schema.DumpError, match="holds a NUL character"):
+            run(cases.ddl() + f"\x00INSERT INTO {TABLE} (ZBOOKTITLE) VALUES ('{SECRET}title');")
+
+
 def test_crafted_store_schema_is_never_run(lib, tmp_path, capsys):
     attached = tmp_path / "attached.db"
     con = sqlite3.connect(lib.library_path)
@@ -459,6 +517,9 @@ def test_store_entries_may_be_triggers_and_views(lib):
     ("CREATE TABLE ZX (a /* note */)", False, False),
     ("CREATE TABLE ZX (a DEFAULT 'x')", True, False),
     ("CREATE TABLE ZX (a DEFAULT 'x;y')", True, False),
+    ("CREATE INDEX I ON ZX (`ZA`)", True, False),
+    ("CREATE TABLE ZX (a)\x00; ATTACH 'x' AS e", False, False),
+    ("CREATE TABLE ZX (a)\x00", False, False),
     ("create table ZX (a)", False, False),
     ("INSERT INTO ZX VALUES (1)", False, False),
 ])
