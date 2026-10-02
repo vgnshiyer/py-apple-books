@@ -5,6 +5,7 @@ only.
 """
 
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -464,7 +465,10 @@ def test_testing_package_uses_only_the_standard_library():
     """Loaded on its own (as tests/mcp_compat/run.py loads it, with no
     ``py_apple_books`` package around it) and used, it imports nothing
     outside the standard library."""
-    proc = subprocess.run([sys.executable, "-I", "-B", "-c", _STANDALONE, str(REPO / "py_apple_books" / "testing")],
+    # The installed package (editable or wheel), not a path under REPO: the
+    # dist jobs run a copy of tests/ with no source tree beside it.
+    tdir = pathlib.Path(importlib.util.find_spec("py_apple_books.testing").origin).parent
+    proc = subprocess.run([sys.executable, "-I", "-B", "-c", _STANDALONE, str(tdir)],
                           capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr[-3000:]
     loaded = set(json.loads(proc.stdout.strip().splitlines()[-1]))
