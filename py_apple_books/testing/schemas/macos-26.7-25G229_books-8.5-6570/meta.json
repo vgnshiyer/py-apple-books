@@ -1,4 +1,8 @@
 {
+  "book_info": {
+    "columns": 72,
+    "file": "AEBookInfo-v20250715-26.7.sqlite"
+  },
   "books": "8.5",
   "books_build": "6570",
   "macos": "26.7",
