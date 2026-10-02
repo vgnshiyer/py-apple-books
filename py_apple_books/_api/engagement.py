@@ -254,6 +254,7 @@ class _EngagementAPI:
         i_id, i_uuid, i_asset, i_note, i_text = (keys.index(k) for k in (
             "id", "uuid", "asset_id", "note", "selected_text"))
         candidates = []
+        prefix = _eng._sample_prefix(day, seed)
         for row in Annotation.manager.filter(**filters, where=where, only=list(_SAMPLE_FIELDS)).run_query():
             text = _coerce_text(row[i_text])
             if not text or not text.strip():
@@ -267,7 +268,7 @@ class _EngagementAPI:
             if exclude_short and is_short_selection(text):
                 continue
             note = _coerce_text(row[i_note])
-            candidates.append((_eng._sample_key(day, seed, ident, bool(note and note.strip())),
+            candidates.append((_eng._sample_key(day, seed, ident, bool(note and note.strip()), prefix=prefix),
                                pk, row[i_asset]))
 
         ranked = _eng._rank(candidates)

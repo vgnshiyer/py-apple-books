@@ -112,6 +112,36 @@ class TestAlgorithm:
         assert engagement._sample_key(DAY, "s", ident, True) == oracle_key(DAY, "s", ident, True)
         assert engagement._sample_key(DAY, None, ident, False) == GOLDEN_KEY
 
+    @pytest.mark.parametrize("seed", [None, "", "s", "\ud83d", "x\x1fy", "é" * 3])
+    def test_a_shared_prefix_gives_the_same_key(self, seed):
+        prefix = engagement._sample_prefix(DAY, seed)
+        for ident in ("A", "pk:7", "\udc00", ""):
+            for noted in (False, True):
+                assert (engagement._sample_key(DAY, seed, ident, noted, prefix=prefix)
+                        == engagement._sample_key(DAY, seed, ident, noted)
+                        == oracle_key(DAY, seed, ident, noted))
+
+    def test_a_long_seed_is_hashed_once(self, api, library, monkeypatch):
+        """The day and seed are hashed once per sample, not once per
+        highlight, so a long caller-supplied seed costs its length once."""
+        library.populate(books=4, annotations_per_book=50)
+        engagement_helpers.realistic_texts(library)
+        hashed = []
+        real = engagement.hashlib.blake2b
+
+        def counting(*args, **kwargs):
+            hashed.append(1)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(engagement.hashlib, "blake2b", counting)
+        seed = "s" * 1_000_000
+        start = time.perf_counter()
+        picks = ids(api.sample_highlights(on=DAY, seed=seed, limit=3))
+        assert time.perf_counter() - start < 2.0
+        assert len(picks) == 3 and len(hashed) == 1
+        monkeypatch.setattr(engagement.hashlib, "blake2b", real)
+        assert picks == ids(api.sample_highlights(on=DAY, seed=seed, limit=3))
+
     def test_ident(self):
         assert engagement._sample_ident("ab-cd", 5) == "AB-CD"
         assert engagement._sample_ident(None, 5) == engagement._sample_ident("", 5) == "pk:5"
@@ -135,6 +165,12 @@ class TestAlgorithm:
         class Fake:
             def __init__(self, *a, **k):
                 pass
+
+            def update(self, data):
+                pass
+
+            def copy(self):
+                return self
 
             def digest(self):
                 return digest

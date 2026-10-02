@@ -170,7 +170,16 @@ def _sample_ident(uuid, pk) -> str:
     return uuid.upper() if uuid else f"pk:{pk}"
 
 
-def _sample_key(day: date, seed: Optional[str], ident: str, noted: bool) -> int:
+def _sample_prefix(day: date, seed: Optional[str]):
+    """The ``pab-sample-v1`` BLAKE2b state after ``'<day ISO>\x1f<seed>\x1f'``,
+    hashed once per sample and copied for each highlight (so a long
+    seed costs its length once, not once per highlight)."""
+    state = hashlib.blake2b(digest_size=8, person=_SAMPLE_PERSON)
+    state.update(f"{day.isoformat()}\x1f{seed or ''}\x1f".encode("utf-8", "surrogatepass"))
+    return state
+
+
+def _sample_key(day: date, seed: Optional[str], ident: str, noted: bool, *, prefix=None) -> int:
     """The ``pab-sample-v1`` key of one highlight; larger ranks first.
 
     ``H`` is the 64-bit BLAKE2b digest (personalised with the algorithm
@@ -179,10 +188,12 @@ def _sample_key(day: date, seed: Optional[str], ident: str, noted: bool) -> int:
     ``h = (H >> 11) | 1``, so ``u = h / 2**53`` lies strictly inside
     (0, 1). The weighted key ``u ** (1 / w)`` (w = 2 for a highlight with
     a note, else 1) is compared squared, in integers: ``h << 53`` for a
-    note, ``h * h`` otherwise.
+    note, ``h * h`` otherwise. ``prefix``: :func:`_sample_prefix` of
+    ``day`` and ``seed``, when already computed.
     """
-    data = f"{day.isoformat()}\x1f{seed or ''}\x1f{ident}".encode("utf-8", "surrogatepass")
-    digest = hashlib.blake2b(data, digest_size=8, person=_SAMPLE_PERSON).digest()
+    state = (prefix if prefix is not None else _sample_prefix(day, seed)).copy()
+    state.update(ident.encode("utf-8", "surrogatepass"))
+    digest = state.digest()
     h = (int.from_bytes(digest, "big") >> 11) | 1
     return h << 53 if noted else h * h
 
