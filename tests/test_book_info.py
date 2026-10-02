@@ -16,6 +16,7 @@ import logging
 import os
 import pathlib
 import pickle
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -313,12 +314,15 @@ def test_open_rule(case, home, spy):
     else:
         assert len(spy.uris) == 1 and spy.uris[0].endswith(
             "?mode=ro&immutable=1" if case.mode == cases.WAL_IMMUTABLE else "?mode=ro")
+    committed = {key: CachedBookInfo(key, title, f"{cases.SECRET}ZBOOKAUTHOR-1",
+                                     f"{cases.SECRET}ZBOOKLANGUAGE-1", f"{cases.SECRET}ZPUBLISHERNAME-1",
+                                     f"{cases.SECRET}ZPUBLISHERYEAR-1", cases.CACHE_NAME)}
     if case.readable is True and case.mode is not cases.REFUSED:
-        assert got == {key: CachedBookInfo(key, title, f"{cases.SECRET}ZBOOKAUTHOR-1",
-                                           f"{cases.SECRET}ZBOOKLANGUAGE-1", f"{cases.SECRET}ZPUBLISHERNAME-1",
-                                           f"{cases.SECRET}ZPUBLISHERYEAR-1", cases.CACHE_NAME)}
+        assert got == committed
     elif case.readable is False:
         assert got == {}
+    else:  # the SQLite build decides (a hot journal): skipped, or the committed row only
+        assert got in ({}, committed)
     # Nothing created, removed or changed; only SQLite's shared-memory WAL
     # index may be written in place by a read-only WAL read.
     if case.mode == cases.WAL:
@@ -425,6 +429,36 @@ def test_a_spilled_uncommitted_write_is_never_returned(home, reader):
               "UPDATE ZAEBOOKINFO SET ZBOOKTITLE = 'uncommitted' || hex(randomblob(500))"):
         got = reader.get_cached_book_info([f"K{i}" for i in range(200)])
     assert all(info.title == "committed" for info in got.values())
+
+
+def test_a_hot_journal_never_shows_uncommitted_titles(home, reader):
+    # A copy of a cache and its journal taken while a writer had spilled
+    # retitled pages into the file: the journal is hot. A read-only open
+    # can't roll it back, so the file is skipped (or, on a SQLite build
+    # that reads past it, only committed titles are seen); nothing is
+    # written.
+    folder = home.book_info_dir
+    work = home.root / "work"
+    source = home.add_book_info_cache([{"asset_id": f"K{i}", "title": "committed"} for i in range(400)],
+                                      journal_mode="DELETE")
+    staged = work / source.name
+    work.mkdir()
+    os.replace(source, staged)
+    writer = sqlite3.connect(staged, isolation_level=None)
+    try:
+        writer.execute("PRAGMA cache_size=1")
+        writer.execute("BEGIN")
+        writer.execute("UPDATE ZAEBOOKINFO SET ZBOOKTITLE = 'uncommitted' || hex(randomblob(800))")
+        assert os.path.exists(f"{staged}-journal")
+        for side in ("", "-journal"):
+            shutil.copyfile(f"{staged}{side}", f"{source}{side}")
+        writer.execute("ROLLBACK")
+    finally:
+        writer.close()
+    before, before_bytes = cases.listing(folder), cases.contents(folder)
+    got = reader.get_cached_book_info([f"K{i}" for i in range(400)])
+    assert all(info.title == "committed" for info in got.values())
+    assert cases.listing(folder) == before and cases.contents(folder) == before_bytes
 
 
 def test_immutable_read_is_rechecked(home, reader, monkeypatch):
