@@ -296,6 +296,8 @@ class _EngagementAPI:
             ``after`` or ``before``.
         :raises InvalidChoiceError: an unknown ``order_by``.
         :raises BookNotFoundError: no book has id ``book_id``.
+        :raises UnsupportedSchemaError: ``underline_only`` on a store
+            with neither the underline flag nor the style column.
         """
         limit, offset = strict_limit(limit), strict_offset(offset)
         field, descending = _eng._vocabulary_order(order_by)

@@ -10,7 +10,8 @@ import pytest
 from py_apple_books import PyAppleBooks
 from py_apple_books.db import LibraryDB, use_library
 from py_apple_books.engagement import VocabularyEntry
-from py_apple_books.exceptions import BookNotFoundError, InvalidArgumentError, InvalidChoiceError
+from py_apple_books.exceptions import (BookNotFoundError, InvalidArgumentError, InvalidChoiceError,
+                                       UnsupportedSchemaError)
 from py_apple_books.text import is_short_selection
 from py_apple_books.utils import APPLE_EPOCH_OFFSET
 from tests import engagement_helpers
@@ -76,6 +77,29 @@ def test_context_skips_text_without_the_word(api, library):
                            raw={"ZANNOTATIONREPRESENTATIVETEXT": "The last word on it."})
     (entry,) = api.get_vocabulary()
     assert entry.context == "The last word on it."
+
+
+@pytest.mark.parametrize("term, newer, older, expected", [
+    # The newer text has the term only inside other words.
+    ("art", "The party started late.", "Art, they said, is long.", "Art, they said, is long."),
+    ("art", "The party started late.", "Smart artists.", None),
+    ("in medias res", "Begin in medias resolutely.", "Begin in medias res, always.",
+     "Begin in medias res, always."),
+    ("Café", "A cafeteria opened.", "We met at the café downtown.", "We met at the café downtown."),
+    ("ending", "It's the ending_word here.", "A happy-ending story.", "A happy-ending story."),
+    # Scripts without spaces between words: inside a run is fine.
+    ("猫", "黒猫が好き。", "猫", "黒猫が好き。"),
+    ("แมว", "ฉันรักแมวมาก", "แมว", "ฉันรักแมวมาก"),
+])
+def test_context_matches_whole_words(api, library, term, newer, older, expected):
+    book = library.add_book("B")
+    library.add_annotation(book, term, created=local(2026, 1, 2),
+                           raw={"ZANNOTATIONREPRESENTATIVETEXT": newer})
+    library.add_annotation(book, term, created=local(2026, 1, 1),
+                           raw={"ZANNOTATIONREPRESENTATIVETEXT": older})
+    (entry,) = api.get_vocabulary()
+    assert entry.count == 2
+    assert entry.context == expected
 
 
 def test_entry_type(api, words):
@@ -184,6 +208,18 @@ def test_without_selected_text(make_library, sql_trace):
         before = len(sql_trace)
         assert api.get_vocabulary() == []
         assert len(sql_trace) == before   # no query, no schema re-read
+
+
+def test_underline_only_without_underline_columns(make_library):
+    lib = make_library()
+    lib.add_annotation(lib.add_book("B"), "word", kind="underline")
+    for column in ("ZANNOTATIONISUNDERLINE", "ZANNOTATIONSTYLE"):
+        lib.execute("annotations", f"ALTER TABLE ZAEANNOTATION DROP COLUMN {column}")
+    with LibraryDB(data_dir=lib.data_dir) as db, use_library(db):
+        api = PyAppleBooks()
+        assert terms(api.get_vocabulary()) == ["word"]
+        with pytest.raises(UnsupportedSchemaError, match="ZANNOTATIONSTYLE"):
+            api.get_vocabulary(underline_only=True)
 
 
 @pytest.mark.parametrize("count", [10_000] + ([50_000] if engagement_helpers.SLOW else []))

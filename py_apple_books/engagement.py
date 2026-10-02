@@ -30,6 +30,7 @@ Python version; a new algorithm gets a new name.
 
 import hashlib
 import math
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Dict, Hashable, Iterable, List, Optional, Sequence, Tuple
@@ -279,16 +280,52 @@ class VocabularyEntry:
     def context(self) -> Optional[str]:
         """A sentence it was used in: the surrounding text Books keeps
         (``representative_text``) of the newest highlight whose surrounding
-        text contains the term and says more than the term itself; None
-        if there is none."""
+        text contains the term as a whole word or phrase (not inside a
+        longer word; in Chinese, Japanese, Thai and other scripts written
+        without spaces, anywhere) and says more than the term itself;
+        None if there is none."""
         for annotation in self.annotations:
             text = _coerce_text(annotation.representative_text)
             if not text or not text.strip():
                 continue
             folded = fold_for_match(selection_core(text))
-            if self.key in folded and folded != self.key:
+            if folded != self.key and _has_word(folded, self.key):
                 return text.strip()
         return None
+
+
+# Scripts written without spaces between words, where a word can sit
+# inside a longer run of letters: Thai, Lao, Myanmar, Khmer (East Asian
+# wide characters are recognised by their width).
+_UNSPACED_SCRIPTS = ((0x0E00, 0x0EFF), (0x1000, 0x109F), (0x1780, 0x17FF))
+
+
+def _joins_word(ch: str) -> bool:
+    """Whether ``ch`` would continue a word next to it: a letter, number,
+    mark or underscore of a script that separates words with spaces."""
+    if ch == "_":
+        return True
+    if unicodedata.category(ch)[0] not in "LNM" or unicodedata.east_asian_width(ch) in ("W", "F"):
+        return False
+    cp = ord(ch)
+    return not any(low <= cp <= high for low, high in _UNSPACED_SCRIPTS)
+
+
+def _has_word(text: str, key: str) -> bool:
+    """Whether ``key`` occurs in ``text`` (both folded) as a whole word or
+    phrase: no occurrence counts whose neighbour would continue its first
+    or last word ('art' is not in 'started')."""
+    if not key:
+        return False
+    start = text.find(key)
+    while start != -1:
+        end = start + len(key)
+        joined_before = start > 0 and _joins_word(key[0]) and _joins_word(text[start - 1])
+        joined_after = end < len(text) and _joins_word(key[-1]) and _joins_word(text[end])
+        if not joined_before and not joined_after:
+            return True
+        start = text.find(key, start + 1)
+    return False
 
 
 # get_vocabulary's orders: entry attribute, and whether None can occur.
