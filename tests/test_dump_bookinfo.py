@@ -103,7 +103,7 @@ def test_committed_book_info_is_schema_only(schema):
         pytest.skip("no AEBookInfo.sql in this schema")
     sql = sql_file.read_text()
     dump_schema.self_check_book_info(sql)
-    # DDL only: CREATE statements, no literal that could carry a value.
+    # DDL only: CREATE statements, no string literal or quoted name.
     statements = [line for line in sql.splitlines() if line and not line.startswith("--")]
     assert all(re.match(r"CREATE (TABLE|INDEX) ", s) for s in statements)
     assert "'" not in sql and '"' not in sql and "/Users/" not in sql
@@ -485,8 +485,24 @@ def test_crafted_store_schema_is_never_run(lib, tmp_path, capsys):
     with pytest.raises(dump_schema.DumpError, match="not a single CREATE statement"):
         dump_schema.dump_store(lib.library_path)
     assert dump(lib, tmp_path / "out") == 1
-    assert "not a single CREATE statement" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "not a single CREATE statement" in err and "py-apple-books/issues" in err
     assert not attached.exists() and not (tmp_path / "out").exists()
+
+
+def test_store_the_self_check_refuses_points_at_the_tracker(lib, tmp_path, capsys):
+    """The trade-off of the authorizer: a store with an index on a
+    function call (1.10 dumped one) is refused, and the message asks for
+    a report instead of failing silently."""
+    con = sqlite3.connect(lib.library_path)
+    con.execute("CREATE INDEX Z_FUNCTION_INDEX ON ZBKCOLLECTION (abs(Z_PK))")
+    con.commit()
+    con.close()
+    assert dump(lib, tmp_path / "out") == 1
+    err = capsys.readouterr().err
+    assert "error: BKLibrary: self-check: the store SQL does not run: not authorized" in err
+    assert "please report it at https://github.com/vgnshiyer/py-apple-books/issues" in err
+    assert not (tmp_path / "out").exists()
 
 
 def test_store_entries_may_be_triggers_and_views(lib):

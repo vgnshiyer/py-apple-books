@@ -21,7 +21,9 @@ When Books keeps per-book info caches next to the library
 found from ``--data-dir`` when it is a ``Documents`` folder), the dump
 also writes ``AEBookInfo.sql``: the ``CREATE TABLE``/``CREATE INDEX``
 statements of the newest cache's ``ZAEBOOKINFO`` table and nothing
-else, with no literal or comment in them, and ``meta.json`` gains
+else, with no string or blob literal, quoted name or comment in them
+(numbers and unquoted names pass, so a fixture is still reviewed by eye
+before it is committed), and ``meta.json`` gains
 ``"book_info": {"file", "columns"}``. The cache is opened by its header
 and never written: rollback journal or WAL with both sidecars
 read-only (SQLite's own read locks; for WAL, SQLite may rebuild the
@@ -118,6 +120,11 @@ _PLAIN_DDL = re.compile(r"CREATE (?:TABLE|(?:UNIQUE )?INDEX) ")
 _COMMENT_MARKS = ("--", "/*")
 _LITERAL_MARKS = ("'", '"', "`")
 _SCHEMA_TABLES = frozenset({"sqlite_master", "sqlite_schema"})
+
+
+# Appended when a store fails a schema check: a store Books wrote that
+# fails one means the checks need to learn its schema.
+_REPORT = "if Books wrote this store, please report it at https://github.com/vgnshiyer/py-apple-books/issues"
 
 
 class DumpError(Exception):
@@ -221,7 +228,8 @@ def dump_store(path: pathlib.Path) -> Tuple[str, dict]:
         con.close()
 
     if not all(_is_store_entry(sql) for _, _, sql in objects):
-        raise DumpError(f"{path.name}: a schema entry is not a single CREATE statement without comments")
+        raise DumpError(f"{path.name}: a schema entry is not a single CREATE statement without comments; "
+                        f"{_REPORT}")
     rank = {"table": 0, "index": 1}
     objects.sort(key=lambda o: (rank.get(o[0], 2), o[1]))
     meta = _clean_plist(plist)
@@ -272,8 +280,13 @@ def _is_store_entry(sql: str) -> bool:
 
 
 def _is_plain_ddl(sql: str) -> bool:
-    """One CREATE TABLE or CREATE INDEX statement with no literal, quoted
-    name, comment or ``;`` in it, so it carries nothing but the schema."""
+    """One CREATE TABLE or CREATE INDEX statement with no string or blob
+    literal, quoted name, comment, NUL or ``;`` in it.
+
+    That keeps quoted text out, not every value: a number (``DEFAULT 1``,
+    ``WHERE ZA > 0``) or an unquoted name still passes. Books' own DDL has
+    neither beyond its names; a committed fixture is still reviewed by
+    eye."""
     text = sql.strip()
     return (bool(_PLAIN_DDL.match(text))
             and not any(m in text for m in _LITERAL_MARKS + _COMMENT_MARKS + (";",))
@@ -631,10 +644,11 @@ def self_check_book_info(sql: str) -> None:
 
     Enforced on the text, not only on what it builds: apart from the two
     header comment lines :func:`dump_book_info` writes, ``sql`` must be
-    plain ``CREATE TABLE``/``CREATE INDEX`` statements with no literal,
-    quoted name or comment (nothing that could carry a value), and it is
-    run under the authorizer of :func:`_schema_db`, so it can't attach a
-    database, create a file or a TEMP object.
+    plain ``CREATE TABLE``/``CREATE INDEX`` statements with no string or
+    blob literal, quoted name or comment (see :func:`_is_plain_ddl`: a
+    number or an unquoted name still passes), and it is run under the
+    authorizer of :func:`_schema_db`, so it can't attach a database,
+    create a file or a TEMP object.
     """
     if "/Users/" in sql:
         raise DumpError(f"self-check: {BOOK_INFO}.sql contains a /Users/ path")
@@ -838,7 +852,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 meta["book_info"] = book_info[1]
             meta_text = json.dumps(meta, indent=2, sort_keys=True) + "\n"
             for store, (sql, _) in dumped.items():
-                self_check(sql, meta_text)
+                try:
+                    self_check(sql, meta_text)
+                except DumpError as e:
+                    raise DumpError(f"{store}: {e}; {_REPORT}") from None
             out = args.out / name
             out.mkdir(parents=True, exist_ok=True)
             # Progress goes to stderr; stdout carries only the reports.
