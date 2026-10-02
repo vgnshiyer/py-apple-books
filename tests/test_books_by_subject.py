@@ -223,6 +223,22 @@ class TestPaging:
         if order_by is None:
             assert whole == sorted(whole)
 
+    def test_reading_stops_once_the_page_is_full(self, lib, many, monkeypatch):
+        whole = lib.ids("topic")
+        calls = []
+        real = _opf.read_subjects
+        monkeypatch.setattr(_opf, "read_subjects", lambda path: calls.append(path) or real(path))
+        for offset, limit in ((None, 2), (3, 2), (0, 1), (15, 10), (None, None)):
+            calls.clear()
+            got = lib.ids("topic", limit, offset=offset)
+            start = offset or 0
+            end = len(whole) if limit is None else start + limit
+            assert got == whole[start:end]
+            # Only books up to the last one the page needs are read (a
+            # genre match never is); every one without a limit or a full page.
+            last = whole[end - 1] if limit is not None and end <= len(whole) else many[-1]
+            assert len(calls) == sum(1 for i, book in enumerate(many) if i % 3 and book <= last)
+
     def test_count_and_slice_run_one_statement(self, lib, many, sql_trace):
         list(lib.api.list_books())  # schema read
         sql_trace.clear()

@@ -208,8 +208,10 @@ class _MetadataAPI:
         touching the disk, and nothing is downloaded: a book with any
         part on the way to its package document only in iCloud is
         skipped. Subjects are cached while the files are unchanged.
-        ``offset`` and ``limit`` then apply in Python; ``count()`` and
-        slices of the result read the list (no further statement).
+        ``offset`` and ``limit`` then apply in Python (with a ``limit``,
+        no file is read once ``offset + limit`` books have matched);
+        ``count()`` and slices of the result read the list (no further
+        statement).
 
         One deadline covers the whole call: the library's
         ``query_timeout`` and any :meth:`query_deadline`, counted from
@@ -237,8 +239,14 @@ class _MetadataAPI:
         matches = _subject_matcher(subject)
         keys = list(Book._get_mappings("Book"))
         i_genre, i_path, i_state = (keys.index(k) for k in ("genre", "path", "state"))
+        start = offset or 0
+        # Results keep candidate order, so once offset + limit books have
+        # matched no later candidate can be on the page: stop reading.
+        wanted = None if limit is None else start + limit
         found = []
         for row in rows:
+            if wanted is not None and len(found) >= wanted:
+                break
             genre = row[i_genre] if i_genre < len(row) else None
             if matches(None if genre is None else (fold_for_match(genre) or "",)):
                 found.append(row)
@@ -251,7 +259,6 @@ class _MetadataAPI:
                     f"Subject search took too long and was stopped (limit {seconds:g} s).", timeout=seconds)
             if matches(_opf.read_subjects(path)):
                 found.append(row)
-        start = offset or 0
         page = found[start:] if limit is None else found[start:start + limit]
         return ModelIterable(lambda: page, Book)
 
