@@ -44,6 +44,16 @@ def test_bookmarks_and_positions_are_not_underlines(api, underlines):
     assert ids == {underlines[f"u{i}"] for i in range(5)}
 
 
+def test_the_flag_decides_when_the_column_exists(api, library):
+    # With ZANNOTATIONISUNDERLINE present, the flag alone decides: a
+    # flagged row with a color style is an underline, and an unflagged
+    # style-0 row is not (style 0 is only the fallback without the flag).
+    book = library.add_book("Flagged")
+    flagged = library.add_annotation(book, "flagged", raw={"ZANNOTATIONISUNDERLINE": 1, "ZANNOTATIONSTYLE": 3})
+    library.add_annotation(book, "style zero", raw={"ZANNOTATIONISUNDERLINE": 0, "ZANNOTATIONSTYLE": 0})
+    assert [a.id for a in api.get_underlines()] == [flagged]
+
+
 def test_deleted_with_include_deleted(api, underlines):
     assert underlines["gone"] in {a.id for a in api.get_underlines(include_deleted=True)}
     assert underlines["gone"] not in {a.id for a in api.get_underlines()}
