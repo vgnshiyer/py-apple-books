@@ -174,6 +174,25 @@ def test_entries_at_the_same_place(tmp_path):
     assert content.get_chapter("1") == "Part I\n\nfirst chapter text."
 
 
+def test_entries_before_any_text_begin_at_the_start_of_the_file(tmp_path):
+    content = BookContent(_span_shapes.leading_anchors(tmp_path))
+    assert [(c.order, c.title, c.fragment, c.depth) for c in content.list_chapters()] == [
+        (1, "Part", "part", 0), (2, "Chapter", "", 1), (3, "Y", "y", 0), (4, "X", "x", 0)]
+    # The part's heading comes before any text of the chapter's file: both
+    # begin at its start, and the chapter, later in the ToC, has the text.
+    assert content.get_chapter("1", span="section") == ""
+    assert content.get_chapter("1", span="chapter") == "Part\n\nchapter text."
+    for span in SPANS:
+        assert content.get_chapter("2", span=span) == "Part\n\nchapter text."
+        # Two empty anchors: the ToC order decides, not the document order.
+        assert content.get_chapter("3", span=span) == ""
+        assert content.get_chapter("4", span=span) == "second text."
+    # 1.10's text is unchanged.
+    assert content.get_chapter("1") == "Part\n\nchapter text."
+    assert content.get_chapter("3") == "second text."
+    assert content.get_chapter("4") == ""
+
+
 def test_nonlinear_and_broken_spine_entries_are_skipped(tmp_path):
     content = BookContent(_span_shapes.nonlinear(tmp_path))
     for span in SPANS:

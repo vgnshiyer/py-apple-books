@@ -16,8 +16,10 @@ order instead:
 * Every table-of-contents entry whose file is in the reading order
   **begins** at a place in it: its file, at the element its fragment
   names (an ``id``, else an ``<a name>``), or at the start of the file
-  when it has no fragment. Entries that begin at the same place are
-  ordered by their table-of-contents order.
+  when it has no fragment. An element that comes before any text of
+  its file counts as the start of the file. Entries that begin at the
+  same place (the same element, or the start of a file) are ordered by
+  their table-of-contents order.
 * A span starts where its entry begins and ends where the next entry
   begins (``'section'``: an entry of any depth; ``'chapter'``: one whose
   depth is at most the entry's own), or at the end of the reading
@@ -43,10 +45,12 @@ and the files' texts are joined with a blank line.
 from __future__ import annotations
 
 import posixpath
-from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
+
+from bs4 import Tag
 
 from py_apple_books.exceptions import InvalidChoiceError
-from py_apple_books.utils import _anchor_index, _parse, _walk, normalize_whitespace
+from py_apple_books.utils import _TEXT_STRING_TYPES, _anchor_index, _parse, _walk, normalize_whitespace
 
 #: The values ``get_chapter``'s ``span`` takes.
 SPANS: Tuple[str, ...] = ("file", "section", "chapter")
@@ -165,6 +169,21 @@ def _find(ids: Mapping[str, Any], names: Mapping[str, Any], fragment: str) -> An
     return el if el is not None else names.get(fragment)
 
 
+def _leading_elements(soup: Any) -> Set[int]:
+    """The ``id()`` of every element of a parsed file that begins before
+    its first text (in ``<body>``, or the whole document without one):
+    an entry anchored at one of them begins, like an entry without a
+    fragment, at the start of the file's text."""
+    top = soup.body if soup.body is not None else soup
+    found: Set[int] = set()
+    for node in top.descendants:
+        if isinstance(node, Tag):
+            found.add(id(node))
+        elif type(node) in _TEXT_STRING_TYPES and node.strip():
+            break
+    return found
+
+
 def _ends_at_start(entry: Any, start: Start) -> bool:
     """For an entry that begins exactly where the span starts: whether it
     ends the span there (it comes later in the table of contents)."""
@@ -212,23 +231,28 @@ def span_text(plan: Plan, chapters: Sequence[Any], start: Start, mode: str,
         # A start whose fragment names nothing begins at the start of the
         # file, at a place in it that is not known.
         unknown = bool(start.fragment) and start_el is None
+        top_els = _leading_elements(soup) if (start.fragment or any(c.fragment for c in here)) else set()
+        start_top = start_el is None or id(start_el) in top_els
         stop_ids = set()
         for c in here:
-            if not c.fragment:
-                # It begins at the start of the file: the span's own place
-                # when it has no fragment, else before it.
-                if not start.fragment and _ends_at_start(c, start):
-                    return ""
-                continue
-            el = _find(ids, names, c.fragment)
-            if el is None:
+            el = _find(ids, names, c.fragment) if c.fragment else None
+            if c.fragment and el is None:
                 continue  # its place in this file is not known
-            if el is start_el:
+            if unknown:
+                # Only entries later in the table of contents, at a known
+                # element, can end it.
+                if el is not None and c.order > start.order:
+                    stop_ids.add(id(el))
+                continue
+            c_top = el is None or id(el) in top_els
+            if start_top and c_top or el is start_el:
+                # The same place (no text between them): the entry later in
+                # the table of contents begins there, the other is empty.
                 if _ends_at_start(c, start):
                     return ""
                 continue
-            if unknown and c.order < start.order:
-                continue  # earlier in the table of contents: taken to be before
+            if c_top:
+                continue  # before the start
             # Elements before the start are never reached by the walk.
             stop_ids.add(id(el))
         top = soup if start_el is not None else (soup.body if soup.body is not None else soup)

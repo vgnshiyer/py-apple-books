@@ -49,6 +49,18 @@ def same_place(dest: pathlib.Path) -> pathlib.Path:
         nav="ncx-undeclared")
 
 
+def leading_anchors(dest: pathlib.Path) -> pathlib.Path:
+    """Entries anchored before any text of their file: a part anchored at
+    the top of its first chapter's file (the chapter listed after it,
+    without a fragment), and two empty anchors listed out of order."""
+    return write_epub_bundle(
+        dest / "Leading.epub",
+        [("f1", '<div><h1 id="part">Part</h1></div>' + _p("chapter text.")),
+         ("f2", '<a id="x"></a><a id="y"></a>' + _p("second text."))],
+        toc=[("Part", "f1.xhtml#part", [("Chapter", "f1.xhtml")]),
+             ("Y", "f2.xhtml#y"), ("X", "f2.xhtml#x")])
+
+
 def nonlinear(dest: pathlib.Path) -> pathlib.Path:
     """A note marked linear="no" between a chapter's two files (listed in
     the ToC), a repeated file, a missing manifest id and an idref-less
@@ -139,6 +151,7 @@ def unicode_text(dest: pathlib.Path) -> pathlib.Path:
 SHAPES: Dict[str, Callable[[pathlib.Path], pathlib.Path]] = {
     "nested": nested,
     "same_place": same_place,
+    "leading_anchors": leading_anchors,
     "nonlinear": nonlinear,
     "images": images,
     "out_of_order": out_of_order,
