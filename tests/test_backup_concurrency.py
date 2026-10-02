@@ -469,6 +469,14 @@ def test_restore_waits_for_a_backup_in_flight(db, backups, monkeypatch, slow_tak
     the other way round): nothing interleaves."""
     monkeypatch.setattr(write_safety, "books_is_running", lambda: False)
     first = write_safety.backup_library(db, backups)
+    in_backup = threading.Event()
+    take = write_safety._take_backup  # the slowed one
+
+    def flagged(*args, **kwargs):
+        in_backup.set()
+        return take(*args, **kwargs)
+
+    monkeypatch.setattr(write_safety, "_take_backup", flagged)
     spans = {}
 
     def timed(name, fn):
@@ -483,7 +491,7 @@ def test_restore_waits_for_a_backup_in_flight(db, backups, monkeypatch, slow_tak
         "restore", lambda: write_safety.restore_library(first, db, force=True, backup_dir=backups)
     ))
     backup.start()
-    time.sleep(SLOW / 3)
+    assert in_backup.wait(30)  # the backup holds the folder lock now
     restore.start()
     backup.join(30)
     restore.join(30)
