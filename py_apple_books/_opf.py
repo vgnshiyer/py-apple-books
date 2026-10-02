@@ -893,7 +893,13 @@ _icloud.register_file_cache(_clear_caches)
 
 
 def _key(bundle) -> Any:
-    return os.path.abspath(os.fspath(bundle))
+    """The cache key: the bundle's absolute path, or None when it has
+    none (a relative path while the working folder is gone: ``getcwd``
+    fails; not a path at all)."""
+    try:
+        return os.path.abspath(os.fspath(bundle))
+    except (OSError, TypeError, ValueError):
+        return None
 
 
 def read_metadata(bundle) -> OpfResult:
@@ -902,6 +908,8 @@ def read_metadata(bundle) -> OpfResult:
     library doesn't record the book as stored only in iCloud and that
     the bundle itself is local. Never raises."""
     key = _key(bundle)
+    if key is None:
+        return _IO_FAILED  # nothing to look up a relative path from
     entry = _metadata_cache.get(key)
     if entry is not None and _still_valid(bundle, entry):
         return entry.result
@@ -933,6 +941,8 @@ def read_subjects(bundle) -> Optional[Tuple[str, ...]]:
     missing, unsafe, malformed). From the subject index or the metadata
     cache when the files are unchanged. Never raises."""
     key = _key(bundle)
+    if key is None:
+        return None  # nothing to look up a relative path from
     indexed = _subject_index.get(key)
     if indexed is not None and _still_valid(bundle, indexed):
         return indexed.folded

@@ -588,6 +588,19 @@ class TestFailSoft:
         # Wall time: a blocking open would wait for a writer forever.
         assert time.perf_counter() - started < 5
 
+    def test_relative_path_without_a_working_folder(self, tmp_path, monkeypatch):
+        """``abspath`` of a relative path calls ``getcwd``, which fails
+        once the working folder is deleted: a state, never an OSError."""
+        gone = tmp_path / "gone"
+        gone.mkdir()
+        monkeypatch.chdir(gone)
+        gone.rmdir()
+        with pytest.raises(OSError):
+            os.getcwd()
+        assert read("rel.epub") == _opf.OpfResult(_opf.UNREADABLE)
+        assert _opf.read_subjects("rel.epub") is None
+        assert len(_opf._metadata_cache) == len(_opf._subject_index) == 0
+
     def test_unknown_encoding(self, tmp_path):
         package = opf("<dc:subject>A</dc:subject>").replace('encoding="UTF-8"', 'encoding="x-nonexistent"')
         assert read(bundle(tmp_path, package)).state == _opf.UNREADABLE
