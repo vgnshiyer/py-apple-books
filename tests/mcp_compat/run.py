@@ -21,7 +21,9 @@ Two ways to start the server:
 
 ``--lib`` is the py_apple_books under test: this checkout by default, or
 a built wheel; ``--lib-extra NAME`` installs it with that optional extra
-(uvx only). ``--check`` exits 1 on any difference from the goldens;
+(uvx only; an extra the wheel's METADATA or the tree's pyproject.toml
+doesn't declare is an error, since uv would only warn). ``--check``
+exits 1 on any difference from the goldens;
 ``--update`` rewrites them (review the diff: every change to MCP output
 must be an intended one). ``--mcp-version latest`` has no goldens and
 fails only on an isError from a probe not marked as an expected error,
@@ -481,6 +483,35 @@ def extra_name(value: str) -> str:
     return value
 
 
+def _canonical_extra(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def declared_extras(lib: pathlib.Path) -> Optional[set]:
+    """The optional extras ``lib`` declares (canonical names): a wheel's
+    ``Provides-Extra``, or a source tree's ``[project.optional-dependencies]``.
+    None when that can't be read here (no tomllib before Python 3.11)."""
+    if lib.is_file() and lib.suffix == ".whl":
+        with zipfile.ZipFile(lib) as wheel:
+            names = [n for n in wheel.namelist()
+                     if n.count("/") == 1 and n.endswith(".dist-info/METADATA")]
+            if len(names) != 1:
+                return None
+            metadata = wheel.read(names[0]).decode("utf-8")
+        return {_canonical_extra(line.split(":", 1)[1].strip())
+                for line in metadata.split("\n\n", 1)[0].splitlines()
+                if line.lower().startswith("provides-extra:")}
+    pyproject = lib / "pyproject.toml"
+    if not pyproject.is_file():
+        return None
+    try:
+        import tomllib
+    except ImportError:
+        return None
+    project = tomllib.loads(pyproject.read_text(encoding="utf-8")).get("project", {})
+    return {_canonical_extra(name) for name in project.get("optional-dependencies", {})}
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--mcp-version", required=True, help="apple-books-mcp version, e.g. 0.8.2, or 'latest'")
@@ -502,6 +533,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.lib = args.lib.resolve()
     if args.lib_extra and args.python:
         parser.error("--lib-extra needs uvx; with --python, install the extra's dependencies into PY")
+    if args.lib_extra:
+        declared = declared_extras(args.lib)
+        missing = sorted({_canonical_extra(e) for e in args.lib_extra} - (declared or set()))
+        if declared is not None and missing:
+            parser.error(f"--lib-extra {', '.join(missing)}: {args.lib} declares "
+                         f"{sorted(declared) or 'no extras'}")
     pinned = args.mcp_version != "latest"
     if args.update and not pinned:
         parser.error("--update needs a pinned --mcp-version")
