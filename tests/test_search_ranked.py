@@ -384,11 +384,12 @@ class TestPaging:
     def test_deleted_rows_ranked_first_keep_pages_whole(self, lib, ranked, filler, monkeypatch):
         """Rows deleted in Apple Books (known to the index) that would rank
         first are left out by the index itself: pages stay consistent and
-        the store is not fingerprinted again for them."""
+        are never refilled from all the hits."""
         gone = [lib.add_annotation(filler, "zebra zebra zebra zebra", deleted=True) for _ in range(5)]
         live = [lib.add_annotation(filler, f"zebra plain row {i}") for i in range(7)]
-        stale = []
-        monkeypatch.setattr(search.AnnotationIndex, "mark_stale", lambda self: stale.append(1))
+        wants = []
+        real = search._query
+        monkeypatch.setattr(search, "_query", lambda *args: wants.append(args[-1]) or real(*args))
         everything = ids(ranked.search_annotations("zebra", limit=None))
         assert sorted(everything) == sorted(live)
         pages = []
@@ -397,7 +398,7 @@ class TestPaging:
         assert pages == everything
         with_deleted = ids(ranked.search_annotations("zebra", limit=None, include_deleted=True))
         assert set(with_deleted[:5]) == set(gone)
-        assert stale == [] and index_of(ranked).builds == 1
+        assert wants == [None, 3, 6, 9, None] and index_of(ranked).builds == 1
 
     def test_rows_deleted_since_the_check_beyond_the_ranked_hits(self, lib, ranked, clock):
         """More hits gone from the store than a page ranked: the page is
@@ -408,7 +409,10 @@ class TestPaging:
         for pk in rows[3:]:
             lib.execute("annotations", "DELETE FROM ZAEANNOTATION WHERE Z_PK = ?", (pk,))
         assert ids(ranked.search_annotations("alpha", limit=2)) == [rows[2], rows[1]]
-        assert index_of(ranked)._ready.checked == float("-inf")
+        assert index_of(ranked).builds == 1  # until the next check
+        clock[0] += search._RECHECK
+        assert ids(ranked.search_annotations("alpha", limit=2)) == [rows[2], rows[1]]
+        assert index_of(ranked).builds == 2
 
     def test_a_row_deleted_since_the_check_with_an_offset(self, lib, ranked, clock):
         book = lib.add_book("B")
@@ -656,11 +660,32 @@ class TestFreshness:
         rows = [lib.add_annotation(book, "alpha") for _ in range(4)]
         assert ids(ranked.search_annotations("alpha", limit=2)) == rows[:1:-1]
         lib.execute("annotations", "DELETE FROM ZAEANNOTATION WHERE Z_PK = ?", (rows[3],))
-        assert ids(ranked.search_annotations("alpha", limit=2)) == [rows[2], rows[1]]
         index = index_of(ranked)
-        assert index._ready.checked == float("-inf")  # fingerprinted again next time
+        for _ in range(2):
+            assert ids(ranked.search_annotations("alpha", limit=2)) == [rows[2], rows[1]]
+            assert index.builds == 1  # the index catches up at its next check
+        clock[0] += search._RECHECK
         assert ids(ranked.search_annotations("alpha", limit=2)) == [rows[2], rows[1]]
         assert index.builds == 2
+
+    def test_deletions_rebuild_at_most_once_per_recheck(self, lib, ranked, clock, monkeypatch):
+        """Hits deleted since the check are skipped without fingerprinting
+        the store again before ``_RECHECK`` has passed, however many."""
+        book = lib.add_book("B")
+        rows = [lib.add_annotation(book, "alpha") for _ in range(12)]
+        prints = []
+        real = search.AnnotationIndex._fingerprint
+        monkeypatch.setattr(search.AnnotationIndex, "_fingerprint",
+                            lambda self, db: prints.append(1) or real(self, db))
+        assert len(ranked.search_annotations("alpha", limit=2)) == 2
+        index = index_of(ranked)
+        for second in range(3):
+            for step in range(3):
+                lib.execute("annotations", "DELETE FROM ZAEANNOTATION WHERE Z_PK = ?", (rows.pop(),))
+                assert ids(ranked.search_annotations("alpha", limit=2)) == rows[:-3:-1]
+                clock[0] += search._RECHECK / 4
+            assert (len(prints), index.builds) == (second + 1, second + 1)
+            clock[0] += search._RECHECK / 4
 
     def test_a_failed_fingerprint_keeps_the_index_under_a_ttl(self, lib, ranked, clock, monkeypatch):
         """A transient failure ('database is locked' while Apple Books

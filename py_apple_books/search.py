@@ -527,13 +527,6 @@ class AnnotationIndex:
         for conn in conns:
             _close_quietly(conn)
 
-    def mark_stale(self) -> None:
-        """Fingerprint the store again on the next search."""
-        with self._state:
-            self._last_check = None
-            if self._ready is not None:
-                self._ready.checked = float("-inf")
-
     def __del__(self):
         # Unreferenced: no search is inside. sqlite3 connections can wait
         # for the cyclic garbage collector, so close them now, but only in
@@ -865,16 +858,16 @@ def _query(conn: sqlite3.Connection, fts: Optional[str], plan: _Plan, asset_id,
 # -- the facade's call --------------------------------------------------------
 
 
-def _index_hits(db: "LibraryDB", plan: _Plan, **kwargs) -> Tuple[AnnotationIndex, List[tuple]]:
-    """The library's index and the hits of ``plan`` in it. An index
-    discarded by ``close()`` once the call got it is replaced by the
-    library's new one; the last attempt uses it anyway, so repeated
-    closes don't fail the search."""
+def _index_hits(db: "LibraryDB", plan: _Plan, **kwargs) -> List[tuple]:
+    """The hits of ``plan`` in the library's index. An index discarded by
+    ``close()`` once the call got it is replaced by the library's new
+    one; the last attempt uses it anyway, so repeated closes don't fail
+    the search."""
     attempts = 3
     for attempt in range(attempts):
         index = db._derived_cache(_INDEX_KEY, AnnotationIndex)
         try:
-            return index, index.search(db, plan, if_discarded=attempt == attempts - 1, **kwargs)
+            return index.search(db, plan, if_discarded=attempt == attempts - 1, **kwargs)
         except _Dead:
             continue
     raise DBQueryError(_FAILED)
@@ -892,36 +885,33 @@ def _search_annotations(db: "LibraryDB", plan: _Plan, *, limit: Optional[int], o
 
     Only the hits up to the page's end are ranked. Each page's
     annotations are read again in the requested scope; one gone since the
-    index was checked (deleted, say) is skipped, the page is filled from
-    the next hits (all of them ranked if those run out), and the index is
-    fingerprinted again on the next search.
+    index was checked (deleted, say) is skipped, and the page is filled
+    from the next hits (all of them ranked if those run out). The index
+    itself catches up at its next check, as for any change: at most once
+    a second, even while deletions keep coming.
     """
     if not db.has_annotations():
         raise AnnotationStoreNotFoundError(ANNOTATIONS_NOT_FOUND)
     options = {"asset_id": asset_id, "include_deleted": include_deleted, "require_all": require_all}
     want = None if limit is None or offset + limit > _RANK_ALL else offset + limit
-    index, raw = _index_hits(db, plan, want=want, **options)
+    raw = _index_hits(db, plan, want=want, **options)
     scope = dict(_ALL_ANNOTATIONS if include_deleted else _LIVE_ANNOTATIONS)
     if asset_id is not None:
         scope["asset_id"] = asset_id
-    out, dropped = _page(db, raw, offset, limit, scope)
+    out = _page(db, raw, offset, limit, scope)
     if want is not None and len(out) < limit and len(raw) >= want:
         # Hits gone from the store left the page short, and the hits after
         # the ones ranked may fill it: the page again, from all of them.
-        index, raw = _index_hits(db, plan, want=None, **options)
-        out, again = _page(db, raw, offset, limit, scope)
-        dropped = dropped or again
-    if dropped:
-        index.mark_stale()
+        raw = _index_hits(db, plan, want=None, **options)
+        out = _page(db, raw, offset, limit, scope)
     return out
 
 
 def _page(db: "LibraryDB", raw: List[tuple], offset: int, limit: Optional[int],
-          scope: dict) -> Tuple[List[AnnotationHit], bool]:
-    """``(hits, dropped)``: ``raw[offset:]`` read as AnnotationHits in
-    ``scope``, at most ``limit``, and whether one was gone and skipped."""
+          scope: dict) -> List[AnnotationHit]:
+    """``raw[offset:]`` read as AnnotationHits in ``scope`` (a hit whose
+    annotation is gone is skipped), at most ``limit``."""
     out: List[AnnotationHit] = []
-    dropped = False
     i = offset
     with use_library(db):
         while i < len(raw) and (limit is None or len(out) < limit):
@@ -933,8 +923,6 @@ def _page(db: "LibraryDB", raw: List[tuple], offset: int, limit: Optional[int],
                 found = {a.id: a for a in Annotation.manager.filter(id__in=[h[0] for h in part], **scope)}
                 for pk, score, matched_all, method in part:
                     annotation = found.get(pk)
-                    if annotation is None:
-                        dropped = True
-                    else:
+                    if annotation is not None:
                         out.append(AnnotationHit(annotation, score, matched_all, method))
-    return out, dropped
+    return out
