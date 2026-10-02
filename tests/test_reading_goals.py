@@ -200,6 +200,58 @@ class TestReasons:
         assert _prefs._read_goals(path) == (None, "not_dict")
 
 
+class TestXmlEntities:
+    """An XML preferences file that declares entities is refused, and
+    nothing it names is read (plistlib refuses entity declarations and
+    never fetches an external DTD; this pins it against a parser change).
+    The files they point at sit in a ``Mobile Documents`` folder."""
+
+    @pytest.fixture
+    def cloud(self, tmp_path):
+        folder = tmp_path / "Mobile Documents" / "com~apple~CloudDocs"
+        folder.mkdir(parents=True)
+        (folder / "secret.txt").write_text("SECRET-CONTENT")
+        (folder / "evil.dtd").write_text('<!ENTITY leak SYSTEM "secret.txt">')
+        return folder
+
+    @staticmethod
+    def document(doctype: str) -> bytes:
+        return (f'<?xml version="1.0" encoding="UTF-8"?>\n{doctype}\n<plist version="1.0"><dict>'
+                f'<key>ReadingHistory.CurrentStreak</key><integer>2</integer>'
+                f'<key>ReadingGoals.BooksFinished</key><dict><key>goal</key><string>&leak;</string></dict>'
+                f'</dict></plist>').encode()
+
+    def read(self, tmp_path, cloud, data: bytes):
+        path = tmp_path / "p.plist"
+        path.write_bytes(data)
+        start = time.monotonic()
+        with _fs_audit.record() as rec:
+            result = _prefs._read_goals(path)
+        assert time.monotonic() - start < 1
+        assert not rec.under(cloud), "a file the document names was opened"
+        assert "SECRET" not in repr(result)
+        return result
+
+    def test_entities_are_refused(self, tmp_path, cloud):
+        secret, dtd = (cloud / "secret.txt").as_uri(), (cloud / "evil.dtd").as_uri()
+        laughs = "".join([f'<!ENTITY l0 "{"lol" * 10}">'] +
+                         [f'<!ENTITY l{i} "{f"&l{i - 1};" * 10}">' for i in range(1, 10)])
+        for doctype in (
+                f'<!DOCTYPE plist [<!ENTITY leak SYSTEM "{secret}">]>',          # external entity
+                f'<!DOCTYPE plist [{laughs}<!ENTITY leak "&l9;">]>',             # billion laughs
+                f'<!DOCTYPE plist [<!ENTITY % ext SYSTEM "{dtd}"> %ext;]>',      # external parameter entity
+                '<!DOCTYPE plist [<!ENTITY leak "inline">]>',                    # even an internal one
+        ):
+            assert self.read(tmp_path, cloud, self.document(doctype)) == (None, "unparseable"), doctype
+
+    def test_an_external_dtd_is_never_fetched(self, tmp_path, cloud):
+        data = self.document(f'<!DOCTYPE plist SYSTEM "{(cloud / "evil.dtd").as_uri()}">').replace(
+            b"&leak;", b"3")
+        goals, reason = self.read(tmp_path, cloud, data)
+        if reason == "ok":   # plistlib ignores the DTD; refusing the file would do too
+            assert goals.apple_current_streak == 2 and goals.books_per_year is None
+
+
 def flagged(st, flags):
     """A stat result like ``st`` with ``st_flags`` set."""
     fields = {name: getattr(st, name) for name in dir(st) if name.startswith("st_")}
