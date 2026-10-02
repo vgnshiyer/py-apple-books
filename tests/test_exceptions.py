@@ -2,10 +2,13 @@
 
 1.10 extends the tree only by adding classes and bases, so every
 ``except`` clause written against 1.9 (including apple-books-mcp
-0.8.2's) keeps catching what it caught before.
+0.8.2's) keeps catching what it caught before. 1.11 adds
+``NotEpubError`` and ``ContextUnavailableError`` and the ``entry``
+attribute of ``UnsafeEpubEntryError``.
 """
 
 import ast
+import copy as copy_module
 import pathlib
 import pickle
 import sqlite3
@@ -33,6 +36,8 @@ TREE = [
     (ex.NotInLibraryError, (ex.BookNotDownloadedError,)),
     (ex.DRMProtectedError, (ex.AppleBooksError,)),
     (ex.UnsafeEpubEntryError, (ex.AppleBooksError,)),
+    (ex.NotEpubError, (ex.AppleBooksError,)),
+    (ex.ContextUnavailableError, (ex.AppleBooksError,)),
     (ex.DBError, (ex.AppleBooksError,)),
     (ex.DBConnectionError, (ex.DBError,)),
     (ex.LibraryNotFoundError, (ex.DBConnectionError,)),
@@ -66,6 +71,8 @@ LEGACY = [
     (ex.LibraryAccessDeniedError, (ex.DBConnectionError, ex.DBError)),
     (ex.UnsupportedSchemaError, (ex.DBQueryError, ex.DBError)),
     (ex.QueryTimeoutError, (ex.DBQueryError, ex.DBError)),
+    # 1.10 raised a plain AppleBooksError where NotEpubError is raised now.
+    (ex.NotEpubError, (ex.AppleBooksError,)),
 ]
 
 
@@ -76,6 +83,10 @@ def _class_id(value):
 def _instance(cls):
     if cls is ex.UnknownFieldError:
         return cls("Book", "bogus", ["title", "author"])
+    if cls is ex.ContextUnavailableError:
+        return cls("message", cls.HIGHLIGHT_NOT_FOUND, 42)
+    if cls is ex.UnsafeEpubEntryError:
+        return cls("message", entry="OEBPS/x.xhtml")
     return cls("message")
 
 
@@ -253,10 +264,58 @@ def test_pickle_round_trip(cls):
     ex.QueryTimeoutError("x", timeout=2.5),
     ex.InvalidChoiceError("x", value="v", valid=["a"]),
     ex.BackupValidationError("x", ex.BackupValidationError.INTEGRITY),
+    ex.ContextUnavailableError("x", ex.ContextUnavailableError.NO_LOCATION, 7),
+    ex.ContextUnavailableError("x", reason=ex.ContextUnavailableError.ORPHANED),
+    ex.ContextUnavailableError("x"),
+    ex.UnsafeEpubEntryError("x", entry="../" * 2000 + "a.xhtml"),
+    ex.UnsafeEpubEntryError("x"),
+    ex.NotEpubError("x"),
 ], ids=lambda e: type(e).__name__)
 def test_pickle_keeps_attributes(e):
     copy = pickle.loads(pickle.dumps(e))
     assert (type(copy), str(copy), vars(copy)) == (type(e), str(e), vars(e))
+    for clone in (copy_module.copy(e), copy_module.deepcopy(e)):
+        assert (type(clone), str(clone), vars(clone)) == (type(e), str(e), vars(e))
+
+
+# ---------------------------------------------------------------------------
+# 1.11 additions
+# ---------------------------------------------------------------------------
+
+
+def test_context_unavailable_error():
+    cls = ex.ContextUnavailableError
+    reasons = {
+        "NO_LOCATION": "no_location",
+        "NO_HIGHLIGHT_TEXT": "no_highlight_text",
+        "ORPHANED": "orphaned",
+        "EMPTY_CHAPTER": "empty_chapter",
+        "HIGHLIGHT_NOT_FOUND": "highlight_not_found",
+    }
+    for name, value in reasons.items():
+        assert getattr(cls, name) == value
+    e = cls("The highlight isn't in its chapter.", cls.HIGHLIGHT_NOT_FOUND, annotation_id=12)
+    assert (str(e), e.reason, e.annotation_id) == (
+        "The highlight isn't in its chapter.", "highlight_not_found", 12)
+    bare = cls("x")
+    assert (bare.reason, bare.annotation_id, bare.args) == (None, None, ("x",))
+    with pytest.raises(ex.AppleBooksError):
+        raise e
+
+
+def test_unsafe_epub_entry_error_entry():
+    e = ex.UnsafeEpubEntryError("EPUB entry 'x' is not a regular file.", entry="x")
+    assert (str(e), e.entry, e.args) == ("EPUB entry 'x' is not a regular file.", "x",
+                                         ("EPUB entry 'x' is not a regular file.",))
+    assert ex.UnsafeEpubEntryError("m").entry is None
+    # 1.10 callers passed the message alone; positional args still work.
+    assert ex.UnsafeEpubEntryError().args == ()
+
+
+def test_not_epub_error_is_caught_as_apple_books_error():
+    with pytest.raises(ex.AppleBooksError, match="not an EPUB"):
+        raise ex.NotEpubError("'x.pdf' is not an EPUB bundle directory")
+    assert not issubclass(ex.NotEpubError, (ex.BookNotDownloadedError, ex.NotFoundError))
 
 
 # ---------------------------------------------------------------------------
