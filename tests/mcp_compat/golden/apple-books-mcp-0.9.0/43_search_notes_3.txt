@@ -1,0 +1,2 @@
+# search_notes {"limit": 1, "note": "synthetic", "offset": 1, "order_by": "oldest"} isError=False
+No matching notes at offset 1 (there are 1). Pass a smaller offset.

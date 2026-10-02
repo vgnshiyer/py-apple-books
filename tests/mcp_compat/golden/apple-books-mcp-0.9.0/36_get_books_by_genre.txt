@@ -1,0 +1,4 @@
+# get_books_by_genre {"genre": "Fiction", "limit": 1, "offset": 1} isError=False
+[2] Don't Panic by Second Author (Science Fiction)
+
+Showing 2–2 of 2 books (end).

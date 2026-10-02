@@ -1,0 +1,7 @@
+# get_recently_read_books {"limit": 2, "offset": 2} isError=False
+[2] Don't Panic by Second Author
+  Progress: Finished | Last Read: 2026-09-10
+[3] Finished At Zero by Test Author
+  Progress: Finished
+
+Showing 3–4 of 5 books. Next page: offset=4.

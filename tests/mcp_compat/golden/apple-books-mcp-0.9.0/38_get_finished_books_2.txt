@@ -1,0 +1,5 @@
+# get_finished_books {"limit": 1, "offset": 1} isError=False
+[3] Finished At Zero by Test Author
+  Progress: Finished
+
+Showing 2–2 of 2 books (end).

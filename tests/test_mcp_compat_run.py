@@ -1,6 +1,7 @@
 """tests/mcp_compat/run.py without starting a server: which probes a
-pinned apple-books-mcp version gets, how uvx is asked for the library
-(with an optional extra), and the option checks."""
+pinned apple-books-mcp version gets, the check that every tool argument
+is probed, how uvx is asked for the library (with an optional extra),
+and the option checks."""
 
 import argparse
 import importlib.util
@@ -95,6 +96,55 @@ def test_option_checks_exit_2(run, tmp_path, capsys):
             run.main(argv)
         assert stop.value.code == 2, argv
     assert "declares no extras" in capsys.readouterr().err
+
+
+def _demo():
+    """Stand-in ids for probe_table(): only the keys it reads."""
+    ids = iter(range(1, 100))
+    books = {k: {"id": next(ids)} for k in (
+        "synthetic", "drm", "finished", "finished_zero", "series_stack", "owned_series")}
+    annos = {k: next(ids) for k in (
+        "highlight", "note", "deleted", "tombstone", "orphan", "no_file", "apostrophe", "curly")}
+    colls = {k: {"id": next(ids)} for k in ("shelf", "deleted")}
+    return {"books": books, "annotations": annos, "collections": colls}
+
+
+def test_unprobed_arguments_are_reported(run):
+    table = [("t", [run.Probe({"a": 1}), run.Probe({"b": 1}, since="0.9.0")]),
+             ("create_collection", [])]
+    params = {"t": {"a", "b", "c"}, "u": {"d"}, "create_collection": {"title"}}
+    assert run.unprobed(params, table, "0.9.0") == [("t", "c"), ("u", "d")]
+    assert run.unprobed(params, table, "0.8.2") == [("t", "b"), ("t", "c"), ("u", "d")]
+    assert run.unprobed(params, table, "latest") == [("t", "c"), ("u", "d")]
+    assert run.unprobed({"t": set()}, table, "0.8.2") == []
+
+
+def test_known_unprobed_arguments_are_probed_from_090(run):
+    """0.8.2's known gaps are real (its frozen probes don't pass them)
+    and closed for 0.9.0 (a 0.9.0 probe of the same tool passes each)."""
+    table = run.probe_table(_demo())
+    passed = {}
+    for version in ("0.8.2", "0.9.0"):
+        passed[version] = {(tool, name) for tool, probes in table for probe in probes
+                           if run.applies(probe, version) for name in probe.args}
+    for gap in run.KNOWN_UNPROBED["0.8.2"]:
+        assert gap not in passed["0.8.2"] and gap in passed["0.9.0"], gap
+
+
+@pytest.mark.parametrize("argv, gaps, problems, code", [
+    (["--mcp-version", "0.9.0", "--check"], [], [], 0),
+    (["--mcp-version", "0.9.0", "--check"], ["argument 'x' of t is passed by no probe"], [], 1),
+    (["--mcp-version", "0.9.0"], ["argument 'x' of t is passed by no probe"], [], 0),
+    (["--mcp-version", "0.9.0", "--check"], [], ["01_t.txt: isError"], 0),
+    (["--mcp-version", "latest"], ["argument 'x' of t is passed by no probe"], [], 1),
+    (["--mcp-version", "latest"], [], ["01_t.txt: isError"], 1),
+])
+def test_unprobed_arguments_fail_check_and_latest(run, monkeypatch, capsys, argv, gaps, problems, code):
+    monkeypatch.setattr(run, "run_calls", lambda args: ({"00_tools.txt": "t\n"}, problems, gaps))
+    monkeypatch.setattr(run, "compare", lambda files, golden: [])
+    assert run.main(argv) == code
+    out = capsys.readouterr().out
+    assert all(f"coverage: {gap}" in out for gap in gaps)
 
 
 def test_extra_name_type(run):

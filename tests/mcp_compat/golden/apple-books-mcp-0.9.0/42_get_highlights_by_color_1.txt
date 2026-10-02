@@ -1,0 +1,6 @@
+# get_highlights_by_color {"color": "yellow", "order_by": "oldest"} isError=False
+Synthetic Book (Test Author) — 1 yellow highlight:
+  [1] a synthetic highlight — Chapter 1 (ch=chap1)
+
+Removed book (asset ORPHANAS…, 1 highlight on this page):
+  [7] orphan synthetic highlight

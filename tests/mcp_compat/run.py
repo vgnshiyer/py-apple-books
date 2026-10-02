@@ -27,8 +27,14 @@ exits 1 on any difference from the goldens;
 ``--update`` rewrites them (review the diff: every change to MCP output
 must be an intended one). ``--mcp-version latest`` has no goldens and
 fails only on an isError from a probe not marked as an expected error,
-a 'Traceback', 'no such column', or a tool missing from the argument
-table.
+a 'Traceback', 'no such column', a tool missing from the argument
+table, or an argument no probe passes (below).
+
+Every argument of every offered read tool (its ``inputSchema``
+properties in ``tools/list``) must be passed by some probe that applies
+to the version, apart from that version's ``KNOWN_UNPROBED``: otherwise
+``--check`` and ``--mcp-version latest`` exit 1 (a "coverage:" line
+names it), so a new argument of a later apple-books-mcp gets a probe.
 
 A probe with ``since`` is made for that apple-books-mcp version and
 later (a new tool or argument); older pinned versions skip it, so their
@@ -200,7 +206,52 @@ def probe_table(demo: dict) -> List[Tuple[str, List[Probe]]]:
         ("get_annotations_by_date_range", [v090({"after": "2026-09-01", "order_by": "oldest"})]),
         ("get_annotation_context", [
             v090({"annotation_id": annos["highlight"], "chars_before": 5, "chars_after": 5})]),
+        # -- apple-books-mcp 0.9.0: offset on every paged tool, order_by on
+        # every tool that has it (each maps to a library query path) --
+        ("list_all_collections", [v090({"limit": 2, "offset": 2})]),
+        ("search_books_by_title", [v090({"title": "Book", "limit": 1, "offset": 1})]),
+        ("get_books_by_genre", [v090({"genre": "Fiction", "limit": 1, "offset": 1})]),
+        ("get_books_in_progress", [v090({"limit": 1, "offset": 1})]),
+        ("get_finished_books", [v090({"limit": 1}), v090({"limit": 1, "offset": 1})]),
+        ("get_unstarted_books", [v090({"limit": 1}), v090({"limit": 1, "offset": 1})]),
+        ("get_recently_read_books", [v090({"limit": 2, "offset": 2})]),
+        ("recent_annotations", [v090({"limit": 2, "offset": 2})]),
+        ("get_highlights_by_color", [
+            v090({"color": "yellow", "order_by": "oldest"}),
+            v090({"color": "yellow", "limit": 1, "offset": 1}),
+            v090({"color": "yellow", "limit": 1, "offset": 1, "order_by": "oldest"})]),
+        ("search_notes", [
+            v090({"note": "synthetic", "order_by": "oldest"}),
+            v090({"note": "synthetic", "limit": 1}),
+            v090({"note": "synthetic", "limit": 1, "offset": 1, "order_by": "oldest"})]),
+        ("get_annotations_by_date_range", [
+            v090({"after": "2026-09-01", "limit": 2, "offset": 2}),
+            v090({"after": "2026-09-01", "limit": 2, "offset": 2, "order_by": "oldest"})]),
     ]
+
+
+# Parameters a pinned version's probes never pass, accepted because its
+# goldens are frozen (R15): adding a probe would change them. The 0.9.0
+# probes pass each of these, on the same library paths.
+KNOWN_UNPROBED = {
+    "0.8.2": {("get_finished_books", "limit"), ("get_unstarted_books", "limit"),
+              ("list_annotations", "limit"), ("search_notes", "limit"),
+              ("get_annotation_context", "chars_before"), ("get_annotation_context", "chars_after")},
+}
+
+
+def unprobed(params: Dict[str, set], table, mcp_version: str) -> List[Tuple[str, str]]:
+    """``(tool, parameter)`` pairs of the offered read tools (``params``:
+    tool name -> its inputSchema properties) that no probe applying to
+    ``mcp_version`` passes, less that version's KNOWN_UNPROBED."""
+    passed: Dict[str, set] = {}
+    for tool, probes in table:
+        for probe in probes:
+            if applies(probe, mcp_version):
+                passed.setdefault(tool, set()).update(probe.args)
+    known = KNOWN_UNPROBED.get(mcp_version, set())
+    return sorted((tool, name) for tool, names in params.items() if tool not in WRITE_TOOLS
+                  for name in names - passed.get(tool, set()) if (tool, name) not in known)
 
 
 # -- seeding ------------------------------------------------------------------
@@ -395,8 +446,10 @@ def render(tool: str, args: dict, outcome: Outcome, roots: List[str]) -> str:
     return f"# {tool} {json.dumps(args, sort_keys=True)} {status}\n{normalize(outcome.text, roots)}\n"
 
 
-def run_calls(args) -> Tuple[Dict[str, str], List[str]]:
-    """Seed, start the server, make every call; ``({file: text}, problems)``."""
+def run_calls(args) -> Tuple[Dict[str, str], List[str], List[str]]:
+    """Seed, start the server, make every call; ``({file: text}, problems,
+    gaps)``, ``gaps`` naming the arguments of offered read tools that no
+    probe passes."""
     testing = load_testing()
     workdir = pathlib.Path(tempfile.mkdtemp(prefix="mcp-compat-"))
     try:
@@ -420,7 +473,7 @@ def run_calls(args) -> Tuple[Dict[str, str], List[str]]:
             shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _drive(server: Server, table, roots: List[str], args) -> Tuple[Dict[str, str], List[str]]:
+def _drive(server: Server, table, roots: List[str], args) -> Tuple[Dict[str, str], List[str], List[str]]:
     init = server.request("initialize", {
         "protocolVersion": PROTOCOL_VERSION, "capabilities": {},
         "clientInfo": {"name": "py-apple-books-mcp-compat", "version": "1"},
@@ -429,13 +482,17 @@ def _drive(server: Server, table, roots: List[str], args) -> Tuple[Dict[str, str
         raise SystemExit(f"error: initialize failed: {init}. Server stderr:\n{server.stderr_tail()}")
     server.notify("notifications/initialized")
     listed = server.request("tools/list", {}, timeout=args.call_timeout)
-    tools = {t["name"] for t in ((listed or {}).get("result") or {}).get("tools", [])}
+    offered = ((listed or {}).get("result") or {}).get("tools", [])
+    tools = {t["name"] for t in offered}
     if not tools:
         raise SystemExit(f"error: tools/list failed: {listed}")
 
     files = {"00_tools.txt": "# tools/list (names)\n" + "\n".join(sorted(tools)) + "\n"}
     problems = [f"tool {name!r} is not in the argument table"
                 for name in sorted(tools - WRITE_TOOLS - {tool for tool, _ in table})]
+    params = {t["name"]: set(((t.get("inputSchema") or {}).get("properties") or {})) for t in offered}
+    gaps = [f"argument {name!r} of {tool} is passed by no probe"
+            for tool, name in unprobed(params, table, args.mcp_version)]
     for n, (tool, probes) in enumerate(table, start=1):
         probes = [probe for probe in probes if applies(probe, args.mcp_version)]
         if not probes:
@@ -458,7 +515,7 @@ def _drive(server: Server, table, roots: List[str], args) -> Tuple[Dict[str, str
     files["99_resource_currently_reading.txt"] = render("resources/read", {"uri": RESOURCE}, outcome, roots)
     if outcome.status != "ok":
         problems.append(f"resources/read {RESOURCE}: {outcome.status}")
-    return files, problems
+    return files, problems, gaps
 
 
 def compare(files: Dict[str, str], golden: pathlib.Path) -> List[str]:
@@ -543,7 +600,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.update and not pinned:
         parser.error("--update needs a pinned --mcp-version")
 
-    files, problems = run_calls(args)
+    files, problems, gaps = run_calls(args)
     for name, text in sorted(files.items()):
         header = text.split("\n", 1)[0]
         digest = hashlib.sha1(text.encode()).hexdigest()[:8]
@@ -561,16 +618,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         for name, text in files.items():
             (golden / name).write_text(text, encoding="utf-8")
         print(f"updated {len(files)} goldens in {golden.relative_to(REPO)}")
+    differs = False
     if pinned and args.check:
         diffs = compare(files, golden)
         for diff in diffs:
             print(diff)
         print(f"{len(diffs)} of {len(files)} outputs differ from {golden.relative_to(REPO)}")
-        if diffs:
-            return 1
+        differs = bool(diffs)
     for problem in problems:
         print(f"problem: {problem}")
-    if not pinned and problems:
+    for gap in gaps:
+        print(f"coverage: {gap}")
+    if differs or (gaps and (args.check or not pinned)) or (problems and not pinned):
         return 1
     return 0
 
