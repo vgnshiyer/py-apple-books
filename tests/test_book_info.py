@@ -659,6 +659,30 @@ def test_a_read_remembers_the_last_ids_it_was_asked(home, reader, monkeypatch):
     assert list(memo.rows) == ids[-4:] and memo.rows["absent"] is None
 
 
+def test_memo_is_bounded_across_calls(home, reader, monkeypatch):
+    # Each call that brings new ids adds them; the oldest are dropped, so
+    # a long-running process holds at most _MEMO_IDS ids per file.
+    monkeypatch.setattr(book_info, "_MEMO_IDS", 4)
+    home.add_book_info_cache([{"asset_id": f"k{i}", "title": f"t{i}"} for i in range(10)])
+    reader.get_cached_book_info(["k0", "k1", "k2"])
+    reader.get_cached_book_info(["k3", "k4", "k5"])
+    (memo,) = index_of(reader)._memos.values()
+    assert list(memo.rows) == ["k2", "k3", "k4", "k5"]
+    reader.get_cached_book_info(["k6", "absent"])
+    assert list(memo.rows) == ["k4", "k5", "k6", "absent"]
+
+
+def test_a_memo_hit_makes_an_id_recently_used(home, reader, monkeypatch):
+    monkeypatch.setattr(book_info, "_MEMO_IDS", 3)
+    home.add_book_info_cache([{"asset_id": f"k{i}", "title": f"t{i}"} for i in range(10)])
+    reader.get_cached_book_info(["k0", "k1", "k2"])
+    (memo,) = index_of(reader)._memos.values()
+    reader.get_cached_book_info("k0")  # answered by the memo
+    assert list(memo.rows) == ["k1", "k2", "k0"]
+    reader.get_cached_book_info("k3")  # read: the least recently used (k1) goes
+    assert list(memo.rows) == ["k2", "k0", "k3"]
+
+
 def test_many_ids_all_found(home, reader):
     rows = [{"asset_id": f"k{i:04d}", "title": f"t{i}"} for i in range(1500)]
     home.add_book_info_cache(rows)
