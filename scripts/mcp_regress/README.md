@@ -47,7 +47,8 @@ those are not part of the snapshot. So, on macOS, `harness.py` and
 `odd_args.py run` first turn off downloads of evicted iCloud files for their
 own process (`setiopolicy_np`, process scope; inherited by `du`): a book
 file that is only in iCloud makes its tool fail instead of downloading, on
-the baseline and the candidate alike. They print whether the policy is on.
+the baseline and the candidate alike. They print whether the policy is on,
+and exit 2 if macOS refuses it (`--allow-downloads` runs anyway).
 To keep book files out entirely, null `ZPATH` in the snapshot's
 `ZBKLIBRARYASSET` first and run a DB-only pass.
 
@@ -110,8 +111,8 @@ A key is `tool(json-args)` with sorted arguments. Calls whose outputs differ
 between A and B are nondeterministic and are ignored. `--mcp-version` makes
 the run exit 2 unless the venv has that apple-books-mcp; without it, the
 installed version is used and recorded. Against 0.9.0 the run adds calls for
-its new tool and arguments (`search_books`, `chapter_id` "current", offsets,
-`order_by`). Each run records the MCP version, the `py_apple_books` version
+its new tool and arguments (`search_books` with and without `limit`/`offset`,
+`chapter_id` "current", offsets, `order_by`, `chars_before`/`chars_after`). Each run records the MCP version, the `py_apple_books` version
 and, if its sources match one, the release it is.
 
 **5. Compare.**

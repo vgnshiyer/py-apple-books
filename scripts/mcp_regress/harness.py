@@ -14,7 +14,7 @@ its new tool and arguments.
 On macOS both commands first turn off downloads of evicted iCloud files
 for their own process, so a book file that is only in iCloud makes its
 tool fail rather than download (on the baseline and the candidate
-alike).
+alike). If macOS refuses, they exit 2 unless ``--allow-downloads``.
 
 ``discover`` refuses anything but a released baseline (py_apple_books
 1.9.1 or 1.10.0, compared byte for byte with the release sources,
@@ -29,6 +29,7 @@ commands refuse a path inside a git working tree.
 """
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import pathlib
@@ -39,6 +40,7 @@ import time
 
 MAX_CONTEXT_ANNOTATIONS = 200
 MAX_CURRENT_CHAPTER_BOOKS = 60
+MAX_SHORT_CONTEXT_ANNOTATIONS = 10
 # source_digest() of the releases discover accepts and compare can name
 # as a baseline (each PyPI wheel and its tag agree).
 RELEASES = {
@@ -181,13 +183,31 @@ def disable_materialization():
         return False
 
 
+def require_download_policy(allow_downloads):
+    """Turn downloads of evicted files off (see disable_materialization).
+    On macOS, exit 2 if that fails, unless ``allow_downloads``: the runs
+    read book files at the paths the snapshot records."""
+    on = disable_materialization()
+    print(f"download of evicted iCloud files turned off: {on}", file=sys.stderr)
+    if sys.platform == "darwin" and not on and not allow_downloads:
+        print("could not turn off downloads of evicted iCloud files, so a book file that is "
+              "only in iCloud would be downloaded; pass --allow-downloads to run anyway",
+              file=sys.stderr)
+        sys.exit(2)
+    return on
+
+
 def _unscoped(method, **scope):
-    """``method(**scope)``, or ``method()`` on a release without those
-    keywords (1.9.1 lists every row anyway)."""
-    try:
+    """``method(**scope)``, or ``method()`` on a release whose method has
+    no such keywords (1.9.1 lists every row anyway). Decided from the
+    signature, not by catching TypeError, so an error raised inside the
+    method is never mistaken for an old release."""
+    params = inspect.signature(method).parameters
+    if any(p.kind is p.VAR_KEYWORD for p in params.values()) or set(scope) <= set(params):
         return method(**scope)
-    except TypeError:
-        return method()
+    print(f"note: {method.__name__} has no {', '.join(sorted(set(scope) - set(params)))}; "
+          f"using its default view", file=sys.stderr)
+    return method()
 
 
 def discover(path):
@@ -279,10 +299,17 @@ def calls(a, version="0.8.2"):
     step = max(1, len(readable) // MAX_CURRENT_CHAPTER_BOOKS)
     for bid in readable[::step][:MAX_CURRENT_CHAPTER_BOOKS]:
         yield "get_chapter_content", {"book_id": bid}
+    yield "search_books", {"query": "the", "limit": 5, "offset": 5}
     yield "list_all_books", {"limit": 50, "offset": 50}
     yield "list_all_annotations", {"limit": 100, "offset": 100}
+    for bid in a["annotated"][:1]:
+        yield "list_annotations", {"book_id": bid, "limit": 5, "offset": 5}
     yield "search_annotations", {"text": "the", "limit": 50, "offset": 50}
+    yield "search_annotations", {"text": "the", "limit": 50, "order_by": "oldest"}
     yield "get_annotations_by_date_range", {"after": "2025-01-01", "order_by": "oldest"}
+    ctx = a["context_ids"]
+    for aid in ctx[:: max(1, len(ctx) // MAX_SHORT_CONTEXT_ANNOTATIONS)][:MAX_SHORT_CONTEXT_ANNOTATIONS]:
+        yield "get_annotation_context", {"annotation_id": aid, "chars_before": 50, "chars_after": 50}
 
 
 def run(args_path, out_path, version):
@@ -317,13 +344,16 @@ def parse_args(argv=None):
     r.add_argument("out_json")
     r.add_argument("--mcp-version", choices=MCP_VERSIONS,
                    help="exit 2 unless this is the installed apple-books-mcp")
+    for p in (d, r):
+        p.add_argument("--allow-downloads", action="store_true",
+                       help="run even if macOS refuses to turn off downloads of evicted "
+                            "iCloud files")
     return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
     cli = parse_args()
-    print(f"download of evicted iCloud files turned off: {disable_materialization()}",
-          file=sys.stderr)
+    require_download_policy(cli.allow_downloads)
     import py_apple_books
     if cli.cmd == "discover":
         require_discover_version(py_apple_books, cli.force)

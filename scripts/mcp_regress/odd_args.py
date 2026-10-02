@@ -18,7 +18,8 @@ compare exits 1 on OK -> EXC, on 'OK notfound' -> anything else, or on a
 call missing from CAND; EXC -> OK is reported as FIXED. It exits 2 if
 the two runs used different apple-books-mcp versions (0.9.0 reports
 not-found as an error, 0.8.2 as text). Like harness.py, ``run`` first
-turns off downloads of evicted iCloud files for its process on macOS.
+turns off downloads of evicted iCloud files for its process on macOS,
+and exits 2 if it can't, unless ``--allow-downloads``.
 """
 import argparse
 import hashlib
@@ -29,7 +30,7 @@ import sys
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from harness import (  # noqa: E402
-    disable_materialization, mcp_version, private_output, require_snapshot_home, text_of,
+    mcp_version, private_output, require_download_policy, require_snapshot_home, text_of,
 )
 
 HUGE = 99999999999999999999
@@ -72,9 +73,8 @@ def classify(text):
     return f"OK {digest} len={len(text)}"
 
 
-def run(out_path):
-    print(f"download of evicted iCloud files turned off: {disable_materialization()}",
-          file=sys.stderr)
+def run(out_path, allow_downloads=False):
+    require_download_policy(allow_downloads)
     require_snapshot_home()
     target = private_output(out_path)
     import py_apple_books
@@ -140,12 +140,14 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="probe the installed library, write OUT.json")
     r.add_argument("out_json")
+    r.add_argument("--allow-downloads", action="store_true",
+                   help="run even if macOS refuses to turn off downloads of evicted iCloud files")
     c = sub.add_parser("compare", help="compare two run outputs")
     c.add_argument("base_json")
     c.add_argument("cand_json")
     args = parser.parse_args(argv)
     if args.cmd == "run":
-        run(args.out_json)
+        run(args.out_json, args.allow_downloads)
         return 0
     return compare(args.base_json, args.cand_json)
 

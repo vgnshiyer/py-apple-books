@@ -88,6 +88,56 @@ def test_090_gets_its_new_calls(tools):
     assert ("search_books", {"query": "the"}) in added
     assert [kw for tool, kw in added if tool == "get_chapter_content"] == [{"book_id": 1}, {"book_id": 2}]
     assert all(tool != "search_books" for tool, _ in old)
+    # Every new argument of 0.9.0 is exercised on the real library too.
+    assert ("search_books", {"query": "the", "limit": 5, "offset": 5}) in added
+    assert ("list_annotations", {"book_id": 1, "limit": 5, "offset": 5}) in added
+    assert ("search_annotations", {"text": "the", "limit": 50, "order_by": "oldest"}) in added
+    assert ("get_annotation_context", {"annotation_id": 4, "chars_before": 50, "chars_after": 50}) in added
+    assert len(set(map(repr, new))) == len(new)  # no call twice: keys must be unique
+
+
+def test_short_contexts_are_spread_and_capped(tools):
+    args = dict(book_ids=[], annotated=[], collections=[], context_ids=list(range(100)),
+                describe_ids=[], chapter_calls=[], revisit_title="t", colors=[])
+    short = [kw["annotation_id"] for tool, kw in tools.harness.calls(args, "0.9.0")
+             if tool == "get_annotation_context" and "chars_before" in kw]
+    assert short == list(range(0, 100, 10))
+
+
+def test_unscoped_falls_back_only_for_a_missing_keyword(tools, capsys):
+    def old_release(limit=None):
+        return ["default view"]
+
+    def new_release(limit=None, *, include_deleted=False):
+        return ["every row" if include_deleted else "default view"]
+
+    def broken(limit=None, *, include_deleted=False):
+        raise TypeError("a bug inside the method")
+
+    assert tools.harness._unscoped(old_release, include_deleted=True) == ["default view"]
+    assert "old_release has no include_deleted" in capsys.readouterr().err
+    assert tools.harness._unscoped(new_release, include_deleted=True) == ["every row"]
+    with pytest.raises(TypeError, match="a bug inside"):
+        tools.harness._unscoped(broken, include_deleted=True)
+
+
+@pytest.mark.parametrize("platform, on, allow, exits", [
+    ("darwin", False, False, True),
+    ("darwin", False, True, False),
+    ("darwin", True, False, False),
+    ("linux", False, False, False),
+])
+def test_runs_stop_when_downloads_cannot_be_turned_off(tools, monkeypatch, platform, on, allow, exits):
+    monkeypatch.setattr(tools.harness, "disable_materialization", lambda: on)
+    monkeypatch.setattr(tools.harness.sys, "platform", platform)
+    if exits:
+        with pytest.raises(SystemExit) as stop:
+            tools.harness.require_download_policy(allow)
+        assert stop.value.code == 2
+    else:
+        assert tools.harness.require_download_policy(allow) is on
+    assert tools.harness.parse_args(["run", "--allow-downloads", "a", "b"]).allow_downloads
+    assert not tools.harness.parse_args(["discover", "a"]).allow_downloads
 
 
 def test_release_of_compares_sources(tools, tmp_path, monkeypatch):
