@@ -722,6 +722,107 @@ class TestThreads:
         assert begins.calls == [("book", True), ("book", False)]
         assert len(calls) == 2
 
+    @staticmethod
+    def _in_thread(call, timeout=10):
+        """``call()``'s result in a new thread, or the exception it
+        raised; fails if it hasn't finished within ``timeout`` s."""
+        out = []
+
+        def run():
+            try:
+                out.append(call())
+            except BaseException as e:  # noqa: BLE001
+                out.append(e)
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(timeout)
+        assert not t.is_alive(), "the call is still waiting"
+        return out[0]
+
+    def test_an_interrupt_right_after_begin_ends_the_flight(self, tmp_path):
+        """A KeyboardInterrupt (Ctrl-C) landing on the first line after
+        begin() returns: the flight is ended, so a later call, from any
+        thread, builds instead of waiting forever."""
+        import sys
+        bundle = _epub_shapes.plain(tmp_path)
+        code = _epub_index._get_or_build.__code__
+        lines = open(code.co_filename).read().splitlines()
+        begin_line = next(i for i, line in enumerate(lines, 1)
+                          if i > code.co_firstlineno and "cache.begin(ident)" in line)
+
+        def tracer(frame, event, arg):
+            if frame.f_code is not code:
+                return None
+
+            def local(f, ev, a):
+                if ev == "line" and f.f_lineno > begin_line:
+                    sys.settrace(None)
+                    raise KeyboardInterrupt("simulated")
+                return local
+            return local
+
+        previous = sys.gettrace()  # a coverage tracer, if any, is put back
+        sys.settrace(tracer)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                BookContent(bundle).list_spine_items()
+        finally:
+            sys.settrace(previous)
+        assert _epub_index._CACHE._inflight == {}
+        assert len(self._in_thread(lambda: BookContent(bundle).list_spine_items())) == 3
+
+    def test_a_flight_never_claimed_is_abandoned(self, tmp_path, monkeypatch):
+        """An exception between the registration and the claim (inside
+        begin()): waiters from other threads give up on it after a poll,
+        and the next call from the same thread replaces it at once."""
+        bundle = _epub_shapes.plain(tmp_path)
+        monkeypatch.setattr(_epub_index, "_WAIT_POLL", 0.05)
+        real = _epub_index._IndexCache.begin
+
+        def interrupted(self, ident):
+            real(self, ident)
+            raise KeyboardInterrupt("simulated")
+
+        monkeypatch.setattr(_epub_index._IndexCache, "begin", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            BookContent(bundle).list_spine_items()
+        monkeypatch.setattr(_epub_index._IndexCache, "begin", real)
+        (orphan,) = _epub_index._CACHE._inflight.values()
+        assert not orphan.claimed and not orphan.done.is_set()
+        # Another thread (the owner is alive, but never claimed it).
+        assert len(self._in_thread(lambda: BookContent(bundle).list_spine_items())) == 3
+        assert orphan.done.is_set() and _epub_index._CACHE._inflight == {}
+
+        clear_content_cache()
+        monkeypatch.setattr(_epub_index._IndexCache, "begin", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            BookContent(bundle).list_spine_items()
+        monkeypatch.setattr(_epub_index._IndexCache, "begin", real)
+        (orphan,) = _epub_index._CACHE._inflight.values()
+        # The same thread: replaced without waiting.
+        monkeypatch.setattr(_epub_index, "_WAIT_POLL", 60)
+        assert len(BookContent(bundle).list_spine_items()) == 3
+        assert orphan.done.is_set() and not orphan.ok
+
+    def test_a_flight_whose_thread_ended_is_abandoned(self, tmp_path, monkeypatch):
+        bundle = _epub_shapes.plain(tmp_path)
+        monkeypatch.setattr(_epub_index, "_WAIT_POLL", 0.05)
+        ident = _epub_index._book_ident(os.stat(bundle))
+        flights = []
+
+        def claim_and_vanish():
+            builder, flight, _ = _epub_index._CACHE.begin(ident)
+            flight.claimed = builder
+            flights.append(flight)
+
+        t = threading.Thread(target=claim_and_vanish)
+        t.start()
+        t.join(10)
+        assert flights[0].claimed and not flights[0].done.is_set()
+        assert len(self._in_thread(lambda: BookContent(bundle).list_spine_items())) == 3
+        assert flights[0].done.is_set() and _epub_index._CACHE._inflight == {}
+
     def test_waiters_share_a_value_the_cache_cannot_keep(self, tmp_path, monkeypatch, small_cache, begins):
         small_cache(max_weight=100)  # no index fits
         bundle = _epub_shapes.plain(tmp_path)

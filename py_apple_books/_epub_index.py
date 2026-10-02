@@ -571,14 +571,30 @@ class _InFlight:
     """One build in progress (see :meth:`_IndexCache.begin`): other
     threads wait for :attr:`done`; then :attr:`ok` tells whether the
     builder got a value (:attr:`value`, stored in the cache or not) or
-    failed."""
+    failed. :attr:`owner` is the thread that registered it;
+    :attr:`claimed` is set by that thread once it holds the flight (and
+    will end it, whatever happens), right after :meth:`_IndexCache.begin`
+    returns."""
 
-    __slots__ = ("done", "ok", "value")
+    __slots__ = ("done", "ok", "value", "owner", "claimed")
 
     def __init__(self) -> None:
         self.done = threading.Event()
         self.ok = False
         self.value: Any = None
+        self.owner = threading.current_thread()
+        self.claimed = False
+
+    def abandoned(self) -> bool:
+        """The builder will never end this flight: its thread is gone, or
+        it never claimed it (an exception, such as a KeyboardInterrupt,
+        landed between the registration and the claim)."""
+        return not self.claimed or not self.owner.is_alive()
+
+
+#: How long a waiter waits for a build before checking it was abandoned
+#: (see :meth:`_InFlight.abandoned`), in seconds.
+_WAIT_POLL = 1.0
 
 
 class _IndexCache:
@@ -649,21 +665,28 @@ class _IndexCache:
 
     def begin(self, ident: tuple) -> Tuple[bool, _InFlight, int]:
         """``(builder, flight, generation)``: the first caller for an
-        ``ident`` builds it (and must call :meth:`end`, after setting the
-        flight's outcome); later callers wait on ``flight.done``
-        meanwhile."""
+        ``ident`` builds it (and must claim the flight, then call
+        :meth:`end` after setting its outcome); later callers wait on
+        ``flight.done`` meanwhile. A flight this thread registered and
+        left behind (an exception before it claimed it) is ended as
+        failed and replaced."""
         with self._lock:
             flight = self._inflight.get(ident)
             if flight is not None:
-                return False, flight, self._generation
+                if flight.owner is not threading.current_thread():
+                    return False, flight, self._generation
+                flight.done.set()  # abandoned: its waiters build themselves
             flight = self._inflight[ident] = _InFlight()
             return True, flight, self._generation
 
     def end(self, ident: tuple, flight: _InFlight) -> None:
-        with self._lock:
-            if self._inflight.get(ident) is flight:
-                del self._inflight[ident]
-        flight.done.set()
+        """Unregister ``flight`` (if it still is) and wake its waiters."""
+        try:
+            with self._lock:
+                if self._inflight.get(ident) is flight:
+                    del self._inflight[ident]
+        finally:
+            flight.done.set()
 
     def clear(self) -> None:
         """Drop every entry. Builds in progress don't store their results,
@@ -736,30 +759,39 @@ def _get_or_build(ident: tuple, lookup: Callable[[], Any],
     found = lookup()
     if found is not None:
         return found
-    builder, flight, generation = cache.begin(ident)
-    if not builder:
-        flight.done.wait()
-        if flight.ok and (still_valid is None or still_valid(flight.value)):
-            return flight.value
-        found = lookup()
-        if found is not None:
-            return found
-        generation = cache.generation
-        value, key, weight, storable = build()
-        if storable:
-            cache.insert(ident, key, value, weight, generation)
-        return value
+    builder, flight = False, None
     try:
-        found = lookup()  # built and stored while this thread got here
-        if found is None:
-            value, key, weight, storable = build()
-            if storable:
-                cache.insert(ident, key, value, weight, generation)
-            found = value
-        flight.value, flight.ok = found, True
-        return found
+        # begin() inside the try, so that the flight is ended whatever
+        # interrupts this thread once begin() has returned it; it is
+        # claimed (see _InFlight) at once.
+        builder, flight, generation = cache.begin(ident)
+        if builder:
+            flight.claimed = True
+            found = lookup()  # built and stored while this thread got here
+            if found is None:
+                value, key, weight, storable = build()
+                if storable:
+                    cache.insert(ident, key, value, weight, generation)
+                found = value
+            flight.value, flight.ok = found, True
+            return found
     finally:
-        cache.end(ident, flight)
+        if builder:
+            cache.end(ident, flight)
+    while not flight.done.wait(_WAIT_POLL):
+        if flight.abandoned():
+            cache.end(ident, flight)  # as failed: this thread builds
+            break
+    if flight.ok and (still_valid is None or still_valid(flight.value)):
+        return flight.value
+    found = lookup()
+    if found is not None:
+        return found
+    generation = cache.generation
+    value, key, weight, storable = build()
+    if storable:
+        cache.insert(ident, key, value, weight, generation)
+    return value
 
 
 # ---------------------------------------------------------------------------
