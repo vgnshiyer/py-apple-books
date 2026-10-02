@@ -129,7 +129,7 @@ class TestBinding:
 
     def test_signatures_are_the_originals(self):
         assert list(inspect.signature(PyAppleBooks.get_finished_books).parameters) == [
-            "self", "limit", "order_by", "offset"]
+            "self", "limit", "order_by", "offset", "finished_after", "finished_before"]
 
     def test_a_bound_mixin_method_reads_the_instance_library(self, library, make_library):
         """The mechanism api.py applies to every mixin: a mixin's method,
