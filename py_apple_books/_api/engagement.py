@@ -352,7 +352,9 @@ class _EngagementAPI:
         This measures highlighting, not reading time, which Books
         doesn't record in a form the library can read. For a window with
         a bound, ``highlights`` equals the number of type-2 rows
-        :meth:`get_annotations_by_date_range` returns for it.
+        :meth:`get_annotations_by_date_range` returns for it whose
+        ``creation_date`` is a date (a stored value too far out of range
+        to read as one is not counted here).
 
         :raises InvalidArgumentError: a bad ``after`` or ``before``.
         :raises InvalidChoiceError: an unknown ``granularity``.

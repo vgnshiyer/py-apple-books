@@ -112,6 +112,18 @@ class TestActivity:
         listed = [a for a in api.get_annotations_by_date_range(after, before) if a.type == 2]
         assert result.highlights == len(listed)
 
+    def test_unreadable_date_in_the_window(self, api, library):
+        # The SQL window keeps a stored date beyond datetime's range; the
+        # model reads it as None and the activity does not count it.
+        book = library.add_book("B")
+        library.add_annotation(book, "dated", created=local(2027, 1, 2, 9))
+        library.add_annotation(book, "far", created=1e300)
+        listed = [a for a in api.get_annotations_by_date_range(D(2020, 1, 1)) if a.type == 2]
+        assert len(listed) == 2
+        result = api.get_highlight_activity(after=D(2020, 1, 1))
+        check_invariants(result)
+        assert result.highlights == len([a for a in listed if a.creation_date is not None]) == 1
+
     def test_book(self, api, activity):
         result = api.get_highlight_activity(book_id=activity["two"]["id"], granularity="day")
         check_invariants(result)
