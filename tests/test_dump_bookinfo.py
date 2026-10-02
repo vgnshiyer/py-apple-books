@@ -233,21 +233,28 @@ def test_cache_without_the_table_is_refused(folder):
         dump_schema.dump_book_info(path)
 
 
-def test_rows_never_reach_the_output(lib, folder, tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("leak", [
+    f"INSERT INTO {TABLE} (ZBOOKTITLE) VALUES ('{SECRET}title');",
+    f"CREATE TEMP TABLE leak AS SELECT '{SECRET}title' AS t;",
+    f"-- {SECRET}title\n",
+])
+def test_rows_never_reach_the_output(lib, folder, tmp_path, monkeypatch, capsys, leak):
     """The self-check stands between a dump and the file: SQL that would
-    carry a row is not written."""
+    carry a value is not written."""
     cases.create(folder / CACHE_NAME).close()
     real = dump_schema.dump_book_info
 
     def leaky(path):
         sql, info = real(path)
-        return sql + f"INSERT INTO {TABLE} (ZBOOKTITLE) VALUES ('{SECRET}title');\n", info
+        return sql + leak + "\n", info
 
     monkeypatch.setattr(dump_schema, "dump_book_info", leaky)
     assert dump(lib, tmp_path / "out") == 0
     fixture = fixture_dir(tmp_path / "out")
     assert sorted(p.name for p in fixture.iterdir()) == STORE_FILES
-    assert "self-check: AEBookInfo.sql holds rows" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "note: AEBookInfo.sql not written: self-check: AEBookInfo.sql holds more than plain" in err
+    assert SECRET not in err
 
 
 def test_stale_book_info_sql_is_reported(lib, tmp_path, capsys):
@@ -264,26 +271,208 @@ def test_stale_book_info_sql_is_reported(lib, tmp_path, capsys):
 # -- self-check -------------------------------------------------------------
 
 
-def test_self_check_book_info():
+def test_self_check_book_info(tmp_path):
     ddl = cases.ddl()
     dump_schema.self_check_book_info(ddl)
+    # The header comments are optional; the statements alone pass too.
+    dump_schema.self_check_book_info("\n".join(l for l in ddl.splitlines() if not l.startswith("--")))
+    attached = tmp_path / "attached.db"
     rejected = {
         "a row": ddl + f"INSERT INTO {TABLE} (Z_PK) VALUES (1);",
         "a row by CREATE AS": f"CREATE TABLE {TABLE} AS SELECT 'x' AS ZBOOKTITLE;",
+        "a row by CREATE AS, no literal": f"CREATE TABLE {TABLE} AS SELECT char(83, 69) AS ZBOOKTITLE;",
         "another table": ddl + "CREATE TABLE ZOTHER (a);",
         "an empty bookkeeping table": ddl + "CREATE TABLE Z_PRIMARYKEY (Z_ENT INTEGER);",
         "an index on another table": ddl + "CREATE TABLE ZOTHER (a); CREATE INDEX I ON ZOTHER (a);",
         "a view": ddl + f"CREATE VIEW V AS SELECT * FROM {TABLE};",
         "a trigger": ddl + f"CREATE TRIGGER T AFTER INSERT ON {TABLE} BEGIN SELECT 1; END;",
         "statistics": ddl + "ANALYZE;",
+        "a pragma": ddl + "PRAGMA user_version = 7;",
         "no table": "-- nothing\n",
         "a path": ddl + "-- /Users/someone\n",
         "SQL that does not run": ddl + "CREATE TABLE (;",
+        "an unterminated statement": ddl + "CREATE INDEX I ON ZAEBOOKINFO (ZGENRE)",
+        # Values the old check let through: it only looked at main's
+        # tables and their rows.
+        "a TEMP table holding a row": ddl + f"CREATE TEMP TABLE leak AS SELECT '{SECRET}title' AS t;",
+        "a TEMP table by schema name": ddl + "CREATE TABLE temp.leak (a);",
+        "an attached table holding a row":
+            ddl + f"ATTACH ':memory:' AS e; CREATE TABLE e.leak AS SELECT '{SECRET}title' AS t;",
+        "an attached file": ddl + f"ATTACH DATABASE '{attached}' AS e; CREATE TABLE e.t (x);",
+        "VACUUM INTO a file": ddl + f"VACUUM INTO '{attached}';",
+        "a DEFAULT literal": ddl.replace("ZBOOKTITLE VARCHAR", f"ZBOOKTITLE VARCHAR DEFAULT '{SECRET}title'"),
+        "a double-quoted literal": ddl.replace("ZBOOKTITLE VARCHAR", f'ZBOOKTITLE VARCHAR DEFAULT "{SECRET}"'),
+        "a blob literal": ddl.replace("ZORTHOGRAPHY BLOB", "ZORTHOGRAPHY BLOB DEFAULT X'00'"),
+        "a partial index literal": ddl + f"CREATE INDEX I ON {TABLE} (ZGENRE) WHERE ZBOOKTITLE <> '{SECRET}';",
+        "a comment": ddl + f"-- {SECRET}title by {SECRET}author\n",
+        "an inline comment": ddl.replace("ZORTHOGRAPHY BLOB", f"ZORTHOGRAPHY BLOB /* {SECRET} */"),
+        "an end-of-line comment": ddl.replace(" );", f" ); -- {SECRET}", 1),
     }
     for label, sql in rejected.items():
         with pytest.raises(dump_schema.DumpError):
             dump_schema.self_check_book_info(sql)
             pytest.fail(f"accepted {label}")
+    assert not attached.exists()
+
+
+def test_schema_scripts_run_without_attach_or_temp(tmp_path):
+    """The authorizer itself, under the text checks: SQL that passes no
+    text check still can't attach a file or leave a TEMP object."""
+    ddl = cases.ddl()
+    attached = tmp_path / "attached.db"
+    payloads = [
+        f"ATTACH DATABASE '{attached}' AS e; CREATE TABLE e.t (x); INSERT INTO e.t VALUES ('written');",
+        "CREATE TEMP TABLE leak (a);",
+        "CREATE TABLE temp.leak (a);",
+        "PRAGMA writable_schema = ON;",
+        f"VACUUM INTO '{attached}';",
+    ]
+    for payload in payloads:
+        for run in (lambda sql: dump_schema._schema_db(sql, "test").close(),
+                    dump_schema.table_columns, dump_schema.self_check):
+            with pytest.raises(dump_schema.DumpError, match="self-check: .* does not run: .*auth"):
+                run(ddl + payload)
+    assert not attached.exists()
+    # What the stores' SQL needs still runs: their DDL and the bookkeeping rows.
+    for store in ("BKLibrary", "AEAnnotation"):
+        sql = (SCHEMAS_DIR / DEFAULT_SCHEMA / f"{store}.sql").read_text()
+        dump_schema.self_check(sql)
+        assert dump_schema.table_columns(sql)
+    # An insert into another table is refused while the script runs.
+    with pytest.raises(dump_schema.DumpError, match="not authorized"):
+        dump_schema.self_check("CREATE TABLE ZX (a); INSERT INTO ZX VALUES (1);")
+
+
+class _NoAuthorizer(sqlite3.Connection):
+    def set_authorizer(self, *args, **kwargs):
+        pass
+
+
+@pytest.mark.parametrize("payload", [
+    "CREATE TEMP TABLE leak (a);",
+    "ATTACH ':memory:' AS e; CREATE TABLE e.leak (a);",
+])
+def test_schema_scripts_are_checked_after_running_too(monkeypatch, payload):
+    # Behind the authorizer: were it bypassed, what the script left
+    # outside main's schema still fails the check.
+    real = sqlite3.connect
+    monkeypatch.setattr(dump_schema.sqlite3, "connect",
+                        lambda *a, **k: real(*a, factory=_NoAuthorizer, **k))
+    with pytest.raises(dump_schema.DumpError, match="creates something outside its own schema"):
+        dump_schema._schema_db(cases.ddl() + payload, "test")
+
+
+def _inject(path: pathlib.Path, name: str, sql: str) -> None:
+    """Set ``name``'s sqlite_master text, as a crafted file could."""
+    con = sqlite3.connect(path, isolation_level=None)
+    try:
+        con.execute("PRAGMA writable_schema = ON")
+        con.execute("UPDATE sqlite_master SET sql = ? WHERE name = ?", (sql, name))
+        con.execute("PRAGMA writable_schema = OFF")
+    finally:
+        con.close()
+
+
+def test_crafted_cache_schema_is_never_run(lib, folder, tmp_path, capsys):
+    """A cache whose sqlite_master text carries more than DDL: the dump
+    refuses it before anything runs it, and no file appears."""
+    path = folder / CACHE_NAME
+    cases.create(path).close()
+    attached = tmp_path / "attached.db"
+    original = cache_objects(path)
+    table_sql = next(sql for kind, _, _, sql in original if kind == "table")
+    _inject(path, TABLE, f"{table_sql}; ATTACH DATABASE '{attached}' AS e; CREATE TABLE e.t (x); "
+                         f"INSERT INTO e.t VALUES ('written')")
+    # The cache still opens: SQLite compiles only the first statement.
+    con = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True)
+    assert con.execute(f"SELECT count(*) FROM {TABLE}").fetchone()[0] > 0
+    con.close()
+    with pytest.raises(dump_schema.DumpError, match="is not a plain CREATE TABLE or CREATE INDEX statement"):
+        dump_schema.dump_book_info(path)
+    assert dump(lib, tmp_path / "out", "--compare") == 0
+    assert sorted(p.name for p in fixture_dir(tmp_path / "out").iterdir()) == STORE_FILES
+    captured = capsys.readouterr()
+    assert "note: AEBookInfo.sql not written" in captured.err
+    assert str(attached) not in captured.out + captured.err
+    assert not attached.exists()
+
+
+@pytest.mark.parametrize("extra", [
+    f"CREATE INDEX Z_PARTIAL ON {TABLE} (ZGENRE) WHERE ZBOOKTITLE <> '{SECRET}literal'",
+    f'CREATE INDEX Z_QUOTED ON {TABLE} ("ZGENRE")',
+])
+def test_cache_ddl_with_a_literal_is_refused(folder, extra):
+    # Valid SQL, but text that could carry a value: not copied.
+    path = folder / CACHE_NAME
+    con = cases.create(path)
+    con.execute(extra)
+    con.close()
+    with pytest.raises(dump_schema.DumpError, match="not a plain CREATE TABLE") as info:
+        dump_schema.dump_book_info(path)
+    assert SECRET not in str(info.value)
+
+
+def test_crafted_store_schema_is_never_run(lib, tmp_path, capsys):
+    attached = tmp_path / "attached.db"
+    con = sqlite3.connect(lib.library_path)
+    table_sql = con.execute("SELECT sql FROM sqlite_master WHERE name = 'ZBKCOLLECTION'").fetchone()[0]
+    con.close()
+    _inject(lib.library_path, "ZBKCOLLECTION",
+            f"{table_sql}; ATTACH DATABASE '{attached}' AS e; CREATE TABLE e.t (x)")
+    with pytest.raises(dump_schema.DumpError, match="not a single CREATE statement"):
+        dump_schema.dump_store(lib.library_path)
+    assert dump(lib, tmp_path / "out") == 1
+    assert "not a single CREATE statement" in capsys.readouterr().err
+    assert not attached.exists() and not (tmp_path / "out").exists()
+
+
+def test_store_entries_may_be_triggers_and_views(lib):
+    """Core Data stores may carry triggers (with literals and function
+    calls) and views: still dumped, self-checked and compared."""
+    con = sqlite3.connect(lib.library_path)
+    con.executescript(
+        "CREATE TRIGGER Z_DA_ZBKCOLLECTION AFTER UPDATE OF ZTITLE ON ZBKCOLLECTION FOR EACH ROW BEGIN "
+        "UPDATE ZBKCOLLECTION SET ZTITLE = upper('x;y') WHERE Z_PK = NEW.Z_PK; END;"
+        "CREATE VIEW ZV AS SELECT Z_PK FROM ZBKCOLLECTION;")
+    con.close()
+    sql, _ = dump_schema.dump_store(lib.library_path)
+    dump_schema.self_check(sql)
+    assert "ZBKCOLLECTION" in dump_schema.table_columns(sql)
+
+
+@pytest.mark.parametrize("entry, store_ok, plain_ok", [
+    ("CREATE TABLE ZX ( Z_PK INTEGER PRIMARY KEY, ZA VARCHAR(255) )", True, True),
+    ("CREATE UNIQUE INDEX I ON ZX (ZA COLLATE BINARY ASC)", True, True),
+    ("CREATE INDEX I ON ZX (ZA) WHERE ZA > 0", True, True),
+    ("  CREATE INDEX I ON ZX (ZA)  ", True, True),
+    ("CREATE TRIGGER T AFTER INSERT ON ZX BEGIN SELECT 'a;b'; SELECT 2; END", True, False),
+    ("CREATE VIEW V AS SELECT 1", True, False),
+    ("CREATE VIRTUAL TABLE V USING fts5(a)", False, False),
+    ("CREATE TABLE ZX (a); ATTACH 'x' AS e", False, False),
+    ("CREATE TABLE ZX (a);", False, False),
+    ("CREATE TABLE ZX (a) -- note", False, False),
+    ("CREATE TABLE ZX (a /* note */)", False, False),
+    ("CREATE TABLE ZX (a DEFAULT 'x')", True, False),
+    ("CREATE TABLE ZX (a DEFAULT 'x;y')", True, False),
+    ("create table ZX (a)", False, False),
+    ("INSERT INTO ZX VALUES (1)", False, False),
+])
+def test_schema_entry_rules(entry, store_ok, plain_ok):
+    assert dump_schema._is_store_entry(entry) is store_ok
+    assert dump_schema._is_plain_ddl(entry) is plain_ok
+
+
+@pytest.mark.parametrize("schema", available_schemas())
+def test_committed_ddl_passes_the_entry_rules(schema):
+    # Apple's own DDL, as committed: what a dump of a real library copies.
+    for name, rule in (("BKLibrary.sql", dump_schema._is_store_entry),
+                       ("AEAnnotation.sql", dump_schema._is_store_entry),
+                       ("AEBookInfo.sql", dump_schema._is_plain_ddl)):
+        sql_file = SCHEMAS_DIR / schema / name
+        if not sql_file.is_file():
+            continue
+        entries = [line[:-1] for line in sql_file.read_text().splitlines() if line.startswith("CREATE ")]
+        assert entries and all(rule(e) for e in entries), name
 
 
 # -- the open rule (shared cases) -------------------------------------------
