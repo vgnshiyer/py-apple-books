@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 # Placeholder for "not in the instance's __dict__".
 _UNSET = object()
@@ -107,6 +107,127 @@ def _spine_index(sort_key: Optional[Tuple[int, ...]]) -> Optional[int]:
     if not sort_key or len(sort_key) < 2 or sort_key[0] != 6 or sort_key[1] < 2:
         return None
     return sort_key[1] // 2 - 1
+
+
+# -- the content path (1.11, private) ------------------------------------------
+
+#: One step of a CFI's content path: the step's integer (even: a child
+#: element, ``2 * (n + 1)`` for the n-th; odd: the text between child
+#: elements) and the step's id assertion (``/4[chap01]``), or None.
+_Step = Tuple[int, Optional[str]]
+
+# Digits accepted in one step; a longer number is malformed (no document
+# has a billion children, and int() of a huge string is slow).
+_MAX_STEP_DIGITS = 9
+
+
+def _top_level(body: str, separators: str) -> Optional[List[str]]:
+    """``body`` split at the characters of ``separators`` that are
+    outside ``[...]`` assertions (where ``^`` escapes the next
+    character). None when a ``[`` is never closed (a malformed CFI,
+    whose separators can't be told apart)."""
+    parts: List[str] = []
+    start = 0
+    i, n = 0, len(body)
+    while i < n:
+        ch = body[i]
+        if ch == "[":
+            i += 1
+            while i < n and body[i] != "]":
+                i += 2 if body[i] == "^" else 1
+            if i >= n:
+                return None
+        elif ch in separators:
+            parts.append(body[start:i])
+            start = i + 1
+        i += 1
+    parts.append(body[start:])
+    return parts
+
+
+def _assertion_id(raw: str) -> Optional[str]:
+    """The id of an element step's assertion text (between the
+    brackets): up to the first unescaped ``;`` (parameters dropped),
+    with ``^`` escapes undone; None when empty."""
+    out: List[str] = []
+    i, n = 0, len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == "^" and i + 1 < n:
+            out.append(raw[i + 1])
+            i += 2
+            continue
+        if ch == ";":
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out) or None
+
+
+def _content_path(cfi: str) -> Optional[Tuple[_Step, ...]]:
+    """The steps of a CFI's content path: where in its spine file the
+    location is, for :meth:`BookContent.resolve
+    <py_apple_books.content.BookContent.resolve>` (and the exact
+    positions of later versions).
+
+    The content path is what follows the first ``!`` (the spine path,
+    before it, names the file). For a range CFI
+    (``epubcfi(parent,start,end)``) it is the parent's content path
+    followed by the start's steps, so a range is placed where it begins.
+    Character offsets (``:N``), temporal (``~N``) and spatial (``@x:y``)
+    offsets are dropped (they end a path), and so is anything after a
+    second ``!`` (a reference into another document). Each step keeps
+    its id assertion (``/2[chap01]``: ``(2, 'chap01')``; text-location
+    parameters after ``;`` dropped, ``^`` escapes undone).
+
+    Returns ``()`` for a CFI that points at a spine item as a whole (no
+    ``!``), and None for anything that isn't an ``epubcfi(...)`` or whose
+    content path is malformed (a step without digits, or with more than
+    nine, an unclosed assertion anywhere in the CFI, a stray character). Never raises; time
+    is linear in the length of the CFI.
+    """
+    if not isinstance(cfi, str) or not cfi:
+        return None
+    m = _CFI_WRAPPER.match(cfi)
+    if not m:
+        return None
+    ranges = _top_level(m.group(1), ",")
+    if ranges is None:
+        return None  # an unclosed assertion, in the spine path included
+    path = ranges[0] + (ranges[1] if len(ranges) > 1 else "")
+    documents = _top_level(path, "!")
+    if documents is None:
+        return None
+    if len(documents) < 2:
+        return ()
+    content = documents[1]
+    steps: List[_Step] = []
+    i, n = 0, len(content)
+    while i < n:
+        ch = content[i]
+        if ch in ":~@":
+            break  # an offset ends the path
+        if ch != "/":
+            return None
+        j = i + 1
+        while j < n and "0" <= content[j] <= "9":
+            j += 1
+        digits = j - i - 1
+        if digits == 0 or digits > _MAX_STEP_DIGITS:
+            return None
+        step = int(content[i + 1:j])
+        ident: Optional[str] = None
+        if j < n and content[j] == "[":
+            k = j + 1
+            while k < n and content[k] != "]":
+                k += 2 if content[k] == "^" else 1
+            if k >= n:
+                return None  # unclosed assertion
+            ident = _assertion_id(content[j + 1:k])
+            j = k + 1
+        steps.append((step, ident))
+        i = j
+    return tuple(steps)
 
 
 def _parse_cfi(
@@ -258,31 +379,44 @@ class PageLocation:
         isn't a dictionary (or has neither key), and for a page offset or
         ordinal that isn't an int in ``0..MAX_PAGE_INDEX``.
         """
-        if not isinstance(data, (bytes, bytearray, memoryview)):
+        found = _decode_page_location(data)
+        if found is None:
             return None
-        try:
-            size = memoryview(data).nbytes
-        except (TypeError, ValueError):
-            return None
-        if not size or size > MAX_PAGE_LOCATION_BYTES:
-            return None
-        import plistlib  # imported on first use, not when the package is imported
+        location = found[0]
+        return location if cls is PageLocation else cls(ordinal=location.ordinal,
+                                                         page_offset=location.page_offset)
 
-        try:
-            obj = plistlib.loads(bytes(data))
-        except Exception:  # noqa: BLE001 - any malformed input means "no page location"
-            return None
-        if not isinstance(obj, dict) or "$archiver" in obj or "$objects" in obj:
-            return None
-        parent = obj.get("super")
-        if parent is not None and not isinstance(parent, dict):
-            return None
-        has_offset = "pageOffset" in obj
-        has_ordinal = parent is not None and "ordinal" in parent
-        if not (has_offset or has_ordinal):
-            return None
-        page_offset = obj["pageOffset"] if has_offset else None
-        ordinal = parent["ordinal"] if has_ordinal else 0
-        if (has_offset and not _page_index(page_offset)) or not _page_index(ordinal):
-            return None
-        return cls(ordinal=ordinal, page_offset=page_offset)
+
+def _decode_page_location(data) -> Optional[Tuple["PageLocation", bool]]:
+    """``(PageLocation.from_plist(data), whether the data records
+    super.ordinal)``, or None (1.11, private): a missing ordinal reads as
+    0, which for an EPUB is not data (the facade's reading position takes
+    the spine item from it only when it was recorded)."""
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        return None
+    try:
+        size = memoryview(data).nbytes
+    except (TypeError, ValueError):
+        return None
+    if not size or size > MAX_PAGE_LOCATION_BYTES:
+        return None
+    import plistlib  # imported on first use, not when the package is imported
+
+    try:
+        obj = plistlib.loads(bytes(data))
+    except Exception:  # noqa: BLE001 - any malformed input means "no page location"
+        return None
+    if not isinstance(obj, dict) or "$archiver" in obj or "$objects" in obj:
+        return None
+    parent = obj.get("super")
+    if parent is not None and not isinstance(parent, dict):
+        return None
+    has_offset = "pageOffset" in obj
+    has_ordinal = parent is not None and "ordinal" in parent
+    if not (has_offset or has_ordinal):
+        return None
+    page_offset = obj["pageOffset"] if has_offset else None
+    ordinal = parent["ordinal"] if has_ordinal else 0
+    if (has_offset and not _page_index(page_offset)) or not _page_index(ordinal):
+        return None
+    return PageLocation(ordinal=ordinal, page_offset=page_offset), has_ordinal
