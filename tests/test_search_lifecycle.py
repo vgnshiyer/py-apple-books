@@ -173,6 +173,37 @@ def test_threads_while_rows_are_inserted(lib, db, monkeypatch):
     assert index_of(db).builds <= 10 + 1
 
 
+def test_one_fingerprint_per_interval_under_concurrency(lib, db, monkeypatch):
+    """16 searches arriving together once a check is due: one of them
+    fingerprints the store and the others use its result, whether the
+    store is unchanged or changed (then one rebuild)."""
+    now = [1000.0]
+    monkeypatch.setattr(search, "_clock", lambda: now[0])
+    assert len(ranked(db, limit=None)) == 200
+    index = index_of(db)
+    real, calls = search.AnnotationIndex._fingerprint, []
+
+    def slow(self, db):
+        calls.append(1)
+        time.sleep(0.05)  # every thread arrives while it runs
+        return real(self, db)
+
+    monkeypatch.setattr(search.AnnotationIndex, "_fingerprint", slow)
+    book = lib.add_book("Growing")
+    for check, change in enumerate((False, True, False), start=1):
+        if change:
+            lib.add_annotation(book, f"one more {QUERY}")
+        now[0] += search._RECHECK * 2
+        barrier = threading.Barrier(16)
+        threads = [in_thread(lambda: (barrier.wait(10), len(ranked(db, limit=None)))[1]) for _ in range(16)]
+        for thread, _ in threads:
+            thread.join(30)
+        expected = 201 if check > 1 else 200
+        assert [result for _, result in threads] == [[("ok", expected)]] * 16
+        assert len(calls) == check
+    assert index.builds == 2 and not index._check_lock.locked()
+
+
 # -- deadlines -----------------------------------------------------------------
 
 

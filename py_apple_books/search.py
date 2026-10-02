@@ -450,11 +450,16 @@ class AnnotationIndex:
     Construction is O(1) and does no I/O. The index keeps no reference
     to its library: the ``LibraryDB`` is passed to each call.
 
-    Locks, in this order only: ``_build_lock`` (one builder), a
-    generation's ``lock`` (one search per database), ``_state`` (the
-    fields, held only around reading and writing them), then the
-    library's own lock and connections (pooled reads). Waits for the
-    first two end at the statement deadline.
+    Locks, in this order only: ``_build_lock`` (one builder),
+    ``_check_lock`` (one freshness check), a generation's ``lock`` (one
+    search per database), ``_state`` (the fields, held only around
+    reading and writing them), then the library's own lock and
+    connections (pooled reads). No thread holds two of the first three
+    at once; waits for them end at the statement deadline.
+
+    Freshness: one thread at a time fingerprints the store (see
+    :meth:`_check`), at most once per ``_RECHECK`` seconds; the others
+    use its result.
 
     Building is resumable: rows are read in Z_PK chunks, and a build
     that a caller's deadline stops is continued by the next caller.
@@ -468,8 +473,11 @@ class AnnotationIndex:
         self._pid = os.getpid()
         self._state = threading.Lock()
         self._build_lock = threading.Lock()
+        self._check_lock = threading.Lock()
         self._ready: Optional[_Gen] = None
         self._pending: Optional[_Pending] = None
+        # The latest fingerprint: (clock before it was taken, key, ttl).
+        self._last_check: Optional[Tuple[float, tuple, bool]] = None
         self._dead = False
         self._inside = 0
         #: Completed builds, and rows read from the annotation store (tests).
@@ -516,6 +524,7 @@ class AnnotationIndex:
     def mark_stale(self) -> None:
         """Fingerprint the store again on the next search."""
         with self._state:
+            self._last_check = None
             if self._ready is not None:
                 self._ready.checked = float("-inf")
 
@@ -553,30 +562,95 @@ class AnnotationIndex:
         except DBQueryError:
             # A column gone under a running process (or the cached schema
             # is out of date): read it again next time, and rely on the
-            # TTL meanwhile rather than fail the search.
+            # TTL meanwhile rather than fail the search (see _matches).
             db.invalidate_schema()
             return (paths, identity, None), True
         return (paths, identity, row), not has_opt
+
+    def _pin_if_fresh(self, now: float) -> Optional[_Gen]:
+        """With ``_state`` held: the ready generation, pinned, if it was
+        checked less than ``_RECHECK`` seconds before ``now`` and has not
+        expired."""
+        gen = self._ready
+        if gen is not None and now - gen.checked < _RECHECK and not gen.expired(now):
+            gen.users += 1
+            return gen
+        return None
+
+    @staticmethod
+    def _matches(gen: _Gen, key: tuple, ttl: bool, checked: float, now: float) -> bool:
+        """With ``_state`` held: whether ``gen`` still serves the store
+        fingerprinted as ``key`` at ``checked``.
+
+        A failed fingerprint (no row in ``key``) keeps an index of the
+        same store file, for at most ``_TTL_WITHOUT_ZOPT`` seconds from
+        the first failure, rather than rebuild it at once (and again when
+        the fingerprint works again). A matching fingerprint with
+        ``Z_OPT`` ends such a TTL.
+        """
+        if key[2] is None:
+            if gen.key[:2] != key[:2]:
+                return False
+            limit = checked + _TTL_WITHOUT_ZOPT
+            if gen.ttl_at is None or gen.ttl_at > limit:
+                gen.ttl_at = limit
+            return not gen.expired(now)
+        if gen.key != key:
+            return False
+        if not ttl:
+            gen.ttl_at = None
+        return not gen.expired(now)
+
+    def _check(self, db: "LibraryDB") -> Tuple[Optional[_Gen], tuple, bool, float]:
+        """``(gen, key, ttl, checked)``: the store's fingerprint ``key``
+        (and whether a TTL applies), taken at ``checked`` (by this thread,
+        or by another less than ``_RECHECK`` seconds ago), and the ready
+        generation pinned if it still matches (else None).
+
+        One thread at a time: a thread that waited finds the generation
+        checked by the one before it, or reuses its fingerprint. The clock
+        is read before the statement, under the lock, so a later
+        ``checked`` always comes with a fingerprint taken later.
+        """
+        deadline, limit = db._statement_deadline()
+        _wait(self._check_lock, deadline, limit)
+        try:
+            now = _clock()
+            with self._state:
+                gen = self._pin_if_fresh(now)
+                last = self._last_check
+            if gen is not None:
+                return gen, gen.key, False, gen.checked
+            if last is not None and now - last[0] < _RECHECK:
+                checked, key, ttl = last
+            else:
+                checked = now
+                key, ttl = self._fingerprint(db)
+                with self._state:
+                    self._last_check = (checked, key, ttl)
+            with self._state:
+                gen = self._ready
+                if gen is not None and self._matches(gen, key, ttl, checked, now):
+                    if key[2] is not None:
+                        gen.checked = max(gen.checked, checked)
+                    gen.users += 1
+                    return gen, key, ttl, checked
+            return None, key, ttl, checked
+        finally:
+            self._check_lock.release()
 
     def _pin_fresh(self, db: "LibraryDB") -> _Gen:
         """A generation built from the store as it is now (as of the last
         check, at most ``_RECHECK`` seconds ago), pinned."""
         while True:
-            now = _clock()
             with self._state:
-                gen = self._ready
-                if gen is not None and now - gen.checked < _RECHECK and not gen.expired(now):
-                    gen.users += 1
-                    return gen
-            key, ttl = self._fingerprint(db)
-            now = _clock()
-            with self._state:
-                gen = self._ready
-                if gen is not None and gen.key == key and not gen.expired(now):
-                    gen.checked = now
-                    gen.users += 1
-                    return gen
-            gen = self._build(db, key, ttl, now)
+                gen = self._pin_if_fresh(_clock())
+            if gen is not None:
+                return gen
+            gen, key, ttl, checked = self._check(db)
+            if gen is not None:
+                return gen
+            gen = self._build(db, key, ttl, checked)
             with self._state:
                 # What this call built (or found built for its key) is
                 # used even if already due for a check: progress.
@@ -601,8 +675,10 @@ class AnnotationIndex:
                     return ready
                 pending = self._pending
             if pending is None or (pending.key != key and pending.checked < checked):
-                # A new build: the old index is freed first, so two never
-                # coexist.
+                # A new build: the old generation is retired first (closed
+                # now, unless searches still use it; the last one closes
+                # it), so the index keeps one database besides those that
+                # running searches hold.
                 with self._state:
                     stale = [self._retire(self._ready), pending and pending.conn]
                     self._ready = self._pending = None

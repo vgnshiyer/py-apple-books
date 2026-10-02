@@ -564,6 +564,71 @@ class TestFreshness:
         assert ids(ranked.search_annotations("alpha", limit=2)) == [rows[2], rows[1]]
         assert index.builds == 2
 
+    def test_a_failed_fingerprint_keeps_the_index_under_a_ttl(self, lib, ranked, clock, monkeypatch):
+        """A transient failure ('database is locked' while Apple Books
+        writes) neither rebuilds the index nor, once over, rebuilds it
+        again; one that lasts past the TTL does."""
+        lib.add_annotation(lib.add_book("B"), "alpha")
+        assert len(ranked.search_annotations("alpha")) == 1
+        index, db = index_of(ranked), ranked._PyAppleBooks__library
+        real, failing = db.execute, [True]
+
+        def execute(sql, *args, **kwargs):
+            if failing[0] and "total(" in sql:
+                raise DBQueryError("Database query failed.")
+            return real(sql, *args, **kwargs)
+
+        monkeypatch.setattr(db, "execute", execute)
+        clock[0] += search._RECHECK * 2
+        assert len(ranked.search_annotations("alpha")) == 1
+        assert index.builds == 1 and index._ready.ttl_at == clock[0] + search._TTL_WITHOUT_ZOPT
+        failing[0] = False
+        clock[0] += search._RECHECK * 2
+        assert len(ranked.search_annotations("alpha")) == 1
+        assert index.builds == 1 and index._ready.ttl_at is None  # verified again: no TTL
+        failing[0] = True
+        clock[0] += search._RECHECK * 2
+        first_failure = clock[0]
+        ranked.search_annotations("alpha")
+        clock[0] += search._TTL_WITHOUT_ZOPT / 2
+        ranked.search_annotations("alpha")
+        assert index.builds == 1 and index._ready.ttl_at == first_failure + search._TTL_WITHOUT_ZOPT
+        clock[0] += search._TTL_WITHOUT_ZOPT / 2
+        assert len(ranked.search_annotations("alpha")) == 1
+        assert index.builds == 2
+
+    def test_a_build_never_goes_back_to_an_older_fingerprint(self, lib, ranked, clock):
+        """Replays what two threads can interleave: one holding an older
+        fingerprint reaches _build after the newer index (or the newer
+        build in progress) exists, and gets that one."""
+        book = lib.add_book("B")
+        rows = [lib.add_annotation(book, "alpha one")]
+        ranked.search_annotations("alpha")
+        index, db = index_of(ranked), ranked._PyAppleBooks__library
+        old_key, old_ttl = index._fingerprint(db)
+        old_at = clock[0]
+        rows.append(lib.add_annotation(book, "alpha two"))
+        clock[0] += 1
+        new_key, new_ttl = index._fingerprint(db)
+        assert new_key != old_key
+        newer = index._build(db, new_key, new_ttl, clock[0])
+        assert newer.key == new_key and index.builds == 2
+        assert index._build(db, old_key, old_ttl, old_at) is newer and index.builds == 2
+        # A build in progress from a newer fingerprint is continued, not
+        # restarted for the older one.
+        rows.append(lib.add_annotation(book, "alpha three"))
+        clock[0] += 1
+        newest_key, _ = index._fingerprint(db)
+        conn, fts = search._new_database()
+        with index._state:
+            retired = index._retire(index._ready)
+            index._ready = None
+            index._pending = search._Pending(conn, fts, newest_key, clock[0], None)
+        search._close_quietly(retired)
+        gen = index._build(db, new_key, new_ttl, clock[0] - 0.5)
+        assert gen.key == newest_key and index.builds == 3
+        assert sorted(ids(ranked.search_annotations("alpha"))) == rows
+
     def test_a_ttl_without_z_opt(self, lib, ranked, clock):
         lib.add_annotation(lib.add_book("B"), "alpha")
         lib.execute("annotations", "ALTER TABLE ZAEANNOTATION DROP COLUMN Z_OPT")
@@ -604,8 +669,17 @@ class TestDrift:
         assert index._ready.ttl_at is None
         lib.execute("annotations", "ALTER TABLE ZAEANNOTATION DROP COLUMN Z_OPT")
         clock[0] += search._RECHECK * 2
+        # The cached schema still names Z_OPT: that fingerprint fails, and
+        # the index is kept under a TTL.
         assert len(ranked.search_annotations("alpha")) == 1  # no error
-        assert index._ready.ttl_at is not None and index.builds == 2
+        assert index._ready.ttl_at == clock[0] + search._TTL_WITHOUT_ZOPT and index.builds == 1
+        # The next one reads the schema again: a new key, one rebuild.
+        clock[0] += search._RECHECK * 2
+        assert len(ranked.search_annotations("alpha")) == 1
+        assert index._ready.ttl_at == clock[0] + search._TTL_WITHOUT_ZOPT and index.builds == 2
+        clock[0] += search._RECHECK * 2
+        ranked.search_annotations("alpha")
+        assert index.builds == 2
 
     def test_a_missing_type_column_raises_as_the_substring_search_does(self, lib, ranked):
         lib.add_annotation(lib.add_book("B"), "alpha")
