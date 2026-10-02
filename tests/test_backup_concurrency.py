@@ -593,6 +593,28 @@ def test_restore_with_the_backup_folder_spelled_another_way(
     assert backup.exists()
 
 
+def test_restored_backup_spelled_another_way_is_not_pruned(db, tmp_path, monkeypatch):
+    """The backup being restored is protected from the restore's own
+    pruning however its path is spelled: here the oldest of a full
+    series, named in another letter case."""
+    monkeypatch.setattr(write_safety, "books_is_running", lambda: False)
+    folder = tmp_path / "Backups"
+    folder.mkdir()
+    other = _case_variant(folder)
+    if other is None:
+        pytest.skip("case-sensitive file system")
+    seeded = _seed(db, folder)
+    real = write_safety._take_backup(db, tmp_path / "src").read_bytes()
+    for path in seeded:
+        path.write_bytes(real)
+    oldest = seeded[0]
+    write_safety.restore_library(other / oldest.name, db, force=True, backup_dir=folder)
+    # Eleven with the snapshot: the one beyond BACKUP_KEEP is the
+    # backup just restored, so it stays.
+    assert oldest.exists()
+    assert len(write_safety._backups_for(db, folder)) == write_safety.BACKUP_KEEP + 1
+
+
 def test_restore_through_a_symlink_locks_the_real_backup_folder(db, tmp_path, monkeypatch):
     """``backup_path`` a symlink to a backup in another folder: the
     restore holds both the link's folder and the backup's own, so a

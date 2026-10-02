@@ -714,6 +714,17 @@ def _take_backup(db_path: Path, backup_dir: Path, *, suffix: str = "") -> Path:
     return dest
 
 
+def _file_identity(path) -> object:
+    """What tells the file ``path`` apart however it is spelled (through
+    a symlink, in another letter case, through a firmlink): its device
+    and inode, or its resolved path if it can't be looked at."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return Path(path).resolve()
+    return (st.st_dev, st.st_ino)
+
+
 def _prune_backups(
     db_path: Path, backup_dir: Path, keep: int, protect: Iterable[Path] = ()
 ) -> None:
@@ -733,9 +744,9 @@ def _prune_backups(
                 stray.unlink()
         except FileNotFoundError:
             pass
-    protected = {Path(p).resolve() for p in protect if p}
+    protected = {_file_identity(p) for p in protect if p}
     for old in _backups_for(db_path, backup_dir)[:-keep]:
-        if old.resolve() in protected:
+        if _file_identity(old) in protected:
             continue
         old.unlink(missing_ok=True)
         # Opening a WAL-mode backup leaves -wal/-shm sidecars behind.
