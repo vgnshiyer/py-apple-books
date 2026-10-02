@@ -308,6 +308,19 @@ class TestRanking:
         assert ids(ranked.search_annotations("alpha beta", limit=None)) != [only_one]
         assert len(ranked.search_annotations("alpha beta", limit=None)) == 1
 
+    def test_fallback_and_short_words(self, lib, ranked, filler):
+        """The fallback first needs every word, short ones included
+        (matched_all); then, unless require_all, only the words of 3 or
+        more characters (not matched_all)."""
+        partial = lib.add_annotation(filler, "prefixalpha nothing else")
+        both = lib.add_annotation(filler, "prefixalpha xzzx")
+        hits = ranked.search_annotations("alpha zz", limit=None)
+        assert [(h.annotation.id, h.matched_all, h.method) for h in hits] == [
+            (both, True, SUBSTRING), (partial, False, SUBSTRING)]
+        hits = ranked.search_annotations("alpha zz", limit=None, require_all=True)
+        assert [(h.annotation.id, h.matched_all) for h in hits] == [(both, True)]
+        assert ids(ranked.search_annotations("alpha zzz", limit=None, require_all=True)) == []
+
     def test_stopwords_are_left_out(self, lib, ranked, filler):
         row = lib.add_annotation(filler, "habits shape us")
         assert ids(ranked.search_annotations("what about the habits")) == [row]

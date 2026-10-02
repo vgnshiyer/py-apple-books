@@ -781,8 +781,11 @@ def _query(conn: sqlite3.Connection, fts: Optional[str], plan: _Plan, asset_id,
        substring plan);
     2. the whole query as a substring (``plan.needle``);
     3. unless ``require_all``, some of the items (OR);
-    4. only when nothing matched, every item of 3 or more characters as
-       a substring (an attached article or affix).
+    4. only when nothing matched, and only for a plan with an item of 3
+       or more characters: every item as a substring (an attached
+       article or affix); then, unless ``require_all``, every item of 3
+       or more characters (``matched_all`` False if a shorter one was
+       left out).
 
     Ties go to the higher annotation id; a row is listed once, in the
     first tier that finds it.
@@ -831,7 +834,9 @@ def _query(conn: sqlite3.Connection, fts: Optional[str], plan: _Plan, asset_id,
     if not hits and use_fts:
         long_items = tuple(item for item in plan.items if len(item) >= 3)
         if long_items:
-            substring(long_items, "AND", True)
+            substring(plan.items, "AND", True)
+            if not require_all and len(long_items) < len(plan.items):
+                substring(long_items, "AND", False)
     return hits
 
 

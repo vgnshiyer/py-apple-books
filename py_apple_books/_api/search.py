@@ -44,7 +44,9 @@ class _SearchAPI:
         3. unless ``require_all``, annotations containing some of the
            words;
         4. only if nothing matched so far, annotations containing every
-           word of 3 or more characters inside a longer word.
+           word inside a longer word; then, unless ``require_all``, those
+           containing every word of 3 or more characters (a query with
+           no such word skips this step).
 
         Equal scores list the newer annotation id first. Common English
         words (the, of, ...) are left out of a multi-word query; double
