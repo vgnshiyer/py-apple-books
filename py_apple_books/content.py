@@ -23,13 +23,22 @@ Every file read from an EPUB bundle is confined to that bundle: entries
 that resolve outside it (absolute or ``../`` hrefs, symlinks) or that
 aren't regular files (FIFOs, device nodes) are refused, since a crafted
 book could otherwise expose unrelated local files or block forever.
+
+Since 1.11 no read can download an evicted iCloud file either: every
+folder is checked not to be an iCloud placeholder before a name inside
+it is looked up, every entry before it is read, and every read runs
+with downloads of evicted files turned off for the reading thread (see
+:mod:`py_apple_books._icloud`), so a missed placeholder fails with
+:class:`BookNotDownloadedError` instead of being downloaded.
 """
 
 import errno
+import os
 import pathlib
 import posixpath
 import stat
 import subprocess
+import threading
 import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
@@ -39,9 +48,13 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from ebooklib import epub
 
+from py_apple_books import _icloud
+from py_apple_books._messages import detail, quote_name, quote_title
 from py_apple_books.exceptions import (
     AppleBooksError,
+    BookNotDownloadedError,
     ChapterNotFoundError,
+    NotEpubError,
     UnsafeEpubEntryError,
 )
 from py_apple_books.utils import extract_chapter_text
@@ -80,6 +93,10 @@ def is_downloaded(path: PathLike) -> bool:
       ``lstat``. This has been verified empirically to **not** trigger
       iCloud hydration on macOS.
 
+    Since 1.11 a path that is itself an iCloud placeholder (``SF_DATALESS``,
+    checked with ``lstat`` before ``du`` runs) or has an iCloud stub
+    (``.<name>.icloud``) next to it is reported as not downloaded first.
+
     Fails open: any filesystem error or unexpected state returns True,
     letting the actual read operation surface a clearer error.
 
@@ -88,6 +105,8 @@ def is_downloaded(path: PathLike) -> bool:
         or does not exist.
     """
     path = pathlib.Path(path)
+    if not _root_is_local(path):
+        return False
     if not path.exists():
         return False
 
@@ -127,6 +146,70 @@ def is_downloaded(path: PathLike) -> bool:
     return True
 
 
+def _root_is_local(path: pathlib.Path) -> bool:
+    """False if ``path`` (or, for a symlink, its target) is an iCloud
+    placeholder or has an iCloud stub next to it. Any other error is
+    left to the caller's own checks."""
+    with _icloud.no_materialize():
+        try:
+            if _icloud.icloud_stub(path):
+                return False
+            st = _icloud.lstat(path)
+            if _icloud.is_dataless(st):
+                return False
+            if stat.S_ISLNK(st.st_mode) and _icloud.is_dataless(_icloud.stat(path)):
+                return False
+        except (OSError, ValueError) as e:
+            if _icloud.is_materialize_error(e):
+                return False
+    return True
+
+
+def _not_downloaded() -> BookNotDownloadedError:
+    """The error for a read that reached an iCloud placeholder."""
+    return BookNotDownloadedError(_icloud.PARTIAL_DOWNLOAD_MESSAGE)
+
+
+def _too_large_message(name: str, limit: int) -> str:
+    if limit % (1024 * 1024) == 0:
+        size = f"{limit // (1024 * 1024)} MiB"
+    else:
+        size = f"{limit} bytes"
+    return f"EPUB entry {quote_name(name)} is larger than {size}."
+
+
+def _check_dirs_local(root: pathlib.Path, rel_dir: str, checked: Optional[Set[str]] = None) -> None:
+    """Raise :class:`BookNotDownloadedError` if a folder on the way to
+    ``rel_dir`` (bundle-relative, lexical: ``"OEBPS/Text"`` checks
+    ``OEBPS``, then ``OEBPS/Text``) is an iCloud placeholder, each
+    checked before anything inside it is looked up.
+
+    Names that leave the bundle lexically aren't checked (containment
+    refuses them), and the walk stops at the first folder that can't be
+    stat'ed, so the read itself reports it. Folders in ``checked`` are
+    skipped; the ones found local are added to it.
+    """
+    if not rel_dir or rel_dir in (".", "..") or rel_dir.startswith(("/", "../")):
+        return
+    current = ""
+    for part in rel_dir.split("/"):
+        current = f"{current}/{part}" if current else part
+        if checked is not None and current in checked:
+            continue
+        try:
+            st = _icloud.lstat(root / current)
+            if stat.S_ISLNK(st.st_mode):
+                st = _icloud.stat(root / current)
+        except (OSError, ValueError) as e:
+            if _icloud.is_materialize_error(e):
+                raise _not_downloaded() from None
+            return
+        if _icloud.is_dataless(st):
+            raise _not_downloaded()
+        if checked is not None:
+            checked.add(current)
+
+
 # ---------------------------------------------------------------------------
 # Bundle containment (every read from an EPUB bundle goes through here)
 # ---------------------------------------------------------------------------
@@ -162,7 +245,8 @@ def _resolve_strictly(path: pathlib.Path, rel: str) -> pathlib.Path:
         # "%00").
         pass
     raise UnsafeEpubEntryError(
-        f"EPUB entry {rel!r} can't be resolved inside the book bundle."
+        f"EPUB entry {quote_name(rel)} can't be resolved inside the book bundle.",
+        entry=rel,
     )
 
 
@@ -173,16 +257,29 @@ def _safe_bundle_path(root: pathlib.Path, rel: str) -> pathlib.Path:
     points outside the bundle is caught just like an absolute or
     ``../`` name. The entry must be a regular file: FIFOs and device
     nodes (``/dev/stdin``, ``/dev/zero``) would block or never end, and
-    are rejected from ``stat`` alone, without opening them.
+    are rejected from ``stat`` alone, without opening them. The bundle
+    and each folder on the way are checked not to be iCloud placeholders
+    before a name inside them is looked up, and so is the entry.
 
     :param root: The EPUB bundle directory.
     :param rel: Entry name relative to ``root`` (``/``-separated).
     :raises UnsafeEpubEntryError: if the entry escapes the bundle, isn't
         a regular file, or exceeds :data:`_MAX_ENTRY_BYTES`.
+    :raises BookNotDownloadedError: if the bundle, a folder or the entry
+        is an iCloud placeholder.
     :raises OSError: if the entry can't be stat'ed (e.g.
         :class:`FileNotFoundError` when it doesn't exist).
     """
     root = _resolve_strictly(root, rel)
+    try:
+        root_st = _icloud.stat(root)
+    except OSError as e:
+        if _icloud.is_materialize_error(e):
+            raise _not_downloaded() from None
+        raise
+    if _icloud.is_dataless(root_st):
+        raise _not_downloaded()
+    _check_dirs_local(root, posixpath.dirname(posixpath.normpath(rel)))
     candidate = root / posixpath.normpath(rel)
     try:
         path = _resolve_strictly(candidate, rel)
@@ -196,24 +293,89 @@ def _safe_bundle_path(root: pathlib.Path, rel: str) -> pathlib.Path:
             escapes = False
         if escapes:
             raise UnsafeEpubEntryError(
-                f"EPUB entry {rel!r} points outside the book bundle."
+                f"EPUB entry {quote_name(rel)} points outside the book bundle.",
+                entry=rel,
             ) from None
         raise
     if not path.is_relative_to(root):
         raise UnsafeEpubEntryError(
-            f"EPUB entry {rel!r} points outside the book bundle."
+            f"EPUB entry {quote_name(rel)} points outside the book bundle.",
+            entry=rel,
         )
-    st = path.stat()
+    st = _icloud.stat(path)
     if not stat.S_ISREG(st.st_mode):
         raise UnsafeEpubEntryError(
-            f"EPUB entry {rel!r} is not a regular file."
+            f"EPUB entry {quote_name(rel)} is not a regular file.",
+            entry=rel,
         )
     if st.st_size > _MAX_ENTRY_BYTES:
-        raise UnsafeEpubEntryError(
-            f"EPUB entry {rel!r} is larger than "
-            f"{_MAX_ENTRY_BYTES // (1024 * 1024)} MiB."
-        )
+        raise UnsafeEpubEntryError(_too_large_message(rel, _MAX_ENTRY_BYTES), entry=rel)
+    # After the 1.10 checks, so an oversized sparse file is still
+    # refused as oversized.
+    if _icloud.is_dataless(st):
+        raise _not_downloaded()
     return path
+
+
+def _read_entry_bytes(root: PathLike, href: str, max_bytes: int) -> bytes:
+    """The bytes of one bundle entry, for new content APIs (1.11): the
+    one guarded primitive they read book files through.
+
+    :func:`_safe_bundle_path` (containment, a regular file, the
+    :data:`_MAX_ENTRY_BYTES` cap, no iCloud placeholder on the way), then
+    the file is opened (no symlink follow, non-blocking) and read with
+    downloads of evicted files turned off for this thread. Its size is
+    checked again on the open file, and at most ``max_bytes + 1`` bytes
+    are read, so an entry that grows past ``max_bytes`` is refused.
+
+    :param href: Entry name relative to ``root`` (``/``-separated,
+        unquoted).
+    :raises UnsafeEpubEntryError: see :func:`_safe_bundle_path`; also an
+        entry larger than ``max_bytes``.
+    :raises BookNotDownloadedError: the entry (or a folder on the way)
+        is an iCloud placeholder.
+    :raises OSError: it can't be read (e.g. :class:`FileNotFoundError`).
+        Its text may name a path: wrap it with
+        :func:`py_apple_books._messages.detail` before showing it.
+    """
+    root = pathlib.Path(root)
+    with _icloud.no_materialize():
+        try:
+            path = _safe_bundle_path(root, href)
+            fd = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise UnsafeEpubEntryError(
+                        f"EPUB entry {quote_name(href)} is not a regular file.",
+                        entry=href,
+                    )
+                if st.st_size > max_bytes:
+                    raise UnsafeEpubEntryError(_too_large_message(href, max_bytes), entry=href)
+                if _icloud.is_dataless(st):
+                    raise _not_downloaded()
+                chunks: List[bytes] = []
+                total = 0
+                while True:
+                    chunk = os.read(fd, min(1 << 20, max_bytes + 1 - total))
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise UnsafeEpubEntryError(_too_large_message(href, max_bytes), entry=href)
+                    chunks.append(chunk)
+            finally:
+                os.close(fd)
+        except OSError as e:
+            err = _icloud.not_downloaded_error(e)
+            if err is not None:
+                raise err from None
+            raise
+    return b"".join(chunks)
 
 
 def _escapes_bundle(href: str) -> bool:
@@ -241,6 +403,11 @@ class _ContainedEpubReader(epub.EpubReader):
         # Bundle-relative directory -> (resolved path, st_dev, st_ino),
         # already checked to lie inside the bundle.
         self._resolved_dirs: Dict[str, Tuple[pathlib.Path, int, int]] = {}
+        # Bundle-relative directories checked not to be iCloud placeholders.
+        self._local_dirs: Set[str] = set()
+        # META-INF/container.xml as read during load (BookContent derives
+        # the OPF directory from it, without reading it again).
+        self.container_bytes: Optional[bytes] = None
 
     def _entry_path(self, name: str) -> pathlib.Path:
         """:func:`_safe_bundle_path`, amortised over one book load.
@@ -253,56 +420,85 @@ class _ContainedEpubReader(epub.EpubReader):
         and an ``lstat`` of itself. Anything else — symlinked entries,
         odd names, directories outside the bundle or changed since —
         takes the full check, so outcomes match it exactly.
+
+        Before any of that, the bundle and each folder on the way are
+        checked (once per load) not to be iCloud placeholders, and the
+        entry's ``lstat`` is too: a placeholder raises
+        :class:`BookNotDownloadedError` before anything inside it is
+        looked up or read.
         """
         if self._root is None:
-            self._root = _resolve_strictly(pathlib.Path(self.file_name), name)
+            root = _resolve_strictly(pathlib.Path(self.file_name), name)
+            try:
+                root_st = _icloud.stat(root)
+            except OSError as e:
+                if _icloud.is_materialize_error(e):
+                    raise _not_downloaded() from None
+                raise
+            if _icloud.is_dataless(root_st):
+                raise _not_downloaded()
+            self._root = root
         rel = posixpath.normpath(name)
         parent, base = posixpath.split(rel)
         if base in ("", ".", ".."):
             return _safe_bundle_path(self._root, name)
+        _check_dirs_local(self._root, parent, self._local_dirs)
         try:
             cached = self._resolved_dirs.get(parent)
             if cached is None:
                 directory = (self._root / parent).resolve(strict=True)
                 if not directory.is_relative_to(self._root):
                     return _safe_bundle_path(self._root, name)
-                dir_st = directory.stat()
+                dir_st = _icloud.stat(directory)
                 cached = (directory, dir_st.st_dev, dir_st.st_ino)
                 self._resolved_dirs[parent] = cached
             else:
-                dir_st = cached[0].stat()
+                dir_st = _icloud.stat(cached[0])
                 if (dir_st.st_dev, dir_st.st_ino) != cached[1:]:
                     del self._resolved_dirs[parent]
                     return _safe_bundle_path(self._root, name)
+            if _icloud.is_dataless(dir_st):
+                raise _not_downloaded()
             path = cached[0] / base
-            st = path.lstat()
-        except (OSError, RuntimeError, ValueError):
+            st = _icloud.lstat(path)
+        except BookNotDownloadedError:
+            raise
+        except (OSError, RuntimeError, ValueError) as e:
+            if _icloud.is_materialize_error(e):
+                raise _not_downloaded() from None
             return _safe_bundle_path(self._root, name)
         if stat.S_ISLNK(st.st_mode):
             return _safe_bundle_path(self._root, name)
         if not stat.S_ISREG(st.st_mode):
             raise UnsafeEpubEntryError(
-                f"EPUB entry {name!r} is not a regular file."
+                f"EPUB entry {quote_name(name)} is not a regular file.",
+                entry=name,
             )
         if st.st_size > _MAX_ENTRY_BYTES:
-            raise UnsafeEpubEntryError(
-                f"EPUB entry {name!r} is larger than "
-                f"{_MAX_ENTRY_BYTES // (1024 * 1024)} MiB."
-            )
+            raise UnsafeEpubEntryError(_too_large_message(name, _MAX_ENTRY_BYTES), entry=name)
+        if _icloud.is_dataless(st):
+            raise _not_downloaded()
         return path
 
     def read_file(self, name):
         if isinstance(self.zf, zipfile.ZipFile):
             return super().read_file(name)
-        try:
-            path = self._entry_path(name)
-            return path.read_bytes()
-        except OSError as e:
-            # Name the entry, not the absolute path — messages reach
-            # MCP clients verbatim.
-            raise AppleBooksError(
-                f"Could not read EPUB entry {name!r}: {e.strerror}"
-            ) from e
+        with _icloud.no_materialize():
+            try:
+                path = self._entry_path(name)
+                data = path.read_bytes()
+            except OSError as e:
+                err = _icloud.not_downloaded_error(e)
+                if err is not None:
+                    raise err from None
+                # Name the entry, not the absolute path — messages reach
+                # MCP clients verbatim.
+                raise AppleBooksError(
+                    f"Could not read EPUB entry {quote_name(name)}: {e.strerror}"
+                ) from e
+        if self.container_bytes is None and posixpath.normpath(name) == "META-INF/container.xml":
+            self.container_bytes = data
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -337,16 +533,19 @@ def _encryption_xml_hides_content(bundle: pathlib.Path) -> bool:
     ``EncryptedData`` without an algorithm, or a file that's still an
     iCloud placeholder (reading it would trigger a download) all count
     as encrypted. Elements are matched by local name, so a file that
-    leaves out the xmlenc namespace is still inspected.
+    leaves out the xmlenc namespace is still inspected. Read with
+    downloads of evicted files turned off.
     """
     try:
-        enc = _safe_bundle_path(bundle, "META-INF/encryption.xml")
-        st = enc.stat()
-        if st.st_blocks == 0 and st.st_size > 0:
-            return True
-        if st.st_size > _MAX_ENCRYPTION_XML_BYTES:
-            return True
-        root = ET.fromstring(enc.read_bytes())
+        with _icloud.no_materialize():
+            enc = _safe_bundle_path(bundle, "META-INF/encryption.xml")
+            st = _icloud.stat(enc)
+            if _icloud.is_dataless(st) or (st.st_blocks == 0 and st.st_size > 0):
+                return True
+            if st.st_size > _MAX_ENCRYPTION_XML_BYTES:
+                return True
+            data = enc.read_bytes()
+        root = ET.fromstring(data)
     except Exception:
         # Not just OSError and ParseError: expat raises ValueError or
         # LookupError for some declared encodings (Shift_JIS, unknown
@@ -415,16 +614,49 @@ class BookContent:
     the pre-filesystem gate checks. Direct construction from a path is
     also supported for testing.
 
+    An instance may be shared between threads: the book is read once.
+    It can be pickled and copied (the parsed book goes with it).
+
     :param path: Absolute path to the book file or bundle directory.
+    :param book_id: The library id of the book (1.11;
+        :meth:`PyAppleBooks.get_book_content` sets it), or None.
     """
 
-    def __init__(self, path: PathLike) -> None:
+    def __init__(self, path: PathLike, *, book_id: Optional[int] = None) -> None:
         self.path = pathlib.Path(path)
         self._book: Optional[epub.EpubBook] = None
         self._opf_dir_cache: Optional[pathlib.PurePosixPath] = None
+        self._book_id = book_id
+        self._init_runtime_state()
+
+    def _init_runtime_state(self) -> None:
+        """Per-instance state that is never pickled or copied (locks,
+        memos); set up again by :meth:`__setstate__`."""
+        self._lock = threading.Lock()
+
+    # Kept by pickle and copy; everything else is runtime state.
+    _PICKLED = ("path", "_book", "_book_id", "_opf_dir_cache")
+
+    def __getstate__(self) -> dict:
+        return {name: getattr(self, name, None) for name in self._PICKLED}
+
+    def __setstate__(self, state: dict) -> None:
+        # Also accepts the state of a 1.10 instance (its __dict__:
+        # path, _book, _opf_dir_cache).
+        self.path = pathlib.Path(state["path"])
+        self._book = state.get("_book")
+        self._opf_dir_cache = state.get("_opf_dir_cache")
+        self._book_id = state.get("_book_id")
+        self._init_runtime_state()
 
     def __repr__(self) -> str:
         return f"BookContent(path={str(self.path)!r})"
+
+    @property
+    def book_id(self) -> Optional[int]:
+        """The library id of the book, when the instance came from
+        :meth:`PyAppleBooks.get_book_content`; else None."""
+        return self._book_id
 
     # -- format / state properties ------------------------------------------
 
@@ -468,14 +700,38 @@ class BookContent:
     def _drm_evidence(self) -> Optional[str]:
         """Name of the ``META-INF`` file that marks this bundle as
         DRM-protected (``"sinf.xml"``, ``"rights.xml"`` or
-        ``"encryption.xml"``), or None. See :attr:`is_drm_protected`."""
+        ``"encryption.xml"``), or None. See :attr:`is_drm_protected`.
+
+        Never looks inside an iCloud placeholder folder: if the bundle or
+        its ``META-INF`` folder is one, the answer is unknown and the
+        gate fails closed (``"encryption.xml"``, as for an
+        ``encryption.xml`` that is itself a placeholder).
+        :meth:`PyAppleBooks.get_book_content` refuses such a book as not
+        downloaded before it gets here."""
         meta_inf = self.path / "META-INF"
-        for name in ("sinf.xml", "rights.xml"):
-            if (meta_inf / name).exists():
-                return name
-        encryption = meta_inf / "encryption.xml"
-        if encryption.exists() and _encryption_xml_hides_content(self.path):
-            return "encryption.xml"
+        with _icloud.no_materialize():
+            try:
+                for folder in (self.path, meta_inf):
+                    st = _icloud.lstat(folder)
+                    if stat.S_ISLNK(st.st_mode):
+                        st = _icloud.stat(folder)
+                    if _icloud.is_dataless(st):
+                        return "encryption.xml"
+            except (OSError, ValueError) as e:
+                if _icloud.is_materialize_error(e):
+                    return "encryption.xml"
+            try:
+                for name in ("sinf.xml", "rights.xml"):
+                    if (meta_inf / name).exists():
+                        return name
+                encryption = meta_inf / "encryption.xml"
+                if encryption.exists() and _encryption_xml_hides_content(self.path):
+                    return "encryption.xml"
+            except OSError as e:
+                # Path.exists() lets some errors through before 3.12.
+                if _icloud.is_materialize_error(e):
+                    return "encryption.xml"
+                raise
         return None
 
     # -- chapter listing ----------------------------------------------------
@@ -591,15 +847,19 @@ class BookContent:
             # No method names: the text reaches MCP clients, whose tools
             # are named differently.
             raise ChapterNotFoundError(
-                f"No chapter or spine entry with id {item_id!r} in this "
+                f"No chapter or spine entry with id {quote_name(item_id)} in this "
                 f"book. Pass an id from the book's table of contents, or "
                 f"a chapter's 1-based order (e.g. \"5\")."
             )
         try:
-            html_bytes = item.get_content()
+            with _icloud.no_materialize():
+                html_bytes = item.get_content()
         except Exception as e:
+            err = _icloud.not_downloaded_error(e)
+            if err is not None:
+                raise err from None
             raise AppleBooksError(
-                f"Could not read spine entry {item_id!r}: {e}"
+                f"Could not read spine entry {quote_name(item_id)}: {detail(e)}"
             ) from e
         return extract_chapter_text(
             html_bytes,
@@ -608,38 +868,60 @@ class BookContent:
         )
 
     def _require_epub(self) -> None:
-        """Raise unless the path is an EPUB bundle. The message names
-        the format or file name, never the absolute path — it reaches
-        MCP clients verbatim."""
+        """Raise :class:`NotEpubError` (an :class:`AppleBooksError`)
+        unless the path is an EPUB bundle. The message names the format
+        or file name, never the absolute path — it reaches MCP clients
+        verbatim."""
         if self.is_epub:
             return
         if self.is_pdf:
-            raise AppleBooksError(
+            raise NotEpubError(
                 "This book is a PDF; chapter listing/reading is only "
                 "supported for EPUB books."
             )
-        raise AppleBooksError(
-            f"'{self.path.name}' is not an EPUB bundle directory; chapter "
+        raise NotEpubError(
+            f"{quote_title(self.path.name)} is not an EPUB bundle directory; chapter "
             f"listing/reading is only supported for EPUB books."
         )
 
     def _load_book(self) -> epub.EpubBook:
         """Lazily read and cache the EPUB via ebooklib, confined to the
-        bundle (see :class:`_ContainedEpubReader`)."""
-        if self._book is None:
-            # Same steps as epub.read_epub(), with the contained reader.
-            reader = _ContainedEpubReader(str(self.path))
-            try:
+        bundle (see :class:`_ContainedEpubReader`), with downloads of
+        evicted files turned off. Threads sharing the instance read it
+        once; the lock is held only while reading."""
+        book = self._book
+        if book is not None:
+            return book
+        with self._lock:
+            if self._book is None:
+                book, container = self._read_book()
+                if self._opf_dir_cache is None:
+                    self._opf_dir_cache = (
+                        _opf_dir_from_container_bytes(container)
+                        if container is not None
+                        else _opf_dir_from_container(self.path)
+                    )
+                self._book = book
+            return self._book
+
+    def _read_book(self) -> Tuple[epub.EpubBook, Optional[bytes]]:
+        """The parsed book, and its ``META-INF/container.xml`` bytes."""
+        # Same steps as epub.read_epub(), with the contained reader.
+        reader = _ContainedEpubReader(str(self.path))
+        try:
+            with _icloud.no_materialize():
                 book = reader.load()
                 reader.process()
-            except AppleBooksError:
-                raise
-            except Exception as e:
-                raise AppleBooksError(
-                    f"Could not read EPUB '{self.path.name}': {e}"
-                ) from e
-            self._book = book
-        return self._book
+        except AppleBooksError:
+            raise
+        except Exception as e:
+            err = _icloud.not_downloaded_error(e)
+            if err is not None:
+                raise err from None
+            raise AppleBooksError(
+                f"Could not read EPUB {quote_title(self.path.name)}: {detail(e)}"
+            ) from e
+        return book, reader.container_bytes
 
     def _opf_dir(self) -> pathlib.PurePosixPath:
         """Cached OPF directory relative to the EPUB bundle root.
@@ -648,6 +930,10 @@ class BookContent:
         want :attr:`Chapter.href` to be bundle-relative so callers can
         resolve it with ``content.path / chapter.href``. This helper
         gives us the prefix to prepend.
+
+        Set from the ``container.xml`` bytes read with the book; read
+        from the bundle only for an instance unpickled from 1.10 state
+        without it.
         """
         if self._opf_dir_cache is None:
             self._opf_dir_cache = _opf_dir_from_container(self.path)
@@ -865,15 +1151,19 @@ class BookContent:
                 pass  # fall through to disk read
 
         try:
-            return _safe_bundle_path(self.path, href).read_bytes()
+            with _icloud.no_materialize():
+                return _safe_bundle_path(self.path, href).read_bytes()
         except (FileNotFoundError, NotADirectoryError):
             raise AppleBooksError(
-                f"Chapter file {href!r} is declared in the EPUB "
+                f"Chapter file {quote_name(href)} is declared in the EPUB "
                 f"manifest but missing on disk."
             ) from None
         except OSError as e:
+            err = _icloud.not_downloaded_error(e)
+            if err is not None:
+                raise err from None
             raise AppleBooksError(
-                f"Could not read chapter file {href!r}: {e.strerror}"
+                f"Could not read chapter file {quote_name(href)}: {e.strerror}"
             ) from e
 
 
@@ -900,11 +1190,33 @@ def _opf_dir_from_container(epub_root: pathlib.Path) -> pathlib.PurePosixPath:
     PurePosixPath (``PurePosixPath('.')``) when the OPF sits at the
     bundle root, and falls back to empty on any parse error, on an
     unsafe ``container.xml``, or when the OPF path leaves the bundle.
+    Since 1.11 a ``container.xml`` that is an iCloud placeholder raises
+    :class:`BookNotDownloadedError` instead (it is never downloaded).
+    The parsing is :func:`_opf_dir_from_container_bytes`.
     """
     try:
-        container = _safe_bundle_path(epub_root, "META-INF/container.xml")
-        root = ET.fromstring(container.read_bytes())
-    except (AppleBooksError, OSError, ET.ParseError, ValueError, LookupError):
+        with _icloud.no_materialize():
+            container = _safe_bundle_path(epub_root, "META-INF/container.xml")
+            data = container.read_bytes()
+    except BookNotDownloadedError:
+        raise
+    except OSError as e:
+        err = _icloud.not_downloaded_error(e)
+        if err is not None:
+            raise err from None
+        return pathlib.PurePosixPath()
+    except (AppleBooksError, ValueError):
+        return pathlib.PurePosixPath()
+    return _opf_dir_from_container_bytes(data)
+
+
+def _opf_dir_from_container_bytes(data: bytes) -> pathlib.PurePosixPath:
+    """The OPF directory named by ``container.xml`` bytes (see
+    :func:`_opf_dir_from_container`); empty on any parse error or when
+    the OPF path leaves the bundle."""
+    try:
+        root = ET.fromstring(data)
+    except (ET.ParseError, ValueError, LookupError):
         # ValueError/LookupError: expat rejects some declared encodings.
         return pathlib.PurePosixPath()
     rootfile = root.find(f".//{{{_NS_CONTAINER}}}rootfile")
@@ -1004,5 +1316,16 @@ def _parse_ncx_bytes(
     return chapters
 
 
+# ---------------------------------------------------------------------------
+# Caches
+# ---------------------------------------------------------------------------
 
 
+def clear_content_cache() -> None:
+    """Drop everything cached from book files, process-wide: chapter
+    indexes and any other data a module derived from a book's files
+    (1.11). Call it after changing a book's files in place; the next
+    read reads them again. Thread-safe. :class:`BookContent` instances
+    keep the book they already read.
+    """
+    _icloud.clear_file_caches()
