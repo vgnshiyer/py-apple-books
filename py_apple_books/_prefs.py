@@ -25,10 +25,15 @@ year-0 date in it. This module reads it defensively and keeps four keys:
 
 The cloud-folder check is by name, for the derived path as for a
 custom ``prefs_path``: first on the path as given, with no file system
-call, then (under :func:`_icloud.no_materialize`) on its folder with
-symlinks resolved, so a symlinked folder that leads into iCloud Drive
-is refused before the file is looked at. A symlink as the file itself
-is refused by ``lstat`` and ``O_NOFOLLOW``.
+call, then (under :func:`_icloud.no_materialize`) on each component as
+the folder is resolved one symlink at a time, before it is looked up,
+so a symlinked folder that leads into iCloud Drive, or through it and
+back out, is refused without anything in the cloud folder being looked
+up. The file is then looked up and opened by its resolved path. A
+symlink as the file itself is refused by ``lstat`` and ``O_NOFOLLOW``.
+A folder swapped for a symlink between the check and the open is not
+caught; the open still runs under :func:`_icloud.no_materialize` and
+the dataless checks.
 
 Nothing here does I/O at import; ``plistlib`` is imported on first use.
 """
@@ -76,6 +81,8 @@ _OFFSET_CODES = {1: "B", 2: "H", 4: "L", 8: "Q"}
 _O_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
             | getattr(os, "O_CLOEXEC", 0))
 _CHUNK = 64 * 1024
+# The most symlinks followed resolving the folder (macOS MAXSYMLINKS).
+_MAX_LINKS = 32
 
 # Binary plist dates are seconds since 2001-01-01 UTC; plistlib turns
 # them into datetimes, which fails outside these bounds.
@@ -139,34 +146,92 @@ def default_prefs_path() -> Optional[Path]:
 
 def _in_cloud_folder(path: str) -> bool:
     """Whether a cloud folder is among the components of ``path`` as
-    written (the open walks those, ``..`` included) or as an absolute
+    written (the lookup walks those, ``..`` included) or as an absolute
     path with ``..`` collapsed (a relative path's folders). Names only,
-    no I/O."""
-    parts = Path(path).parts + Path(os.path.abspath(path)).parts
+    no I/O besides ``getcwd`` for a relative path."""
+    parts = Path(path).parts
+    try:
+        parts += Path(os.path.abspath(path)).parts
+    except OSError:   # the working folder is gone: the walk reports it
+        pass
     return any(part.casefold() in _CLOUD_FOLDERS for part in parts)
 
 
 # -- reading ------------------------------------------------------------------
 
 
-def _real_folder(path: str) -> str:
-    """The folder of ``path`` with symlinks resolved. Non-strict: a
-    folder that can't be looked at stays as written (a dataless one
-    fails with EDEADLK under :func:`_icloud.no_materialize`)."""
-    return os.path.realpath(os.path.dirname(os.path.abspath(path)))
+def _resolve_folder(path: str) -> Tuple[Optional[str], Optional[str], str]:
+    """``(folder, name, reason)``: the folder holding the file ``path``
+    names, with every symlink resolved, and the file's name in it; or
+    None, None and why.
+
+    The folder is resolved one component at a time, the way the kernel
+    walks a path: a symlink's target replaces it (an absolute one from
+    the root), and ``..`` goes up from where the symlink led, not from
+    the symlink. Each name, the targets' included, is checked against
+    the cloud folders before it is looked up, and each folder is checked
+    not to be dataless before anything in it is, so no symlink leads a
+    lookup into a cloud folder or a placeholder folder, not even on the
+    way back out of one. Run under :func:`_icloud.no_materialize`;
+    raises ``OSError``/``ValueError`` for the caller to map.
+    """
+    if not path:
+        return None, None, MISSING
+    full = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+    head, name = os.path.split(full)
+    if name in ("", ".", ".."):   # names a folder, whatever it resolves to
+        head, name = full, None
+    pending = head.split(os.sep)[::-1]   # a stack: the next component last
+    resolved, links = [], 0
+    while pending:
+        part = pending.pop()
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if resolved:
+                resolved.pop()
+            continue
+        if part.casefold() in _CLOUD_FOLDERS:
+            return None, None, ICLOUD_PATH
+        current = os.sep + os.sep.join(resolved + [part])
+        st = _icloud.lstat(current)
+        if stat.S_ISLNK(st.st_mode):
+            links += 1
+            if links > _MAX_LINKS:
+                return None, None, UNREADABLE
+            target = os.readlink(current)
+            if os.path.isabs(target):
+                resolved = []
+            pending.extend(target.split(os.sep)[::-1])
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            return None, None, MISSING
+        if _icloud.is_dataless(st):
+            return None, None, DATALESS
+        resolved.append(part)
+    if name is None:
+        return None, None, NOT_REGULAR
+    if name.casefold() in _CLOUD_FOLDERS:
+        return None, None, ICLOUD_PATH
+    return os.sep + os.sep.join(resolved), name, OK
 
 
 def _read_bytes(path: str) -> Tuple[Optional[bytes], str, Optional[float]]:
     """``(data, reason, mtime)``: the file's bytes, or None and why."""
     with _icloud.no_materialize():
         # A symlinked folder on the way may lead into a cloud folder the
-        # names as written don't show; the file itself is a symlink only
-        # if lstat says so (not_regular below).
+        # names as written don't show: the file is looked up, and opened,
+        # by its resolved path. The file itself is a symlink only if
+        # lstat says so (not_regular below).
         try:
-            if _in_cloud_folder(_real_folder(path)):
-                return None, ICLOUD_PATH, None
-        except (OSError, ValueError):
-            return None, UNREADABLE, None
+            folder, name, reason = _resolve_folder(path)
+        except (FileNotFoundError, NotADirectoryError):
+            return None, MISSING, None
+        except (OSError, ValueError) as e:
+            return None, (DATALESS if _icloud.is_materialize_error(e) else UNREADABLE), None
+        if reason != OK:
+            return None, reason, None
+        path = os.path.join(folder, name)
         try:
             st = _icloud.lstat(path)
         except (FileNotFoundError, NotADirectoryError):

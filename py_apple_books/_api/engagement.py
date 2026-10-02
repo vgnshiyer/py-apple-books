@@ -434,9 +434,9 @@ class _EngagementAPI:
 
         Returns None when there is no such file or it can't be read
         safely: the library isn't in an Apple Books container, the file
-        is missing or not downloaded, its path leads into an iCloud
-        Drive or other cloud folder (by name or through a symlinked
-        folder), it isn't a regular file, it is over 8 MiB,
+        is missing or not downloaded, its path leads into or through an
+        iCloud Drive or other cloud folder (by name or through a
+        symlinked folder), it isn't a regular file, it is over 8 MiB,
         or it isn't a readable property list. A single key missing or
         in an unexpected form leaves just that field None.
 

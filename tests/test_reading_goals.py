@@ -138,18 +138,24 @@ class TestReasons:
 
     def test_a_symlinked_folder_into_a_cloud_folder(self, lib, monkeypatch, tmp_path):
         """A folder on the way that is a symlink into a cloud folder is
-        refused before the file is looked at; a symlinked folder that
-        stays local still reads."""
+        refused before anything in the cloud folder is looked up, also
+        when ``..`` or another symlink leads back out of it; a symlinked
+        folder that stays local still reads."""
         cloud = tmp_path / "Mobile Documents" / "com~apple~CloudDocs" / "Folder"
-        cloud.mkdir(parents=True)
+        (cloud / "sub").mkdir(parents=True)
+        (cloud / "x").mkdir()
         shutil.copy(lib.write_prefs(), cloud / "p.plist")
+        shutil.copy(lib.prefs_path, cloud / "x" / "p.plist")
         (tmp_path / "link").symlink_to(cloud)
+        (tmp_path / "sublink").symlink_to(cloud / "sub")
         local = tmp_path / "local"
         local.mkdir()
         shutil.copy(lib.prefs_path, local / "p.plist")
+        (cloud / "back").symlink_to(local)
         (tmp_path / "locallink").symlink_to(local)
+        (tmp_path / "rel").symlink_to("local")
         seen = []
-        for name in ("lstat", "open"):
+        for name in ("lstat", "open", "readlink", "stat"):
             real = getattr(os, name)
 
             def spy(path, *args, _real=real, _name=name, **kwargs):
@@ -157,11 +163,42 @@ class TestReasons:
                 return _real(path, *args, **kwargs)
 
             monkeypatch.setattr(os, name, spy)
-        assert _prefs._read_goals(tmp_path / "link" / "p.plist") == (None, "icloud_path")
-        assert not [call for call in seen if call[1].endswith("p.plist")], "the file was looked at"
+
+        def looked_up_in_the_cloud_folder():
+            return [call for call in seen if "Mobile Documents" in call[1]]
+
+        for path in (tmp_path / "link" / "p.plist",
+                     # The kernel goes up from the symlink's target, not
+                     # from the link: this is Folder/x/p.plist.
+                     f"{tmp_path}/sublink/../x/p.plist",
+                     # Into the cloud folder and out again by a symlink.
+                     tmp_path / "link" / "back" / "p.plist",
+                     f"{tmp_path}/link/back/../local/p.plist"):
+            seen.clear()
+            assert _prefs._read_goals(path) == (None, "icloud_path"), path
+            assert not looked_up_in_the_cloud_folder(), path
         monkeypatch.chdir(tmp_path / "link")
         assert _prefs._read_goals("p.plist") == (None, "icloud_path")
-        assert _prefs._read_goals(tmp_path / "locallink" / "p.plist")[1] == "ok"
+        monkeypatch.chdir(tmp_path)
+        seen.clear()
+        for path in (tmp_path / "locallink" / "p.plist", "local/p.plist",
+                     "locallink/../local/p.plist", f"{tmp_path}/rel/p.plist", "rel/./p.plist"):
+            assert _prefs._read_goals(path)[1] == "ok", path
+        assert not looked_up_in_the_cloud_folder()
+        assert ("open", str(local.resolve() / "p.plist")) in seen, "opened by its resolved path"
+
+    def test_a_symlink_loop_and_odd_names(self, tmp_path):
+        (tmp_path / "a").symlink_to("b")
+        (tmp_path / "b").symlink_to("a")
+        assert _prefs._read_goals(tmp_path / "a" / "p.plist") == (None, "unreadable")
+        (tmp_path / "file").write_bytes(b"x")
+        assert _prefs._read_goals(tmp_path / "file" / "p.plist") == (None, "missing")
+        assert _prefs._read_goals(f"{tmp_path}/") == (None, "not_regular")
+        assert _prefs._read_goals(f"{tmp_path}/.") == (None, "not_regular")
+        assert _prefs._read_goals(f"{tmp_path}/a/..") == (None, "unreadable")
+        assert _prefs._read_goals("") == (None, "missing")
+        assert _prefs._read_goals("/") == (None, "not_regular")
+        assert _prefs._read_goals(f"{tmp_path}/p\x00.plist") == (None, "unreadable")
 
     @pytest.mark.parametrize("data", [
         b"", b"bplist00", b"garbage" * 10, b"bplist00" + b"\x00" * 40,
@@ -343,6 +380,7 @@ class TestDataless:
             monkeypatch.setattr(os, name, spy)
         assert _prefs._read_goals(path)[1] == "ok"
         assert {name for name, _ in seen} == {"lstat", "open", "fstat", "read"}
+        assert len([name for name, _ in seen if name == "lstat"]) > 1, "the folders were not looked at"
         assert all(value == _icloud.IOPOL_MATERIALIZE_DATALESS_FILES_OFF for _, value in seen)
         assert state["value"] == 0
 
