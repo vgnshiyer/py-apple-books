@@ -1,0 +1,4 @@
+# Modules added by stream 1.1 (content safety) whose import must do no
+# I/O (R19): no ctypes.dlopen until no_materialize() is first used.
+py_apple_books._icloud
+py_apple_books._messages
