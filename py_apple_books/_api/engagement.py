@@ -77,7 +77,9 @@ def _asset_of(api, book_id) -> Optional[str]:
 
 def _iterable(name: str, value) -> list:
     """``value`` as a list of items, for an ``exclude_*`` argument: any
-    iterable but a string."""
+    iterable but a string; None is no items."""
+    if value is None:
+        return []
     if isinstance(value, (str, bytes, bytearray)):
         raise InvalidArgumentError(f"{name} must be an iterable of items, not a single {type(value).__name__}.")
     try:
@@ -187,7 +189,7 @@ class _EngagementAPI:
 
     def sample_highlights(self, limit: Optional[int] = 5, *, offset: Optional[int] = None, on=None,
                           seed: Optional[str] = None, book_id=None, after=None, before=None,
-                          exclude_ids: Iterable = (), exclude_uuids: Iterable[str] = (),
+                          exclude_ids: Optional[Iterable] = (), exclude_uuids: Optional[Iterable[str]] = (),
                           exclude_short: bool = True, include_orphans: bool = False) -> ModelIterable:
         """A varied, repeatable sample of your highlights for one day
         (1.11): the same day and ``seed`` give the same picks, and a new
@@ -203,7 +205,7 @@ class _EngagementAPI:
         ``include_orphans``; words and short phrases
         (:attr:`Annotation.is_short_selection`) unless ``exclude_short``
         is False; ``exclude_ids`` (ints or strings of digits) and
-        ``exclude_uuids`` (any case).
+        ``exclude_uuids`` (any case; None for either excludes nothing).
 
         They are ranked by :data:`py_apple_books.engagement.SAMPLE_ALGORITHM`
         (a highlight with a note counts twice) and, without ``book_id``,

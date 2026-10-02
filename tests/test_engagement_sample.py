@@ -311,6 +311,8 @@ class TestCandidates:
                                (rows["noted"],))[0][0]
         assert rows["noted"] not in self.sampled(api, exclude_uuids=[uuid.lower()])
         assert rows["noted"] not in self.sampled(api, exclude_uuids={uuid})
+        # None excludes nothing (a caller passing optional arguments through).
+        assert self.sampled(api, exclude_ids=None, exclude_uuids=None) == self.sampled(api)
 
     @pytest.mark.parametrize("kwargs, match", [
         ({"exclude_ids": ["x"]}, "exclude_ids items"),
