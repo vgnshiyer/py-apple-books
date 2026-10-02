@@ -2,8 +2,8 @@
 
 A fresh interpreter (``-I -B``: no cwd, no PYTHON* settings, no
 bytecode writes) installs the suite's audit hook and imports every
-module named in the ``tests/import_no_io_*.txt`` lists, one at a time,
-recording each import. Expected: reading any file in the package's own
+module of the package, one at a time, recording each import.
+Expected: reading any file in the package's own
 folder (its modules and package data), and, elsewhere on the import
 path, only module files (source, bytecode, extension modules: the
 interpreter's ``importlib.machinery.all_suffixes()``) and directory
@@ -12,9 +12,14 @@ data files included), no write, no SQLite connection, no process, no
 ``ctypes.dlopen``. ctypes, plistlib, FTS5 probes and the like belong in
 first use, not at import.
 
-Each stream that adds a module lists it in its own
-``tests/import_no_io_<stream>.txt``; ``test_every_module_is_listed``
-fails until it does.
+The modules are found in the package's source, so a new module is
+checked without being listed anywhere. The ``tests/import_no_io_*.txt``
+lists are optional: a stream may name the modules it adds there (each
+listed name must be a module of the package), and ``!name`` keeps a
+module from being imported at all (one only ever run as a file). One
+list per stream, named ``tests/import_no_io_<stream>.txt`` with the
+stream number's dot written as an underscore (``import_no_io_2_1.txt``
+for stream 2.1); the glob also reads other spellings.
 """
 
 import importlib.util
@@ -58,7 +63,7 @@ print(json.dumps(out))
 
 
 def listed():
-    """``(imported, never_imported)`` module names from every list file."""
+    """``(listed, never_imported)`` module names from every list file."""
     imported, skipped = [], []
     for path in sorted(TESTS.glob("import_no_io_*.txt")):
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -84,22 +89,32 @@ def package_modules():
     return names
 
 
+def modules_to_import():
+    """Every module of the package and every listed one, less the
+    ``!name`` ones; the package itself comes first (sorted)."""
+    imported, skipped = listed()
+    return sorted((package_modules() | set(imported)) - set(skipped))
+
+
 def _under(path, roots):
     return any(path == r or path.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
 
 
-def test_every_module_is_listed():
-    imported, skipped = listed()
-    missing = sorted(package_modules() - set(imported) - set(skipped))
-    assert not missing, (f"add these modules to a tests/import_no_io_<stream>.txt list: {missing}")
+def test_every_module_is_imported():
+    modules = modules_to_import()
+    _, skipped = listed()
+    assert modules[0] == PACKAGE
+    assert {"py_apple_books.api", "py_apple_books.db.client", "py_apple_books.models.book"} <= set(modules)
+    assert set(modules) == package_modules() - set(skipped)
 
 
 def test_lists_name_real_modules():
     imported, skipped = listed()
-    assert imported, "no tests/import_no_io_*.txt lists found"
     unknown = sorted(set(imported + skipped) - package_modules())
     assert not unknown, f"listed but not in the package: {unknown}"
     assert len(imported) == len(set(imported)), "a module is listed twice"
+    both = sorted(set(imported) & set(skipped))
+    assert not both, f"listed both to import and to skip: {both}"
 
 
 def import_events(modules, extra_path=""):
@@ -145,9 +160,9 @@ def problems_in(report):
 
 
 def test_importing_the_package_does_no_io():
-    imported, _ = listed()
-    report = import_events(imported)
-    assert set(report["modules"]) == set(imported)
+    modules = modules_to_import()
+    report = import_events(modules)
+    assert set(report["modules"]) == set(modules)
     problems = problems_in(report)
     assert not problems, "import-time I/O:\n" + "\n".join(problems)
 

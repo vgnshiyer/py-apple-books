@@ -50,7 +50,11 @@ BOOK_INFO_CACHES = "Library/Caches/AEEpubInfoSource"
 # Modules (added in 1.11) whose ``default_*_path()``/``default_*_dir()``
 # functions name such files; checked too once they exist. Every such
 # function that takes no required argument is called; one may return
-# None (no default here: nothing to read), which the guard skips.
+# None (no default here: nothing to read), which the guard skips. This is
+# an extra check only: a module without such functions (one that derives
+# its paths from the instance's source) is not checked here, and the two
+# container files above, derived from HOME and from the data dir, are
+# what guards it.
 _DEFAULT_LOCATION_MODULES = ("py_apple_books._prefs", "py_apple_books.book_info")
 
 
