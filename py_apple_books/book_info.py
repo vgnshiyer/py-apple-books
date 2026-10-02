@@ -518,8 +518,9 @@ class _BookInfoIndex:
                     except OSError as e:
                         _debug(name, e)
                         sigs[name] = None  # stat'ed again when needed
-        except OSError as e:
-            # Transient: keep what is known; look again at the next call.
+        except (OSError, ValueError) as e:
+            # Transient (or a path the OS refuses, such as one holding a
+            # NUL): keep what is known; look again at the next call.
             logger.debug("AEBookInfo cache folder not listed: %s", type(e).__name__)
             return
         with self._lock:

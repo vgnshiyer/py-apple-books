@@ -1007,6 +1007,15 @@ def test_missing_folder_and_home(tmp_path, spy):
         api.close()
 
 
+def test_a_path_the_os_refuses_gives_nothing(tmp_path, spy):
+    api = PyAppleBooks(tmp_path / "a\x00b" / "Documents")
+    try:
+        assert api.get_cached_book_info("A") == {}
+    finally:
+        api.close()
+    assert spy.uris == []
+
+
 def test_folder_derivation_never_raises(monkeypatch):
     class Source:
         def __init__(self, result):
