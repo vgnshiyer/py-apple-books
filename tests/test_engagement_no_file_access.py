@@ -77,6 +77,11 @@ _SCRIPT = textwrap.dedent(r'''
 
     home = pathlib.Path(sys.argv[2])
     UTC = dt.timezone.utc
+
+    def noon(*ymd):
+        # Local noon, so each row's local day is the same in every zone.
+        return dt.datetime(*ymd, 12).astimezone()
+
     lib = FixtureLibrary.create(home)
     bundle = write_epub_bundle(
         home / "Library" / "Mobile Documents" / "iCloud~com~apple~iBooks" / "Documents" / "Cloud Book.epub",
@@ -85,11 +90,11 @@ _SCRIPT = textwrap.dedent(r'''
                         finished_date=dt.datetime(2026, 3, 1, tzinfo=UTC))
     for i in range(4):
         lib.add_annotation(book, f"a passage long enough to be sampled, number {i}.",
-                           note="a note" if i % 2 else None, created=dt.datetime(2025, 10, 1, 12, tzinfo=UTC))
-    lib.add_annotation(book, "Ephemeral,", kind="underline", created=dt.datetime(2024, 10, 1, 12, tzinfo=UTC))
-    lib.add_annotation(book, "laconic", kind="note", note="brief", created=dt.datetime(2026, 9, 1, 12, tzinfo=UTC))
+                           note="a note" if i % 2 else None, created=noon(2025, 10, 1))
+    lib.add_annotation(book, "Ephemeral,", kind="underline", created=noon(2024, 10, 1))
+    lib.add_annotation(book, "laconic", kind="note", note="brief", created=noon(2026, 9, 1))
     lib.add_annotation("GONE-ASSET", "an orphan passage long enough to count.",
-                       created=dt.datetime(2023, 10, 1, 12, tzinfo=UTC))
+                       created=noon(2023, 10, 1))
     lib.write_prefs(finished={book["asset_id"]: dt.datetime(2026, 3, 1)})
 
     day = dt.date(2026, 10, 1)
