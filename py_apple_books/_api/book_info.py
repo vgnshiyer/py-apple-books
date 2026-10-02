@@ -69,7 +69,9 @@ class _BookInfoAPI:
         don't offer it as a lookup by arbitrary id.
 
         :param asset_ids: one asset id (a ``str``), or an iterable of
-            them; None and '' items are skipped.
+            them; None and '' items are skipped. An id no asset id can
+            match (over 1,024 bytes in UTF-8, or holding a lone
+            surrogate) is never found, and hides no other id.
         :returns: ``{asset id: CachedBookInfo}`` for the ids found, in
             the order the ids were first given.
         :raises InvalidArgumentError: ``asset_ids`` is neither a ``str``

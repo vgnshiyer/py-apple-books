@@ -366,6 +366,30 @@ def test_an_unbindable_id_does_not_hide_the_others(three, reader):
     assert list(reader.get_cached_book_info(["\ud800", "A"])) == ["A"]
 
 
+def test_an_oversized_id_is_never_looked_up(home, reader, spy, monkeypatch):
+    # Over 1,024 bytes (UTF-8) an id can't be an asset id: it is skipped
+    # silently, never bound or remembered, and hides no other id, even
+    # where it would pass SQLite's length limit (lowered here, where the
+    # sqlite3 module allows it).
+    at_bound, over = "k" * 1024, "k" * 1025
+    home.add_book_info_cache([{"asset_id": "A", "title": "a"}, {"asset_id": at_bound, "title": "at the bound"},
+                              {"asset_id": over, "title": "over"}])
+    real_connect = book_info._connect
+
+    def connect(uri, busy):
+        con = real_connect(uri, busy)
+        if hasattr(con, "setlimit"):
+            con.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 20000)
+        return con
+
+    monkeypatch.setattr(book_info, "_connect", connect)
+    got = reader.get_cached_book_info([over, "A", "x" * 30000, at_bound, "é" * 513])
+    assert list(got) == ["A", at_bound]
+    assert sorted(len(p) for params in spy.selects() for p in params) == [1, 1024]
+    (memo,) = index_of(reader)._memos.values()
+    assert sorted(memo.rows) == ["A", at_bound]
+
+
 # -- the open rule (cases shared with dump_schema) ---------------------------------
 
 

@@ -90,6 +90,8 @@ _MAX_FILES = 32
 _MEMO_IDS = 1024
 # Ids bound per statement.
 _CHUNK = 500
+# A longer id (in bytes, UTF-8) is never looked up: see _bindable.
+_MAX_ID_BYTES = 1024
 # A cached value longer than this (in bytes) reads as None: a damaged or
 # crafted cell is neither returned nor remembered whole.
 _MAX_VALUE_BYTES = 4096
@@ -146,13 +148,18 @@ def _asset_id_list(asset_ids) -> List[str]:
 
 
 def _bindable(asset_id: str) -> bool:
-    # A str with lone surrogates can't be bound (and can't equal any
-    # cached key); leaving it out keeps it from failing the other ids.
+    # Ids that can't be a cached key are never looked up, so one can't
+    # fail the statement of the other ids or take memo space: a str with
+    # lone surrogates (it can't be bound), and one longer than
+    # _MAX_ID_BYTES in UTF-8 (far beyond any asset id; past SQLite's
+    # length limit it would fail the statement, and below it, each such
+    # id would be remembered as absent until close()).
+    if len(asset_id) > _MAX_ID_BYTES:
+        return False
     try:
-        asset_id.encode("utf-8")
+        return len(asset_id.encode("utf-8")) <= _MAX_ID_BYTES
     except UnicodeEncodeError:
         return False
-    return True
 
 
 # -- the cache folder ----------------------------------------------------------
