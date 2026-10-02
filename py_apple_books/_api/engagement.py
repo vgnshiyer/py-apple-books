@@ -303,7 +303,9 @@ class _EngagementAPI:
         :raises InvalidChoiceError: an unknown ``order_by``.
         :raises BookNotFoundError: no book has id ``book_id``.
         :raises UnsupportedSchemaError: ``underline_only`` on a store
-            with neither the underline flag nor the style column.
+            with neither the underline flag nor the style column, or
+            ``after`` or ``before`` on a store without the annotation
+            creation date.
         """
         limit, offset = strict_limit(limit), strict_offset(offset)
         field, descending = _eng._vocabulary_order(order_by)
@@ -359,6 +361,8 @@ class _EngagementAPI:
         :raises InvalidArgumentError: a bad ``after`` or ``before``.
         :raises InvalidChoiceError: an unknown ``granularity``.
         :raises BookNotFoundError: no book has id ``book_id``.
+        :raises UnsupportedSchemaError: the store has no annotation
+            creation date.
         """
         granularity = _eng._granularity(granularity)
         window = _eng._window_filters("creation_date", after, before)
@@ -394,6 +398,8 @@ class _EngagementAPI:
         highlight breaks a streak.
 
         :raises InvalidArgumentError: a bad ``on``.
+        :raises UnsupportedSchemaError: the store has no annotation
+            creation date.
         """
         day = _eng._local_day(on)
         _require_annotation_store()

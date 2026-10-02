@@ -12,8 +12,11 @@ import time
 
 import pytest
 
+from py_apple_books import PyAppleBooks
+from py_apple_books.db import LibraryDB, use_library
 from py_apple_books.engagement import ActivityPeriod, HighlightActivity, HighlightStreaks, _streaks
-from py_apple_books.exceptions import BookNotFoundError, InvalidArgumentError, InvalidChoiceError
+from py_apple_books.exceptions import (BookNotFoundError, InvalidArgumentError, InvalidChoiceError,
+                                       UnsupportedSchemaError)
 from py_apple_books.utils import APPLE_EPOCH_OFFSET
 from tests import engagement_helpers
 
@@ -140,6 +143,15 @@ class TestActivity:
         library.add_annotation(first, "s", created=local(2027, 1, 1))
         assert api.get_highlight_activity().per_book == ((first["id"], "First", 1), (other["id"], "Other", 1))
 
+    def test_blank_notes_are_not_notes(self, api, library):
+        book = library.add_book("B")
+        for hour, note in ((9, None), (10, "   "), (11, " \n\t"), (12, "a note"), (13, "  padded  ")):
+            library.add_annotation(book, "x", note=note, created=local(2027, 1, 1, hour))
+        result = api.get_highlight_activity(granularity="day")
+        check_invariants(result)
+        assert (result.highlights, result.notes) == (5, 2)
+        assert [(p.highlights, p.notes) for p in result.periods] == [(5, 2)]
+
     def test_empty(self, api):
         result = api.get_highlight_activity()
         check_invariants(result)
@@ -212,6 +224,18 @@ class TestStreaks:
         assert (s.current, s.longest, s.active_days, s.last_active) == (0, 0, 0, None)
         with pytest.raises(InvalidArgumentError):
             api.get_highlight_streaks(on="today")
+
+
+def test_without_a_creation_date_column(make_library):
+    lib = make_library()
+    lib.add_annotation(lib.add_book("B"), "x", created=local(2027, 1, 1, 12))
+    lib.execute("annotations", "ALTER TABLE ZAEANNOTATION DROP COLUMN ZANNOTATIONCREATIONDATE")
+    with LibraryDB(data_dir=lib.data_dir) as db, use_library(db):
+        api = PyAppleBooks()
+        with pytest.raises(UnsupportedSchemaError, match="ZANNOTATIONCREATIONDATE"):
+            api.get_highlight_activity()
+        with pytest.raises(UnsupportedSchemaError, match="ZANNOTATIONCREATIONDATE"):
+            api.get_highlight_streaks(on=D(2027, 1, 2))
 
 
 _TZ_SCRIPT = textwrap.dedent(r'''

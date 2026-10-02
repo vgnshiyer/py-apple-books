@@ -102,6 +102,15 @@ def test_context_matches_whole_words(api, library, term, newer, older, expected)
     assert entry.context == expected
 
 
+def test_notes_are_trimmed_and_blank_ones_left_out(api, library):
+    book = library.add_book("B")
+    for day, note in ((1, "  fleeting \n"), (2, "fleeting"), (3, "   "), (4, " \t"), (5, "brief")):
+        library.add_annotation(book, "ephemeral", note=note, created=local(2026, 1, day))
+    (entry,) = api.get_vocabulary()
+    assert entry.count == 5
+    assert entry.notes == ("brief", "fleeting")   # newest first, one each
+
+
 def test_entry_type(api, words):
     entry = api.get_vocabulary()[0]
     assert isinstance(entry, VocabularyEntry)
@@ -220,6 +229,17 @@ def test_underline_only_without_underline_columns(make_library):
         assert terms(api.get_vocabulary()) == ["word"]
         with pytest.raises(UnsupportedSchemaError, match="ZANNOTATIONSTYLE"):
             api.get_vocabulary(underline_only=True)
+
+
+def test_window_without_a_creation_date_column(make_library):
+    lib = make_library()
+    lib.add_annotation(lib.add_book("B"), "word", created=local(2026, 1, 1))
+    lib.execute("annotations", "ALTER TABLE ZAEANNOTATION DROP COLUMN ZANNOTATIONCREATIONDATE")
+    with LibraryDB(data_dir=lib.data_dir) as db, use_library(db):
+        api = PyAppleBooks()
+        assert terms(api.get_vocabulary()) == ["word"]
+        with pytest.raises(UnsupportedSchemaError, match="ZANNOTATIONCREATIONDATE"):
+            api.get_vocabulary(after=dt.date(2026, 1, 1))
 
 
 @pytest.mark.parametrize("count", [10_000] + ([50_000] if engagement_helpers.SLOW else []))
