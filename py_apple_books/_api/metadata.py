@@ -6,6 +6,8 @@ book's OPF) and series.
   (:mod:`py_apple_books._opf`).
 - ``get_series``, ``list_series``: Apple Books Store series from the
   library database alone (provisional).
+- ``get_books_by_subject``: ``get_books_by_genre`` that also searches
+  the subjects in the books' package documents.
 
 See ``py_apple_books._api`` for the rules mixin code follows.
 """
@@ -13,11 +15,15 @@ See ``py_apple_books._api`` for the rules mixin code follows.
 import datetime as _dt
 import os
 import stat as _stat
+import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 from py_apple_books import _icloud, _opf
-from py_apple_books._api._common import _book_arg, strict_limit, strict_offset
-from py_apple_books.db.clause import Q, Subquery, Where, WhereGroup
+from py_apple_books._api._common import _book_arg, _book_scope, strict_limit, strict_offset
+from py_apple_books.db.clause import Q, Subquery, Where, WhereGroup, _text
+from py_apple_books.db.client import current_library, query_deadline
+from py_apple_books.exceptions import QueryTimeoutError
+from py_apple_books.models.manager import ModelIterable
 from py_apple_books.models.book import (
     CONTENT_TYPE_SERIES_CONTAINER,
     SERIES_DATA_SOURCE,
@@ -177,6 +183,109 @@ class _MetadataAPI:
             found = [s for s in found if any(v.reading_status != ReadingStatus.UNSTARTED for v in s.volumes)]
         found.sort(key=_series_order)
         return found[offset:] if limit is None else found[offset:offset + limit]
+
+
+    def get_books_by_subject(self, subject: str, limit: int = None, order_by: str = None, *,
+                             offset: int = None, include_store_series: bool = False,
+                             read_files: bool = True) -> ModelIterable:
+        """Books whose genre, or any subject in the book's package document
+        (OPF), contains ``subject``, ignoring case, accents and quote/dash
+        style as :meth:`get_books_by_genre` does (1.11).
+
+        The needle rules are :meth:`get_books_by_genre`'s: ``''`` matches
+        every book with a genre or at least one subject, a needle of
+        spaces matches values with a space, and a needle whose characters
+        all fold away matches nothing. Store series items you don't own
+        are left out unless ``include_store_series``. Every book
+        :meth:`get_books_by_genre` returns is returned too.
+
+        ``read_files=False`` returns :meth:`get_books_by_genre` itself.
+        Otherwise one statement reads the candidate books (in
+        ``order_by`` order; id order when None), then, for those whose
+        genre doesn't match, the subjects are read from the package
+        documents of unzipped EPUBs on this Mac, after the database
+        lookup has finished. Books stored only in iCloud (``ZSTATE`` 3),
+        books without a file and other formats are skipped without
+        touching the disk, and nothing is downloaded: a book with any
+        part on the way to its package document only in iCloud is
+        skipped. Subjects are cached while the files are unchanged.
+        ``offset`` and ``limit`` then apply in Python; ``count()`` and
+        slices of the result read the list (no further statement).
+
+        One deadline covers the whole call: the library's
+        ``query_timeout`` and any :meth:`query_deadline`, counted from
+        the start of the call.
+
+        :param limit: None for all, else at least 1.
+        :param offset: None or at least 0.
+        :raises InvalidArgumentError: a bad ``limit`` or ``offset``.
+        :raises QueryTimeoutError: the deadline passed (the message names
+            no book).
+        :raises DBError: the library couldn't be read.
+        """
+        limit = strict_limit(limit)
+        offset = strict_offset(offset)
+        if not read_files:
+            return self.get_books_by_genre(subject, limit, order_by, offset=offset,
+                                           include_store_series=include_store_series)
+        deadline, seconds = current_library()._statement_deadline()
+        candidates = Book.manager.filter(**_book_scope(include_store_series), order_by=order_by or "id")
+        if deadline is None:
+            rows = candidates.run_query()
+        else:
+            with query_deadline(max(0.0, deadline - time.monotonic())):
+                rows = candidates.run_query()
+        matches = _subject_matcher(subject)
+        keys = list(Book._get_mappings("Book"))
+        i_genre, i_path, i_state = (keys.index(k) for k in ("genre", "path", "state"))
+        found = []
+        for row in rows:
+            genre = row[i_genre] if i_genre < len(row) else None
+            if matches(None if genre is None else (fold_for_match(genre) or "",)):
+                found.append(row)
+                continue
+            path = _scan_path(row, i_path, i_state)
+            if path is None:
+                continue
+            if deadline is not None and time.monotonic() > deadline:
+                raise QueryTimeoutError(
+                    f"Subject search took too long and was stopped (limit {seconds:g} s).", timeout=seconds)
+            if matches(_opf.read_subjects(path)):
+                found.append(row)
+        start = offset or 0
+        page = found[start:] if limit is None else found[start:start + limit]
+        return ModelIterable(lambda: page, Book)
+
+
+# -- get_books_by_subject ---------------------------------------------------------
+
+
+def _subject_matcher(subject) -> Callable[[Optional[Tuple[str, ...]]], bool]:
+    """``matches(folded_values)`` with ``get_books_by_genre``'s needle
+    rules (the ``search`` lookup's): the needle as text, folded; a
+    needle with visible characters that all fold away matches nothing."""
+    raw = _text(subject)
+    needle = fold_for_match(raw) if raw is not None else None
+    if needle is None or (raw.strip() and not needle.strip()):
+        return lambda values: False
+    return lambda values: bool(values) and any(needle in value for value in values)
+
+
+def _scan_path(row, i_path: int, i_state: int):
+    """The bundle path of a candidate whose package document may be read,
+    decided from the row alone: None for no file, ``ZSTATE`` 3 or not an
+    ``.epub`` path."""
+    raw = row[i_path] if i_path < len(row) else None
+    state = row[i_state] if i_state < len(row) else None
+    if raw is None or state == STATE_CLOUD_ONLY:
+        return None
+    try:
+        path = os.fspath(raw)
+    except TypeError:
+        return None
+    if not path or not _is_epub_path(path):
+        return None
+    return path
 
 
 # -- get_book_metadata ----------------------------------------------------------

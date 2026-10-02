@@ -1,5 +1,5 @@
 """Drift cases for stream 2.4 (metadata): ``get_book_metadata``,
-``get_series`` and ``list_series``.
+``get_series``, ``list_series`` and (Tier B) ``get_books_by_subject``.
 
 ``seed`` links the seeded Store series rows (``container``, ``volume``,
 ``owned_volume``) into one series by setting their series columns, so
@@ -47,4 +47,8 @@ CASES = {
     "get_series(none)": lambda api, rows: series(api.get_series(rows["reading"])),
     "list_series": lambda api, rows: [series(s) for s in api.list_series()],
     "list_series(started)": lambda api, rows: [series(s) for s in api.list_series(started_only=True, limit=5)],
+    # Tier B: the seeded books have no file, so only genres match.
+    "get_books_by_subject": lambda api, rows: [b.id for b in api.get_books_by_subject("fic")],
+    "get_books_by_subject(library only)": lambda api, rows: [
+        b.id for b in api.get_books_by_subject("", order_by="title", read_files=False)],
 }
