@@ -143,6 +143,15 @@ class TestScope:
         assert lib.ids("evicted") == []
         assert "content.opf" not in opened and evicted
 
+    def test_path_stored_as_bytes(self, lib):
+        """A ZPATH BLOB is read like the same path stored as text, and
+        shares its subject-index entry."""
+        book = lib.book(subjects=["Blob Topic"])
+        path = os.fspath(lib.api.get_book_by_id(book).path)
+        lib.fx.execute("library", "UPDATE ZBKLIBRARYASSET SET ZPATH = ? WHERE Z_PK = ?", (os.fsencode(path), book))
+        assert lib.ids("blob topic") == [book]
+        assert _opf._subject_index.get(os.path.abspath(path)) is not None
+
     def test_is_downloaded_is_not_called(self, lib, monkeypatch):
         from py_apple_books import content
 

@@ -184,7 +184,6 @@ class _MetadataAPI:
         found.sort(key=_series_order)
         return found[offset:] if limit is None else found[offset:offset + limit]
 
-
     def get_books_by_subject(self, subject: str, limit: int = None, order_by: str = None, *,
                              offset: int = None, include_store_series: bool = False,
                              read_files: bool = True) -> ModelIterable:
@@ -275,15 +274,11 @@ def _scan_path(row, i_path: int, i_state: int):
     """The bundle path of a candidate whose package document may be read,
     decided from the row alone: None for no file, ``ZSTATE`` 3 or not an
     ``.epub`` path."""
-    raw = row[i_path] if i_path < len(row) else None
     state = row[i_state] if i_state < len(row) else None
-    if raw is None or state == STATE_CLOUD_ONLY:
+    if state == STATE_CLOUD_ONLY:
         return None
-    try:
-        path = os.fspath(raw)
-    except TypeError:
-        return None
-    if not path or not _is_epub_path(path):
+    path = _file_path(row[i_path] if i_path < len(row) else None)
+    if path is None or not _is_epub_path(path):
         return None
     return path
 
