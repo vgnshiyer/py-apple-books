@@ -516,3 +516,38 @@ def test_write_sessions_refuse_other_invalid_text_without_quoting_it(writable):
         names = [n for (n,) in session.conn.execute(
             "SELECT Z_NAME FROM Z_PRIMARYKEY WHERE Z_NAME = 'BKCollection'")]
     assert names == ["BKCollection"]
+
+
+def _set_store_uuid(lib, raw: bytes) -> None:
+    _raw(lib, "UPDATE Z_METADATA SET Z_UUID = CAST(? AS TEXT)", (raw,))
+    assert _raw(lib, "SELECT typeof(Z_UUID) FROM Z_METADATA") == [("text",)]
+
+
+@pytest.mark.parametrize("model_check", ["warn", "enforce"])
+def test_invalid_store_metadata_refuses_a_write(writable, model_check, caplog):
+    """The backstop in a write's own reads: the model check reads
+    ``Z_METADATA.Z_UUID``. 1.10 took metadata it couldn't decode as
+    unavailable (writing anyway under 'warn', SchemaValidationError
+    under 'enforce'); the write is now refused, quoting nothing."""
+    lib = writable
+    pk = lib.shelf["id"]
+    _set_store_uuid(lib, NOISY)
+    row = "SELECT * FROM ZBKCOLLECTION WHERE Z_PK = ?"
+    before = _raw(lib, row, (pk,))
+    with caplog.at_level(logging.DEBUG, logger="py_apple_books"):
+        with pytest.raises(WriteError) as exc:
+            rename_collection(pk, "Renamed", model_check=model_check, **_kwargs(lib))
+    assert type(exc.value) is WriteError
+    assert str(exc.value) == ("Some text this write needs to read in the Books library database "
+                              "isn't valid UTF-8; nothing was changed.")
+    assert exc.value.__cause__ is None and exc.value.__context__ is None
+    assert "SECRET" not in caplog.text
+    assert _raw(lib, row, (pk,)) == before
+
+
+def test_invalid_store_metadata_is_not_read_with_the_model_check_off(writable):
+    lib = writable
+    pk = lib.shelf["id"]
+    _set_store_uuid(lib, NOISY)
+    rename_collection(pk, "Renamed", model_check="off", **_kwargs(lib))
+    assert _raw(lib, "SELECT ZTITLE FROM ZBKCOLLECTION WHERE Z_PK = ?", (pk,)) == [("Renamed",)]

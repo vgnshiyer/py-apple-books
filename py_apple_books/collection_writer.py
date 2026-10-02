@@ -312,7 +312,9 @@ class WriteSession:
 
     ``conn`` reads text as sqlite3 does by default, except that a value
     that isn't valid UTF-8 raises :class:`WriteError` (quoting nothing),
-    which rolls the transaction back.
+    which rolls the transaction back. Entering reads with it too: store
+    metadata that isn't valid UTF-8 refuses the write, unless the model
+    check is ``'off'``.
     """
 
     def __init__(
