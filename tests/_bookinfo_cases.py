@@ -9,9 +9,16 @@ reader. Both test modules parametrize over :data:`CASES` and compare the
 mode their rule picks with :attr:`Case.mode`, which pins the two copies
 to one rule:
 
-- rollback journal (DELETE, PERSIST, TRUNCATE; locked or with a hot
-  journal too): ``journal``, opened ``mode=ro``;
-- WAL with a local regular ``-wal`` and ``-shm``: ``wal``, ``mode=ro``;
+- rollback journal (DELETE, PERSIST, TRUNCATE; locked by another
+  process or with a hot journal too): ``journal``, opened ``mode=ro``;
+- rollback journal whose ``-journal`` is not a local regular file (a
+  symlink): refused (:data:`REFUSED`), never opened, because SQLite
+  would read it;
+- WAL with a local regular ``-wal`` and ``-shm``, whether a connection
+  has the cache open or not: ``wal``, ``mode=ro``. The read writes
+  ``-shm`` in place (SQLite's read marks; a rebuild of the index when no
+  connection has the cache open, after a crash or in a copy); every other
+  file stays as it was;
 - WAL without both (closed cleanly, one missing, one a symlink):
   ``wal_immutable``, ``mode=ro&immutable=1``.
 
@@ -23,10 +30,13 @@ a test can check that no row reached its output.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import pathlib
 import shutil
 import sqlite3
+import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Callable, ContextManager, Iterator, Optional
 
@@ -35,6 +45,7 @@ from py_apple_books.testing.fixture import DEFAULT_SCHEMA, SCHEMAS_DIR
 CACHE_NAME = "AEBookInfo-v20250715-26.7.sqlite"
 TABLE = "ZAEBOOKINFO"
 JOURNAL, WAL, WAL_IMMUTABLE = "journal", "wal", "wal_immutable"
+REFUSED = None  # the rule refuses the file before SQLite opens it
 SECRET = "SECRET-"
 
 
@@ -97,17 +108,46 @@ def _persist(folder: pathlib.Path) -> Iterator[pathlib.Path]:
     yield path
 
 
+_HOLD_LOCK = """
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1], isolation_level=None)
+con.execute("BEGIN EXCLUSIVE")
+print("locked", flush=True)
+sys.stdin.read()
+con.execute("ROLLBACK")
+con.close()
+"""
+
+
 @contextlib.contextmanager
 def _locked(folder: pathlib.Path) -> Iterator[pathlib.Path]:
+    # The lock is held by another process, as Books holds it. A lock held
+    # by a connection in this process would not model Books: POSIX locks
+    # belong to the process, and the open rule's own os.open/os.close of
+    # the file would drop it.
     path = folder / CACHE_NAME
     create(path).close()
-    holder = sqlite3.connect(path, isolation_level=None)
-    holder.execute("BEGIN EXCLUSIVE")
+    holder = subprocess.Popen([sys.executable, "-I", "-c", _HOLD_LOCK, str(path)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
+        assert holder.stdout.readline().strip() == "locked"
         yield path
     finally:
-        holder.execute("ROLLBACK")
-        holder.close()
+        holder.stdin.close()
+        holder.wait(timeout=30)
+        holder.stdout.close()
+
+
+@contextlib.contextmanager
+def _journal_symlinked(folder: pathlib.Path) -> Iterator[pathlib.Path]:
+    path = folder / CACHE_NAME
+    create(path, "PERSIST").close()
+    assert sidecars(path) == [f"{CACHE_NAME}-journal"]
+    elsewhere = folder / "elsewhere"
+    elsewhere.mkdir()
+    os.replace(f"{path}-journal", elsewhere / "journal")
+    os.symlink(elsewhere / "journal", f"{path}-journal")
+    yield path
 
 
 @contextlib.contextmanager
@@ -147,6 +187,25 @@ def _wal_live(folder: pathlib.Path) -> Iterator[pathlib.Path]:
 
 
 @contextlib.contextmanager
+def _wal_dormant(folder: pathlib.Path) -> Iterator[pathlib.Path]:
+    # Both sidecars and no connection: what a crash leaves, or a copy of
+    # a cache Books has open. The committed rows are in the -wal only.
+    work = folder / "work"
+    work.mkdir()
+    source = work / CACHE_NAME
+    con = create(source, "WAL")
+    con.execute("PRAGMA wal_autocheckpoint=0")
+    fill(con, 1)
+    path = folder / CACHE_NAME
+    for side in ("", "-wal", "-shm"):
+        shutil.copyfile(f"{source}{side}", f"{path}{side}")
+    con.close()
+    shutil.rmtree(work)
+    assert sidecars(path) == [f"{CACHE_NAME}-shm", f"{CACHE_NAME}-wal"]
+    yield path
+
+
+@contextlib.contextmanager
 def _wal_one_sidecar(folder: pathlib.Path, keep: str) -> Iterator[pathlib.Path]:
     path = folder / CACHE_NAME
     con = create(path, "WAL")
@@ -179,12 +238,13 @@ def _wal_symlinked_sidecar(folder: pathlib.Path) -> Iterator[pathlib.Path]:
 
 @dataclass(frozen=True)
 class Case:
-    """One cache state. ``mode`` is the open mode the rule must pick;
-    ``readable`` whether its schema can be read in that mode (None: the
-    SQLite build decides, e.g. a hot journal on a read-only open)."""
+    """One cache state. ``mode`` is the open mode the rule must pick
+    (:data:`REFUSED`: none, the file is refused); ``readable`` whether its
+    schema can be read in that mode (None: the SQLite build decides, e.g.
+    a hot journal on a read-only open)."""
 
     name: str
-    mode: str
+    mode: Optional[str]
     make: Callable[[pathlib.Path], ContextManager[pathlib.Path]]
     readable: Optional[bool] = True
 
@@ -198,7 +258,9 @@ CASES = [
     Case("persist_journal", JOURNAL, _persist),
     Case("delete_locked", JOURNAL, _locked, readable=False),
     Case("hot_journal", JOURNAL, _hot_journal, readable=None),
+    Case("journal_symlinked", REFUSED, _journal_symlinked, readable=False),
     Case("wal_live", WAL, _wal_live),
+    Case("wal_dormant_sidecars", WAL, _wal_dormant),
     Case("wal_closed", WAL_IMMUTABLE, lambda d: _closed(d, "WAL")),
     Case("wal_without_shm", WAL_IMMUTABLE, lambda d: _wal_one_sidecar(d, "-wal")),
     Case("wal_without_wal", WAL_IMMUTABLE, lambda d: _wal_one_sidecar(d, "-shm")),
@@ -213,4 +275,15 @@ def listing(folder: pathlib.Path) -> dict:
         for entry in entries:
             st = entry.stat(follow_symlinks=False)
             out[entry.name] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+def contents(folder: pathlib.Path) -> dict:
+    """``{name: sha256}`` of the regular files in ``folder`` (symlinks
+    and directories skipped)."""
+    out = {}
+    with os.scandir(folder) as entries:
+        for entry in entries:
+            if entry.is_file(follow_symlinks=False):
+                out[entry.name] = hashlib.sha256(pathlib.Path(entry.path).read_bytes()).hexdigest()
     return out

@@ -16,6 +16,7 @@ import pytest
 from py_apple_books.testing import available_schemas, dump_schema
 from py_apple_books.testing.fixture import DEFAULT_SCHEMA, SCHEMAS_DIR
 from tests import _bookinfo_cases as cases
+from tests import _fs_audit
 from tests._bookinfo_cases import CACHE_NAME, CASES, SECRET, TABLE
 
 STORE_FILES = ["AEAnnotation.sql", "BKLibrary.sql", "meta.json"]
@@ -119,7 +120,9 @@ def test_committed_book_info_is_schema_only(schema):
 def test_dump_writes_book_info_and_no_rows(lib, folder, tmp_path, capsys):
     """Privacy regression: a populated cache dumps to its DDL only."""
     path = folder / CACHE_NAME
-    cases.create(path, "WAL", rows=5).close()  # closed cleanly: no sidecars, as Books leaves it
+    # Closed cleanly: no sidecars. (A running Books or a crash leaves both;
+    # see the wal_live and wal_dormant_sidecars cases.)
+    cases.create(path, "WAL", rows=5).close()
     before = cases.listing(folder)
     out = tmp_path / "out"
     assert dump(lib, out) == 0
@@ -483,8 +486,13 @@ def test_open_rule(case, tmp_path):
     folder = tmp_path / "AEEpubInfoSource"
     folder.mkdir()
     with case.make(folder) as path:
-        assert dump_schema.book_info_open_mode(path) == case.mode
-        before = cases.listing(folder)
+        before, before_bytes = cases.listing(folder), cases.contents(folder)
+        if case.mode is cases.REFUSED:
+            with pytest.raises(dump_schema.DumpError) as info:
+                dump_schema.book_info_open_mode(path)
+            assert str(folder) not in str(info.value)
+        else:
+            assert dump_schema.book_info_open_mode(path) == case.mode
         try:
             sql, info = dump_schema.dump_book_info(path)
         except dump_schema.DumpError as e:
@@ -495,14 +503,23 @@ def test_open_rule(case, tmp_path):
             dump_schema.self_check_book_info(sql)
             assert info == {"file": CACHE_NAME, "columns": len(dump_schema.table_columns(cases.ddl())[TABLE])}
         # No file created, removed or changed: no sidecar made by a
-        # read-only open, no hot journal rolled back, no checkpoint.
-        assert cases.listing(folder) == before
+        # read-only open, no hot journal rolled back, no checkpoint. Only
+        # SQLite's shared-memory WAL index may be written in place (read
+        # marks; a rebuild when no connection had the cache open).
+        after, after_bytes = cases.listing(folder), cases.contents(folder)
+        if case.mode == cases.WAL:
+            shm = f"{CACHE_NAME}-shm"
+            assert after.keys() == before.keys() and after[shm][0] == before[shm][0]
+            for files in (before, after, before_bytes, after_bytes):
+                del files[shm]
+        assert after == before
+        assert after_bytes == before_bytes
 
 
 def test_open_rule_constants_match_the_cases():
     assert (dump_schema.OPEN_JOURNAL, dump_schema.OPEN_WAL, dump_schema.OPEN_WAL_IMMUTABLE) == (
         cases.JOURNAL, cases.WAL, cases.WAL_IMMUTABLE)
-    assert {c.mode for c in CASES} == {cases.JOURNAL, cases.WAL, cases.WAL_IMMUTABLE}
+    assert {c.mode for c in CASES} == {cases.JOURNAL, cases.WAL, cases.WAL_IMMUTABLE, cases.REFUSED}
 
 
 def test_immutable_read_is_rechecked(folder, monkeypatch):
@@ -566,6 +583,81 @@ def test_evicted_sidecar_means_immutable(folder, monkeypatch):
         assert dump_schema.book_info_open_mode(path) == dump_schema.OPEN_WAL_IMMUTABLE
 
 
+# -- no byte of an evicted file is read (the suite's audit hook, R13) -------
+
+READS = ("open", "sqlite3.connect", "shutil.copyfile")
+LISTINGS = ("os.listdir", "os.scandir")
+EVICTED = [
+    pytest.param({"st_flags": dump_schema._SF_DATALESS}, id="SF_DATALESS"),
+    pytest.param({"st_flags": 0, "st_blocks": 0}, id="no-blocks"),
+]
+
+
+def touching(rec, path, *events) -> list:
+    """Audit events on ``path`` or a file whose name extends it (its
+    sidecars), or below it."""
+    root = os.path.realpath(path)
+    return [e for e in rec.of(*events) if e.path and e.path.startswith(root)]
+
+
+def test_evicted_journal_is_never_opened(folder, monkeypatch):
+    path = folder / CACHE_NAME
+    cases.create(path, "PERSIST").close()
+    assert cases.sidecars(path) == [f"{CACHE_NAME}-journal"]
+    patch_lstat(monkeypatch, f"{path}-journal", st_flags=dump_schema._SF_DATALESS)
+    with _fs_audit.record() as rec:
+        with pytest.raises(dump_schema.DumpError, match=f"{CACHE_NAME}-journal is not a local file"):
+            dump_schema.dump_book_info(path)
+    assert touching(rec, path, "sqlite3.connect") == []
+    assert touching(rec, f"{path}-", *READS) == []
+
+
+@pytest.mark.parametrize("fields", [
+    {"st_ino": -1},
+    {"st_mode": stat.S_IFIFO | 0o644},
+    {"st_flags": dump_schema._SF_DATALESS},
+    {"st_flags": 0, "st_blocks": 0},
+])
+def test_file_changed_while_being_opened_is_refused(folder, monkeypatch, fields):
+    # Replaced, or evicted, between the lstat and the open: the header
+    # is not read and SQLite never opens the file.
+    path = folder / CACHE_NAME
+    cases.create(path).close()
+    real = os.fstat
+    monkeypatch.setattr(dump_schema.os, "fstat", lambda fd: FakeStat(real(fd), **fields))
+    monkeypatch.setattr(dump_schema.os, "read", lambda *a: pytest.fail("read the header"))
+    with pytest.raises(dump_schema.DumpError, match="changed while being opened"):
+        dump_schema.dump_book_info(path)
+
+
+@pytest.mark.parametrize("versions, mode", [
+    ((1, 1), dump_schema.OPEN_JOURNAL),
+    ((2, 2), dump_schema.OPEN_WAL_IMMUTABLE),
+    ((1, 2), dump_schema.OPEN_WAL_IMMUTABLE),  # either byte means WAL
+    ((2, 1), dump_schema.OPEN_WAL_IMMUTABLE),
+])
+def test_wal_is_read_from_either_header_byte(folder, versions, mode):
+    path = folder / CACHE_NAME
+    cases.create(path).close()
+    with open(path, "r+b") as f:
+        f.seek(18)
+        f.write(bytes(versions))
+    assert dump_schema.book_info_open_mode(path) == mode
+
+
+def test_wal_sidecars_replaced_during_the_read_are_reported(folder, monkeypatch):
+    """The mode is chosen while Books has the cache open; Books closes it
+    before SQLite reads, and the read-only open creates new sidecars."""
+    wal_live = next(c for c in CASES if c.name == "wal_live")
+    with wal_live.make(folder) as path:
+        assert dump_schema.book_info_open_mode(path) == dump_schema.OPEN_WAL
+    assert cases.sidecars(path) == []  # Books closed it
+    monkeypatch.setattr(dump_schema, "book_info_open_mode", lambda p: dump_schema.OPEN_WAL)
+    with pytest.raises(dump_schema.DumpError, match="removed, replaced or created during the read") as info:
+        dump_schema.dump_book_info(path)
+    assert str(folder) not in str(info.value)
+
+
 # -- the folder -------------------------------------------------------------
 
 
@@ -588,7 +680,8 @@ def test_evicted_folder_is_never_listed(lib, folder, monkeypatch):
         dump_schema.find_book_info(lib.data_dir)
 
 
-@pytest.mark.parametrize("cloud", ["Mobile Documents", "com~apple~CloudDocs", "CloudStorage"])
+@pytest.mark.parametrize("cloud", ["Mobile Documents", "com~apple~CloudDocs", "CloudStorage",
+                                   "mobile documents", "COM~APPLE~CLOUDDOCS", "cloudstorage"])
 def test_folder_resolving_into_cloud_storage_is_refused(lib, tmp_path, monkeypatch, cloud):
     # The container's Library folder is a symlink into a fake cloud tree:
     # the cache folder itself is a real directory there.
@@ -599,6 +692,15 @@ def test_folder_resolving_into_cloud_storage_is_refused(lib, tmp_path, monkeypat
     monkeypatch.setattr(dump_schema.os, "listdir", lambda *a: pytest.fail("listed a cloud folder"))
     with pytest.raises(dump_schema.DumpError, match="iCloud Drive or cloud storage"):
         dump_schema.find_book_info(lib.data_dir)
+
+
+@pytest.mark.parametrize("cloud", ["Mobile Documents", "MOBILE DOCUMENTS", "CloudStorage"])
+def test_data_dir_in_cloud_storage_is_refused_before_any_lookup(tmp_path, monkeypatch, cloud):
+    docs = tmp_path / cloud / "box" / "Data" / "Documents"
+    (docs.parent / dump_schema.BOOK_INFO_DIR).mkdir(parents=True)
+    monkeypatch.setattr(dump_schema, "_lstat", lambda p: pytest.fail("looked up a path in cloud storage"))
+    with pytest.raises(dump_schema.DumpError, match="iCloud Drive or cloud storage"):
+        dump_schema.find_book_info(docs)
 
 
 def test_unlistable_folder_is_refused_without_its_path(lib, folder, monkeypatch):
