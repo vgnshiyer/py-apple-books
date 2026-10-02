@@ -21,9 +21,11 @@ year-0 date in it. This module reads it defensively and keeps four keys:
 - any problem gives None and a reason code; only the reason code is
   logged (DEBUG), never a path or a value.
 
-A custom ``prefs_path`` is checked by name only: a symlinked parent
-folder that leads into iCloud Drive is not detected (``O_NOFOLLOW``
-protects the last component only).
+The cloud-folder check is by name only, for the derived path as for a
+custom ``prefs_path``: a symlinked parent folder that leads into iCloud
+Drive is not detected (``O_NOFOLLOW`` protects the last component
+only); the dataless checks and :func:`_icloud.no_materialize` still
+apply to such a path.
 
 Nothing here does I/O at import; ``plistlib`` is imported on first use.
 """

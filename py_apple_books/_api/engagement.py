@@ -431,9 +431,10 @@ class _EngagementAPI:
 
         Returns None when there is no such file or it can't be read
         safely: the library isn't in an Apple Books container, the file
-        is missing, in iCloud Drive or not downloaded, not a regular
-        file, over 8 MiB, or not a readable property list. A single key
-        missing or in an unexpected form leaves just that field None.
+        is missing or not downloaded, its path names an iCloud Drive or
+        other cloud folder, it isn't a regular file, it is over 8 MiB,
+        or it isn't a readable property list. A single key missing or
+        in an unexpected form leaves just that field None.
 
         :raises InvalidArgumentError: ``prefs_path`` isn't a path.
         """
