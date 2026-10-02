@@ -525,24 +525,26 @@ def _make_dirs(path) -> None:
     ``mkdir -p``, each new folder with mode 0700 (as the umask allows):
     backups hold the whole library. Existing folders keep their mode.
 
+    The path is used as given, as :meth:`pathlib.Path.mkdir` does: the
+    OS resolves it, so ``link/../backups`` lands where ``link`` points.
+
     :raises OSError: as :meth:`pathlib.Path.mkdir` does, e.g.
         :class:`FileExistsError` for a file in the way.
     """
-    path = os.path.abspath(os.fspath(path))
+    path = Path(path)
     try:
         os.mkdir(path, 0o700)
     except FileNotFoundError:
-        parent = os.path.dirname(path)
-        if parent == path:
+        if path.parent == path:
             raise
-        _make_dirs(parent)
+        _make_dirs(path.parent)
         try:
             os.mkdir(path, 0o700)
         except OSError:
-            if not os.path.isdir(path):
+            if not path.is_dir():
                 raise
     except OSError:
-        if not os.path.isdir(path):
+        if not path.is_dir():
             raise
 
 

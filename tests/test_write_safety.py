@@ -235,6 +235,28 @@ def test_pre_restore_snapshot_is_0600(scratch_db, tmp_path, monkeypatch, umask_0
     assert _mode(tmp_path / "snaps") == 0o700
 
 
+def test_backup_dir_through_a_symlink_and_dotdot(scratch_db, tmp_path, umask_022):
+    """``link/../new/backups`` is resolved by the OS, as Path.mkdir did:
+    the folders are made next to where ``link`` points, and the backup
+    lands there (not in a folder made by collapsing ``..`` as text)."""
+    deep = tmp_path / "real" / "deep"
+    deep.mkdir(parents=True)
+    (tmp_path / "x").mkdir()
+    link = tmp_path / "x" / "link"
+    link.symlink_to(deep)
+    dest = write_safety.backup_library(scratch_db, link / ".." / "new" / "backups")
+    made = tmp_path / "real" / "new" / "backups"
+    assert os.path.samefile(dest.parent, made)
+    assert _mode(made) == _mode(made.parent) == 0o700
+    assert not (tmp_path / "x" / "new").exists()
+
+
+def test_backup_dir_relative(scratch_db, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    dest = write_safety.backup_library(scratch_db, os.path.join("rel", "backups"))
+    assert os.path.samefile(dest.parent, tmp_path / "rel" / "backups")
+
+
 def test_backup_dir_in_the_way_raises_as_before(scratch_db, tmp_path):
     """A file where the folder should be fails as Path.mkdir did."""
     blocker = tmp_path / "backups"
