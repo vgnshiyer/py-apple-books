@@ -107,6 +107,45 @@ _COMPAT_WARNING = (
     "AppleBooksDBClient.conn is deprecated and will be removed in 2.0; "
     "use LibraryDB.open_connection()"
 )
+#: Logged (once per :class:`LibraryDB`) when a query first meets a text
+#: cell that isn't valid UTF-8.
+INVALID_TEXT_WARNING = (
+    "Some text in the Apple Books library isn't valid UTF-8; it is shown with U+FFFD in "
+    "place of the invalid bytes."
+)
+
+# How sqlite3 words the error for a TEXT cell that isn't valid UTF-8
+# (CPython's Modules/_sqlite/cursor.c; tests pin it on every supported
+# Python). The rest of its message quotes the cell, which must never
+# reach an error message.
+_DECODE_ERROR = "Could not decode to UTF-8"
+_DECODE_ERROR_COLUMN = re.compile(r"Could not decode to UTF-8 column '([A-Za-z0-9_$]{1,128})' with text '")
+
+
+def _decode_lenient(value: bytes) -> str:
+    """``text_factory`` of a library holding invalid UTF-8: U+FFFD in
+    place of each invalid byte sequence; valid text reads as with
+    ``str``."""
+    return value.decode("utf-8", "replace")
+
+
+def _is_decode_error(e: BaseException) -> bool:
+    """Whether ``e`` is sqlite3 failing to decode a TEXT cell as UTF-8."""
+    if not isinstance(e, sqlite3.OperationalError) or not e.args:
+        return False
+    message = e.args[0]
+    return isinstance(message, str) and message.startswith(_DECODE_ERROR)
+
+
+def _scrub_sqlite_message(e: BaseException) -> str:
+    """``str(e)``, except for a decode error, which is rebuilt from its
+    known prefix without the cell text sqlite3 appends: ``"Could not
+    decode to UTF-8 column '<name>'"``, or without the name if it isn't
+    a plain identifier."""
+    if not _is_decode_error(e):
+        return str(e)
+    match = _DECODE_ERROR_COLUMN.match(e.args[0])
+    return f"{_DECODE_ERROR} column '{match[1]}'" if match else _DECODE_ERROR
 
 
 class _UseDefault:
@@ -555,6 +594,14 @@ class LibraryDB:
     A forked child makes its own connections. Fork only while no other
     thread is running a query: SQLite's internal locks are copied in
     whatever state they were in.
+
+    Text that isn't valid UTF-8 (which sqlite3 refuses to read) doesn't
+    fail queries: the first statement that meets such a cell is run
+    again with U+FFFD in place of the invalid bytes, a warning
+    (:data:`INVALID_TEXT_WARNING`) is logged once, and from then on
+    every query of this library reads text that way. The connections
+    :meth:`connection` and :meth:`open_connection` hand out read text as
+    sqlite3 does by default.
     """
 
     def __init__(self, data_dir=None, *, library_db=None, annotation_db=None,
@@ -591,6 +638,9 @@ class LibraryDB:
         # (identity, clock time) of the last stat() that found the store
         # files unchanged.
         self._verified: Tuple[Optional[tuple], float] = (None, 0.0)
+        # Set (for good, forks included) once a query met text that
+        # isn't valid UTF-8: pooled queries then decode with U+FFFD.
+        self._lenient_text = False
 
     def __repr__(self) -> str:
         if not self._explicit:
@@ -922,8 +972,10 @@ class LibraryDB:
           read lock on the store, which can hold up Apple Books' writes.
         - Don't detach ``anno_db``, change PRAGMAs or register functions.
 
-        An open transaction is rolled back and a progress handler
-        removed when it is returned.
+        An open transaction is rolled back, a progress handler removed
+        and the ``text_factory`` set back to ``str`` when it is returned.
+        Text is read as sqlite3 does by default, even once this library's
+        queries read invalid UTF-8 leniently (see :class:`LibraryDB`).
         """
         self.paths()  # an expired fallback is resolved again first
         pooled, slots = self._acquire(deadline, None)
@@ -931,6 +983,7 @@ class LibraryDB:
             self._limit_busy_wait(pooled, deadline)
             yield pooled.conn
         finally:
+            pooled.conn.text_factory = str
             with contextlib.suppress(sqlite3.Error):
                 pooled.conn.set_progress_handler(None, 0)
             self._release(pooled, slots)
@@ -965,7 +1018,11 @@ class LibraryDB:
 
     def _run_pooled(self, fn: Callable[[_Pooled], _T]) -> _T:
         """Run ``fn`` on a checked-out connection within the deadline and
-        turn every failure into a typed :class:`DBError`."""
+        turn every failure into a typed :class:`DBError`.
+
+        ``fn`` may be called twice (see :meth:`_call`): it must have no
+        effect but the statements it runs.
+        """
         deadline, limit = self._statement_deadline()
         pooled = None
         try:
@@ -980,8 +1037,10 @@ class LibraryDB:
                     if pooled.busy != _BUSY_TIMEOUT or (
                             deadline is not None and deadline - time.monotonic() < _BUSY_TIMEOUT):
                         self._limit_busy_wait(pooled, deadline)
-                    return fn(pooled)
+                    return self._call(fn, pooled)
                 finally:
+                    # Strict again for the next checkout (connection()).
+                    conn.text_factory = str
                     if deadline is not None:
                         conn.set_progress_handler(None, 0)
             finally:
@@ -993,16 +1052,21 @@ class LibraryDB:
             raise
         except sqlite3.OperationalError as e:
             message = str(e)
-            if "interrupted" in message and deadline is not None:
-                raise QueryTimeoutError(
-                    f"Query took too long and was stopped (limit {limit:g} s).", timeout=limit) from e
-            if _gave_up_on_lock(e, deadline):
-                raise QueryTimeoutError(
-                    f"Timed out waiting for a locked database (limit {limit:g} s).", timeout=limit) from e
-            if (f"{ANNOTATION_SCHEMA}." in message or f"database {ANNOTATION_SCHEMA}" in message) \
-                    and pooled is not None and pooled.paths.annotations is None:
-                raise AnnotationStoreNotFoundError(ANNOTATIONS_NOT_FOUND) from e
-            raise DBQueryError(f"Error executing query: {e}") from e
+            # First: the cell text in a decode error's message could pass
+            # any of the tests below.
+            if _is_decode_error(e):
+                message = _scrub_sqlite_message(e)
+            else:
+                if "interrupted" in message and deadline is not None:
+                    raise QueryTimeoutError(
+                        f"Query took too long and was stopped (limit {limit:g} s).", timeout=limit) from e
+                if _gave_up_on_lock(e, deadline):
+                    raise QueryTimeoutError(
+                        f"Timed out waiting for a locked database (limit {limit:g} s).", timeout=limit) from e
+                if (f"{ANNOTATION_SCHEMA}." in message or f"database {ANNOTATION_SCHEMA}" in message) \
+                        and pooled is not None and pooled.paths.annotations is None:
+                    raise AnnotationStoreNotFoundError(ANNOTATIONS_NOT_FOUND) from e
+                raise DBQueryError(f"Error executing query: {e}") from e
         except sqlite3.DatabaseError as e:
             if "not a database" in str(e):
                 raise LibraryNotFoundError(NOT_A_DATABASE) from e
@@ -1011,6 +1075,42 @@ class LibraryDB:
             raise DBQueryError(f"Error executing query: {e}") from e
         except Exception as e:
             raise DBQueryError(f"Unexpected error while executing query: {e}") from e
+        # A decode error the lenient retry didn't cure (fn set its own
+        # text_factory): raised out of the except block, so the original,
+        # which quotes the cell, is neither its cause nor its context.
+        raise DBQueryError(f"Error executing query: {message}")
+
+    def _call(self, fn: Callable[[_Pooled], _T], pooled: _Pooled) -> _T:
+        """``fn(pooled)``, reading text leniently once this library is
+        known to hold invalid UTF-8.
+
+        A decode error makes the library lenient for good and runs ``fn``
+        once more, on the same connection and under the same deadline,
+        with :func:`_decode_lenient` as the ``text_factory`` (the caller
+        sets it back to ``str``).
+        """
+        conn = pooled.conn
+        if self._lenient_text:
+            conn.text_factory = _decode_lenient
+            return fn(pooled)
+        try:
+            return fn(pooled)
+        except sqlite3.OperationalError as e:
+            if not _is_decode_error(e):
+                raise
+        # Out of the except block, so an error of the retry doesn't chain
+        # to the decode error, whose message quotes the cell.
+        self._make_lenient()
+        conn.text_factory = _decode_lenient
+        return fn(pooled)
+
+    def _make_lenient(self) -> None:
+        """Read text with U+FFFD for invalid UTF-8 from now on; warn the
+        first time."""
+        with self._lock:
+            first, self._lenient_text = not self._lenient_text, True
+        if first:
+            logger.warning(INVALID_TEXT_WARNING)
 
     def _run(self, fn: Callable[[sqlite3.Connection], _T]) -> _T:
         return self._run_pooled(lambda pooled: fn(pooled.conn))
@@ -1029,7 +1129,17 @@ class LibraryDB:
             without an annotation store, :class:`LibraryAccessDeniedError`).
         """
         params = () if params is None else params
-        return self._run(lambda conn: conn.execute(sql, adapt_params(params)).fetchall())
+        adapted = None
+
+        def run(conn: sqlite3.Connection) -> list:
+            # Adapted once: a retry (see _call) binds the same values, even
+            # when params is an iterator.
+            nonlocal adapted
+            if adapted is None:
+                adapted = adapt_params(params)
+            return conn.execute(sql, adapted).fetchall()
+
+        return self._run(run)
 
     # -- schema -----------------------------------------------------------
 
@@ -1284,9 +1394,13 @@ class AppleBooksDBClient(DBClient):
         except AppleBooksError:
             raise
         except sqlite3.Error as e:
-            raise DBQueryError(f"Error executing query: {e}") from e
+            if not _is_decode_error(e):
+                raise DBQueryError(f"Error executing query: {e}") from e
+            message = _scrub_sqlite_message(e)
         except Exception as e:
             raise DBQueryError(f"Unexpected error while executing query: {e}") from e
+        # Out of the except block: the decode error quotes the cell.
+        raise DBQueryError(f"Error executing query: {message}")
 
     def _compat_conn(self) -> sqlite3.Connection:
         if self._conn is None:
