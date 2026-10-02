@@ -124,6 +124,103 @@ def test_concurrent_first_use_makes_one_object(tmp_path):
     assert Derived.made == 1 and all(obj is got[0] for obj in got)
 
 
+class Guarded(Derived):
+    """``dead`` read under the object's own lock, as a cache that must be
+    safe on free-threaded builds may well do."""
+
+    @property
+    def dead(self) -> bool:
+        with self._state:
+            return self._dead
+
+
+def test_dead_is_read_outside_the_lock(tmp_path):
+    db = LibraryDB(data_dir=tmp_path / "nowhere")
+    seen = []
+
+    class Watched(Derived):
+        @property
+        def dead(self):
+            seen.append(_lock_is_free_elsewhere(db))
+            return self._dead
+
+    obj = db._derived_cache("index", Watched)
+    assert db._derived_cache("index", Watched) is obj
+    assert seen == [True]
+
+
+def test_dead_may_wait_for_an_object_that_is_querying(lib_db):
+    """One thread holds the object's lock and queries, which takes the
+    library's lock; another looks the object up, holding the library's
+    lock first, and reads ``dead``, which waits for the object's lock.
+    Neither waits for the other: ``dead`` is read after the library's
+    lock is released."""
+    lib_db.fixture.add_book("Synthetic Book")
+    # Not lib_db: a deadlocked library would hang the fixture's close().
+    db = LibraryDB(data_dir=lib_db.fixture.data_dir, query_timeout=20)
+    obj = db._derived_cache("index", Guarded)
+    inside = threading.Event()
+    counts, found, errors = [], [], []
+
+    def query():
+        try:
+            with obj._state:
+                inside.set()
+                time.sleep(0.2)  # the lookup reaches dead meanwhile
+                counts.append(db.execute(COUNT_BOOKS)[0][0])
+        except BaseException as e:  # pragma: no cover - reported below
+            errors.append(e)
+
+    def lookup():
+        try:
+            found.append(db._derived_cache("index", Guarded))
+        except BaseException as e:  # pragma: no cover - reported below
+            errors.append(e)
+
+    querier = threading.Thread(target=query, daemon=True)
+    querier.start()
+    assert inside.wait(timeout=10)
+    looker = threading.Thread(target=lookup, daemon=True)
+    with db._lock:  # the lookup takes the library's lock before the query does
+        looker.start()
+        time.sleep(0.05)
+    querier.join(timeout=10)
+    looker.join(timeout=10)
+    assert not querier.is_alive() and not looker.is_alive(), "deadlock"
+    assert not errors and counts == [1] and found == [obj]
+    db.close()
+
+
+def test_a_dead_object_is_replaced_once(tmp_path):
+    """Threads that all find the same dead object make one replacement."""
+    db = LibraryDB(data_dir=tmp_path / "nowhere")
+    old = db._derived_cache("index", Guarded)
+    old._dead = True
+    barrier = threading.Barrier(16)
+    got, errors, made = [], [], []
+
+    def factory():
+        time.sleep(0.01)  # widen the window a racing replacement would hit
+        made.append(Guarded())
+        return made[-1]
+
+    def worker():
+        try:
+            barrier.wait(timeout=30)
+            got.append(db._derived_cache("index", factory))
+        except BaseException as e:  # pragma: no cover - reported below
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert not errors and len(got) == 16
+    assert made == [got[0]] and got[0] is not old and all(obj is got[0] for obj in got)
+    assert db._derived == {"index": got[0]}
+
+
 def test_close_discards_outside_the_lock(lib_db):
     seen = []
 

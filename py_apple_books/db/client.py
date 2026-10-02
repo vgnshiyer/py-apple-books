@@ -1033,6 +1033,10 @@ class LibraryDB:
           that never blocks: it marks the object dead and leaves the
           release of what it holds to its last user. :meth:`close` calls
           it, outside this library's lock, on every object it held.
+          ``dead`` is read outside this library's lock, so it may take
+          the object's own lock even while another thread holds that
+          lock and queries (the lock order is the object's locks, then
+          this library's; never the reverse).
         - In a forked child the parent's objects are set aside, kept
           referenced and never used or discarded (they may hold the
           parent's connections); the child makes its own.
@@ -1040,11 +1044,23 @@ class LibraryDB:
           per call), so a dropped library is still collected.
         """
         self._check_fork()
-        with self._lock:
-            obj = self._derived.get(key)
-            if obj is None or obj.dead:
-                obj = self._derived[key] = factory()
-            return obj
+        while True:
+            with self._lock:
+                obj = self._derived.get(key)
+                if obj is None:
+                    obj = self._derived[key] = factory()
+                    return obj
+            # Outside the lock: dead is the object's code, and may wait
+            # for the object's own lock, whose holder may be waiting for
+            # this library's.
+            if not obj.dead:
+                return obj
+            with self._lock:
+                # Replaced only if no other thread did so meanwhile (or
+                # close() dropped it); otherwise look again.
+                if self._derived.get(key) is obj:
+                    obj = self._derived[key] = factory()
+                    return obj
 
     # -- execution --------------------------------------------------------
 
