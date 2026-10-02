@@ -194,7 +194,11 @@ class TestUnknownSections:
         outside.write_bytes(target.read_bytes())
         target.unlink()
         os.symlink(outside, target)
-        assert placed(BookContent(bundle), cfi(0, "s0", "/4/8/1:0")) == (None, UNKNOWN)
+        with _fs_audit.block(_fs_audit.Policy(deny=(str(outside),))) as rec:
+            assert placed(BookContent(bundle), cfi(0, "s0", "/4/8/1:0")) == (None, UNKNOWN)
+        # Neither the link nor what it points to is opened.
+        assert rec.under(outside, "open") == [] and rec.under(target, "open") == []
+        assert rec.refused == []
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +265,20 @@ class TestFile:
         assert book.resolve(cfi(2, "c1")).spine_index == 2
         assert book.resolve(cfi(1, "c1")).spine_index == 0
 
+    def test_repeated_multi_entry_file_before_its_anchors(self, tmp_path):
+        """A file holding several entries, listed again later in the
+        spine: a location there before its first anchor belongs to the
+        section before the file's first place in the spine (where its
+        sections start), not to the file just before the repeat."""
+        multi = '<h1>Top</h1>' + p("x.") + '<h1 id="a">A</h1>' + p("a.") + '<h1 id="b">B</h1>' + p("b.")
+        book = BookContent(write_epub_bundle(
+            tmp_path / "Again.epub", [("f", p("front")), ("m", multi), ("e", p("end"))],
+            toc=[("F", "f.xhtml"), ("A", "m.xhtml#a"), ("B", "m.xhtml#b"), ("E", "e.xhtml")],
+            spine_xml='<itemref idref="f"/><itemref idref="m"/><itemref idref="e"/><itemref idref="m"/>'))
+        assert placed(book, cfi(1, "m", "/4/2/1:0")) == ("F", PRECEDING)
+        assert placed(book, cfi(3, "m", "/4/2/1:0")) == ("F", PRECEDING)
+        assert placed(book, cfi(3, "m", "/4/8/1:0")) == ("A", ANCHOR)
+
     def test_broken_and_binary_spine_items(self, tmp_path):
         book = BookContent(_epub_shapes.mixed_types(tmp_path))
         assert placed(book, 3) == ("Page", PRECEDING)
@@ -302,7 +320,7 @@ def test_invariants(tmp_path, shape):
             elif resolved.match in (ANCHOR, UNKNOWN):
                 assert len(by_file) > 1
             elif resolved.match == PRECEDING:
-                assert resolved.chapter not in by_file or by_file
+                assert resolved.chapter not in by_file
 
 
 @pytest.mark.parametrize("shape", sorted(_epub_shapes.SHAPES))
@@ -370,8 +388,12 @@ class TestReads:
             BookContent(pdf).resolve(0)
         other = _epub_shapes.ncx_only(tmp_path)
         icloud.mark(other / "OEBPS")
-        with pytest.raises(BookNotDownloadedError):
-            BookContent(other).resolve(0)
+        with _fs_audit.record() as rec:
+            with pytest.raises(BookNotDownloadedError):
+                BookContent(other).resolve(0)
+        # Refused before anything under the dataless folder is opened or
+        # listed (R1, R2).
+        assert rec.under(other / "OEBPS", "open", "os.scandir", "os.listdir") == []
 
 
 def test_deep_nesting_is_recursion_safe(tmp_path):

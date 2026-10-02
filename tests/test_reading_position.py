@@ -158,6 +158,22 @@ class TestPages:
         pos = api.get_reading_position(book["id"])
         assert (pos.page, pos.page_count, pos.page_count_estimated) == (MAX_PAGE_INDEX + 1,) * 2 + (True,)
 
+    def test_pdf_page_data_without_a_page_is_no_page_tier(self, api, library, pdf):
+        # Only super.ordinal: no page, and an ordinal isn't a PDF's
+        # position, so the row gives a position only by its fraction.
+        import plistlib
+
+        blob = plistlib.dumps({"class": "BKPageLocation", "super": {"class": "BKLocation", "ordinal": 3}},
+                              fmt=plistlib.FMT_BINARY)
+        book = pdf()
+        library.add_annotation(book, None, kind="reading_position", user_data=blob)
+        assert api.get_reading_position(book["id"]) is None
+        other = pdf()
+        library.add_annotation(other, None, kind="reading_position", user_data=blob, position_fraction=0.25)
+        pos = api.get_reading_position(other["id"])
+        assert (pos.source, pos.page, pos.spine_index, pos.fraction, pos.unavailable) == (
+            BOOKMARK, None, None, 0.25, R.NOT_EPUB)
+
     def test_pdf_without_page_data_has_no_inferred_position(self, api, library, pdf):
         book = pdf()
         library.add_annotation(book, "a highlight", location=cfi(0, "x"))
