@@ -1,0 +1,7 @@
+# describe_book {"book_id": "5"} isError=False
+Series Stack by Test Author
+  Book id: 5
+  Genre:    Fantasy
+  Progress: Not Started
+  Readable text: no (an Apple Books Store series item that isn't in your library; there is no book file)
+  Open in Books: ibooks://assetid/EAA97C7FC8E65E008D83A298056E6514

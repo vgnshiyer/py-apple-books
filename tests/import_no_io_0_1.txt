@@ -1,0 +1,32 @@
+# The package's modules as of 1.10 (stream 0.1). Their import must do no
+# I/O (R19): tests/test_import_no_io.py imports every module of the
+# package in a fresh interpreter under the audit hook, listed or not.
+# Lists are optional, one per stream (tests/import_no_io_<stream>.txt,
+# e.g. import_no_io_2_1.txt); one name per line; "!name" names a module
+# that is never imported, such as a script run as a file.
+py_apple_books
+py_apple_books.api
+py_apple_books.collection_writer
+py_apple_books.content
+py_apple_books.db
+py_apple_books.db.clause
+py_apple_books.db.client
+py_apple_books.db.exceptions
+py_apple_books.db.metadata
+py_apple_books.db.query
+py_apple_books.exceptions
+py_apple_books.models
+py_apple_books.models.annotation
+py_apple_books.models.base
+py_apple_books.models.book
+py_apple_books.models.collection
+py_apple_books.models.location
+py_apple_books.models.manager
+py_apple_books.models.relations
+py_apple_books.testing
+py_apple_books.testing.demo
+py_apple_books.testing.dump_schema
+py_apple_books.testing.fixture
+py_apple_books.text
+py_apple_books.utils
+py_apple_books.write_safety

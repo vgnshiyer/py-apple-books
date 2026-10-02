@@ -1,8 +1,8 @@
 """Rule-based expected changes for compare.py.
 
 Each ITEMS entry is an audit item whose intended fix may change MCP output,
-the stage from which it applies (see STAGES) and the harness keys
-(``tool(json-args)``) it may change:
+the release that shipped it, the stage from which it applies (see STAGES)
+and the harness keys (``tool(json-args)``) it may change:
 
   tools       every call of these tools
   calls       fnmatch patterns on the full key
@@ -13,9 +13,15 @@ Rules may allow more than actually changes. Allowed means "not a
 regression if it changes", never "must change". Every addition needs an
 item id. Per-book rules are resolved from the snapshot by book_sets(), so
 this file holds no ids, titles or counts from any library.
+
+An item applies only when the baseline predates its ``release``: against
+a 1.10.0 baseline every 1.10 item is already in the baseline, so none is
+active and any change is UNEXPECTED. 1.11 adds no items: on a fully
+local library it must not change MCP output at all.
 """
 import fnmatch
 import json
+import re
 import pathlib
 import sqlite3
 import urllib.parse
@@ -38,22 +44,26 @@ ITEMS = {
     # Apostrophes no longer break the search SQL. Harness keys sort their
     # arguments, so "limit" precedes "text".
     "F08": {
+        "release": "1.10.0",
         "stage": "query",
         "calls": ['search_annotations(*"text": "don\'t"*'],
     },
     # Folded, parameterised text matching.
     "G4.1": {
+        "release": "1.10.0",
         "stage": "query",
         "tools": ["search_annotations", "search_notes", "search_books_by_title",
                   "get_books_by_genre", "search_collections_by_title", "revisit_book"],
     },
     # Newest-first default order for colour and text searches.
     "F28": {
+        "release": "1.10.0",
         "stage": "query",
         "tools": ["get_highlights_by_color", "search_notes", "search_annotations"],
     },
     # Owned scope: series containers and unowned Store-series rows hidden.
     "F07": {
+        "release": "1.10.0",
         "stage": "semantics",
         "tools": ["list_all_books", "search_books_by_title", "get_books_by_genre",
                   "get_books_in_progress", "get_unstarted_books", "get_recently_read_books",
@@ -64,6 +74,7 @@ ITEMS = {
     },
     # Disjoint reading-status partition.
     "F04": {
+        "release": "1.10.0",
         "stage": "semantics",
         "tools": ["get_books_in_progress", "get_unstarted_books", "get_finished_books",
                   "get_library_stats", "library_snapshot", "currently_reading_resource",
@@ -71,6 +82,7 @@ ITEMS = {
     },
     # Live annotations only (no deleted or non-positive-type rows).
     "F25": {
+        "release": "1.10.0",
         "stage": "semantics",
         "tools": ["list_all_annotations", "recent_annotations", "get_highlights_by_color",
                   "search_notes", "search_annotations", "get_annotations_by_date_range",
@@ -81,6 +93,7 @@ ITEMS = {
     },
     # 'Last read' also counts the engaged date.
     "F62": {
+        "release": "1.10.0",
         "stage": "semantics",
         "tools": ["get_recently_read_books", "get_books_in_progress", "get_finished_books",
                   "currently_reading_resource", "weekly_digest", "library_snapshot"],
@@ -89,6 +102,7 @@ ITEMS = {
     # An unknown colour ('underline' is not one) gets a typed error
     # naming the valid colours.
     "F27": {
+        "release": "1.10.0",
         "stage": "semantics",
         "calls": ['get_highlights_by_color({"color": "underline"*'],
     },
@@ -128,6 +142,10 @@ SET_QUERIES = {
            OR (ZDATASOURCEIDENTIFIER = 'com.apple.ibooks.BKLibraryDataSourceSeries'
                AND ZCANREDOWNLOAD IS NOT 1)""",
 }
+
+
+def version_key(version):
+    return tuple(int(part) for part in re.findall(r"\d+", version or ""))
 
 
 def resolve_stage(name):
@@ -195,14 +213,27 @@ def _matches(rule, key, sets):
     return False
 
 
-def allowed_by_item(keys, stage, sets):
-    """Return ``{item: set(keys)}`` for the items active at ``stage``."""
+def active_items(stage, baseline="1.9.1"):
+    """The ITEMS names that apply at ``stage`` against a ``baseline``
+    release: up to that stage, and shipped after the baseline."""
     limit = STAGES.index(resolve_stage(stage))
-    return {item: {k for k in keys if _matches(rule, k, sets)}
-            for item, rule in ITEMS.items()
-            if STAGES.index(rule["stage"]) <= limit}
+    return [item for item, rule in ITEMS.items()
+            if STAGES.index(rule["stage"]) <= limit
+            and version_key(rule["release"]) > version_key(baseline)]
 
 
-def allowed_keys(keys, stage, sets):
-    """Return the keys some item active at ``stage`` allows to change."""
-    return set().union(*allowed_by_item(keys, stage, sets).values())
+def needs_book_sets(stage, baseline="1.9.1"):
+    """Whether an active item has per-book rules (compare needs --home)."""
+    return any(ITEMS[item].get("book_tools") for item in active_items(stage, baseline))
+
+
+def allowed_by_item(keys, stage, sets, baseline="1.9.1"):
+    """Return ``{item: set(keys)}`` for the items active at ``stage``
+    against ``baseline``."""
+    return {item: {k for k in keys if _matches(ITEMS[item], k, sets)}
+            for item in active_items(stage, baseline)}
+
+
+def allowed_keys(keys, stage, sets, baseline="1.9.1"):
+    """Return the keys some active item allows to change."""
+    return set().union(*allowed_by_item(keys, stage, sets, baseline).values())

@@ -1,0 +1,2 @@
+# get_chapter_content {"book_id": 999999, "chapter_id": "current"} isError=True
+Error executing tool get_chapter_content: No book with id 999999. Use search_books or list_all_books to find book ids.

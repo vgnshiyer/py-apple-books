@@ -1,0 +1,2 @@
+# describe_collection {"collection_id": "10"} isError=True
+Error executing tool describe_collection: No collection with id 10. Use list_all_collections or search_collections_by_title to find collection ids.

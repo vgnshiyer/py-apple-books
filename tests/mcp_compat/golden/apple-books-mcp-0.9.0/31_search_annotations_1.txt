@@ -1,0 +1,5 @@
+# search_annotations {"limit": 1, "offset": 1, "text": "synthetic"} isError=False
+Synthetic Book (Test Author):
+  [1] a synthetic highlight — Chapter 1 (ch=chap1)
+
+Showing 2–2 of more than 2 matches. Next page: offset=2.

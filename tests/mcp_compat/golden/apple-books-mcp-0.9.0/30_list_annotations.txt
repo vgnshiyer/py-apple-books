@@ -1,0 +1,5 @@
+# list_annotations {"book_id": 1, "limit": 2, "offset": 2} isError=False
+[10] don’t touch snake_case names — Chapter 2 (ch=chap2)
+[9] Don't panic, it's 100% fine. — Chapter 2 (ch=chap2)
+
+Showing 3–4 of 5 annotations. Next page: offset=4.

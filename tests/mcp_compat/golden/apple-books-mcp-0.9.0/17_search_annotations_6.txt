@@ -1,0 +1,3 @@
+# search_annotations {"text": "_"} isError=False
+Synthetic Book (Test Author):
+  [10] don’t touch snake_case names — Chapter 2 (ch=chap2)

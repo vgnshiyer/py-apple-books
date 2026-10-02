@@ -1,0 +1,6 @@
+# search_annotations {"limit": 1, "text": "synthetic"} isError=False
+Synthetic Book (Test Author):
+  [2] Opening words. — Chapter 2 (ch=chap2)
+    ↳ note: my synthetic note
+
+Showing 1–1 of more than 1 matches. Next page: offset=1.

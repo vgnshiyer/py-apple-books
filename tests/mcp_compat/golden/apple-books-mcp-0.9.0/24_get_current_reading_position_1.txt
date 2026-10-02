@@ -1,0 +1,7 @@
+# get_current_reading_position {"book_id": 1} isError=False
+Current chapter:
+<book_text book_id="1">
+[1] Chapter 1
+</book_text>
+(use get_chapter_content(1, "chap1") for the text)
+Open in Books: ibooks://assetid/8BE83570810E5357845372A57CDA8FCB

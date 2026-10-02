@@ -1,0 +1,5 @@
+# get_finished_books {"limit": 1} isError=False
+[2] Don't Panic by Second Author
+  Progress: Finished | Last Read: 2026-09-10
+
+Showing 1–1 of 2 books. Next page: offset=1.

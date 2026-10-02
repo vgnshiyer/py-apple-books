@@ -1,0 +1,6 @@
+# get_annotations_by_date_range {"after": "2026-09-01", "limit": 2, "offset": 2} isError=False
+Annotations created from 2026-09-01 00:00 on, local time (UTC, UTC+00:00), newest first:
+2026-09-21 12:00 [1] a synthetic highlight — Chapter 1 (ch=chap1) · Synthetic Book
+2026-09-19 12:00 [7] orphan synthetic highlight · removed book ORPHANAS…
+
+Showing 3–4 of 7 annotations. Next page: offset=4.

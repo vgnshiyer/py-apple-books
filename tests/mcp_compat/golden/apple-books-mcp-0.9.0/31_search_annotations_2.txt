@@ -1,0 +1,8 @@
+# search_annotations {"order_by": "oldest", "text": "synthetic"} isError=False
+Synthetic Book (Test Author):
+  [1] a synthetic highlight — Chapter 1 (ch=chap1)
+  [2] Opening words. — Chapter 2 (ch=chap2)
+    ↳ note: my synthetic note
+
+Removed book (asset ORPHANAS…, 1 highlight on this page):
+  [7] orphan synthetic highlight

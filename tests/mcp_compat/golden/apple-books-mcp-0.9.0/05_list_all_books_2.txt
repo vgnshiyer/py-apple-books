@@ -1,0 +1,5 @@
+# list_all_books {"limit": 2} isError=False
+[1] Synthetic Book by Test Author
+[2] Don't Panic by Second Author
+
+Showing 1–2 of 6 books. Next page: offset=2.

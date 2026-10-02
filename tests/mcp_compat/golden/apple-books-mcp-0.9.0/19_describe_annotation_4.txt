@@ -1,0 +1,4 @@
+# describe_annotation {"annotation_id": "6"} isError=False
+Annotation 6
+  Book:     Removed book (no asset id), no longer in the library
+  Created:  unknown

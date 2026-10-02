@@ -1,0 +1,6 @@
+# get_annotations_by_date_range {"before": "2026-09-18", "limit": 2} isError=False
+Annotations created through 2026-09-18 23:59, local time (UTC, UTC+00:00), newest first:
+2026-09-18 12:00 [9] Don't panic, it's 100% fine. — Chapter 2 (ch=chap2) · Synthetic Book
+2026-09-17 12:00 [10] don’t touch snake_case names — Chapter 2 (ch=chap2) · Synthetic Book
+
+Showing 1–2 of 3 annotations. Next page: offset=2.

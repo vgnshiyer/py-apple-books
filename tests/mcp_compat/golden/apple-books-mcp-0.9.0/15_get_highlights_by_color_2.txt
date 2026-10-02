@@ -1,0 +1,3 @@
+# get_highlights_by_color {"color": "purple"} isError=False
+Don't Panic (Second Author) — 1 purple highlight:
+  [8] towel day

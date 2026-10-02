@@ -1,0 +1,8 @@
+# recent_annotations {} isError=False
+2026-09-23 12:00 [3] Closing words. — Chapter 1 (ch=chap1) · Synthetic Book
+2026-09-22 12:00 [2] Opening words. — Chapter 2 (ch=chap2) · Synthetic Book
+2026-09-21 12:00 [1] a synthetic highlight — Chapter 1 (ch=chap1) · Synthetic Book
+2026-09-19 12:00 [7] orphan synthetic highlight · removed book ORPHANAS…
+2026-09-18 12:00 [9] Don't panic, it's 100% fine. — Chapter 2 (ch=chap2) · Synthetic Book
+2026-09-17 12:00 [10] don’t touch snake_case names — Chapter 2 (ch=chap2) · Synthetic Book
+2026-09-15 12:00 [8] towel day · Don't Panic

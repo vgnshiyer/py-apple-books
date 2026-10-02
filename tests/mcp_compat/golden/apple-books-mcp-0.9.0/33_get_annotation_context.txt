@@ -1,0 +1,4 @@
+# get_annotation_context {"annotation_id": 1, "chars_after": 5, "chars_before": 5} isError=False
+<book_text book_id="1" annotation_id="1">
+…«a synthetic highlight»…
+</book_text>

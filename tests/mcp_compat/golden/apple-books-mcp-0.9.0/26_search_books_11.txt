@@ -1,0 +1,4 @@
+# search_books {"limit": 1, "offset": 1, "query": "book"} isError=False
+[4] Unopened Book by Test Author
+
+Showing 2–2 of 3 books. Next page: offset=2.
