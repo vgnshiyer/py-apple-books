@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.11.0 (unreleased)
+## 1.11.0 (2026-10-07)
 
 The release candidate is `1.11.0rc1`. Installers only pick a pre-release
 when asked for it by version (`pip install py-apple-books==1.11.0rc1`), so
